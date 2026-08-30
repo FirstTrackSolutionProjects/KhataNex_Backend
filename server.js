@@ -28,14 +28,16 @@ const app = express();
 // CORS: kept intentionally open (no security hardening yet, by request).
 // Once ready, restrict via FRONTEND_URL in .env, e.g.:
 //   cors({ origin: process.env.FRONTEND_URL })
+
 // * app.use(cors());
 app.use(helmet({ crossOriginResourcePolicy: false, crossOriginEmbedderPolicy: false }));
 
 app.use(cors({
-  origin: true, // dynamically reflects the requesting origin (great for local dev)
+  origin: process.env.FRONTEND_URL, // dynamically reflects the requesting origin (great for local dev)
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  
 }));
 
 app.use(express.json());
