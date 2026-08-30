@@ -15,11 +15,6 @@ ALTER TABLE users MODIFY role ENUM('user','employee','superadmin','admin') NOT N
 UPDATE users SET role = 'employee' WHERE role = 'admin';
 ALTER TABLE users MODIFY role ENUM('user','employee','superadmin') NOT NULL DEFAULT 'user';
 
--- rename admin_role_type -> employee_role_type (skip if already renamed)
-ALTER TABLE users CHANGE COLUMN admin_role_type employee_role_type VARCHAR(50) DEFAULT NULL;
--- rename promoted_by -> created_by_admin (skip if already renamed)
-ALTER TABLE users CHANGE COLUMN promoted_by created_by_admin INT DEFAULT NULL;
-
 ALTER TABLE users ADD COLUMN IF NOT EXISTS business_name VARCHAR(150) DEFAULT NULL AFTER password;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS address VARCHAR(255) DEFAULT NULL AFTER business_name;
 ALTER TABLE users MODIFY name VARCHAR(100) DEFAULT NULL;
@@ -70,8 +65,6 @@ ALTER TABLE invoice_items MODIFY product_name VARCHAR(150) DEFAULT 'Item';
 ALTER TABLE invoice_items MODIFY quantity DECIMAL(10,2) NOT NULL DEFAULT 1;
 ALTER TABLE invoice_items MODIFY price DECIMAL(12,2) NOT NULL DEFAULT 0;
 ALTER TABLE invoice_items MODIFY amount DECIMAL(12,2) NOT NULL DEFAULT 0;
-
-CREATE INDEX idx_invoices_doctype ON invoices(doc_type);
 
 -- Note: "ADD COLUMN IF NOT EXISTS" / "CHANGE COLUMN" require MySQL 8.0.29+ /
 -- MariaDB 10.3+. If your server is older, drop "IF NOT EXISTS" and run each

@@ -92,9 +92,3 @@ CREATE TABLE IF NOT EXISTS vehicle_trips (
   created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (created_by) REFERENCES users(id)
 ) ENGINE=InnoDB;
-
-CREATE INDEX idx_stock_hsn ON stock(hsn_code);
-CREATE INDEX idx_purchase_invoices_hsn ON purchase_invoices(hsn_code);
-CREATE INDEX idx_invoices_customer ON invoices(customer_id);
-CREATE INDEX idx_vehicle_trips_type ON vehicle_trips(trip_type);
-CREATE INDEX idx_vehicle_trips_vehicle ON vehicle_trips(vehicle_number);
