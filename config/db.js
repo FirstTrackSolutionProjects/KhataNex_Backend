@@ -11,6 +11,8 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
   decimalNumbers: true, // return DECIMAL columns as JS numbers, not strings
+  enableKeepAlive: true,          // Prevents idle timeouts by sending TCP keep-alives
+  keepAliveInitialDelay: 10000,    // Starts keep-alive packets after 10 seconds of inactivity
 });
 
 // Quick sanity check on boot
