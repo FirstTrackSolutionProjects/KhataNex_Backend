@@ -15,6 +15,15 @@ const pool = mysql.createPool({
   keepAliveInitialDelay: 10000,    // Starts keep-alive packets after 10 seconds of inactivity
 });
 
+pool.on('connection', (connection) => {
+  connection.on('error', (err) => {
+    console.error('MySQL connection error:', err);
+    if (err.code === 'PROTOCOL_CONNECTION_LOST') {
+      console.log('Database connection was closed.');
+    }
+  });
+});
+
 // Quick sanity check on boot
 (async () => {
   try {
