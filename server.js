@@ -55,7 +55,7 @@ app.get("/", (req, res) => {
 app.get("/api/health", (req, res) => res.json({ success: true, status: "ok" }));
 
 app.use("/api/auth", authRoutes);
-app.use("/api/contact", contactRoutes);
+app.use("/api/contacts", contactRoutes);
 app.use("/api/superadmin", superAdminRoutes);
 app.use("/api/customers", customerRoutes);
 app.use("/api/collections", collectionRoutes);
