@@ -1,3 +1,4 @@
+const { ZodError } = require("zod");
 const ApiError = require("../utils/ApiError");
 
 // 404 handler — must be mounted after all routes
@@ -27,6 +28,11 @@ const errorHandler = (err, req, res, next) => {
   if (err.name === "MulterError") {
     statusCode = 400;
     message = `File upload error: ${err.message}`;
+  }
+
+  if (err instanceof ZodError) {
+    statusCode = 400;
+    message = err.issues[0]?.message || 'Invalid input';
   }
 
   if (process.env.NODE_ENV !== "production") {
