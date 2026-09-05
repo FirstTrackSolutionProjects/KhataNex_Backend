@@ -1,18 +1,15 @@
 const nodemailer = require("nodemailer");
 
-let transporter = null;
-
 // Lazily build the transporter so a missing/incomplete SMTP config doesn't
 // crash the whole server on boot — it just makes email sending fail
 // gracefully at send time, with a clear error.
 const getTransporter = () => {
-  if (transporter) return transporter;
 
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     return null;
   }
 
-  transporter = nodemailer.createTransport({
+  const transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT) || 587,
     secure: Number(process.env.SMTP_PORT) === 465,
@@ -54,4 +51,4 @@ const sendMail = async ({ to, subject, text, html, attachments = [] }) => {
   }
 };
 
-module.exports = { sendMail };
+module.exports = { sendMail, transporter : getTransporter() };

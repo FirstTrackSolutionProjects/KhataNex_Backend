@@ -8,6 +8,7 @@ const morgan = require("morgan");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 
 const authRoutes = require("./routes/authRoutes");
+const contactRoutes = require("./routes/contactRoutes");
 const superAdminRoutes = require("./routes/superAdminRoutes");
 const customerRoutes = require("./routes/customerRoutes");
 const collectionRoutes = require("./routes/collectionRoutes");
@@ -54,6 +55,7 @@ app.get("/", (req, res) => {
 app.get("/api/health", (req, res) => res.json({ success: true, status: "ok" }));
 
 app.use("/api/auth", authRoutes);
+app.use("/api/contact", contactRoutes);
 app.use("/api/superadmin", superAdminRoutes);
 app.use("/api/customers", customerRoutes);
 app.use("/api/collections", collectionRoutes);
