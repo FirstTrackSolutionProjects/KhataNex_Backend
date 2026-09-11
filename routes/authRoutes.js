@@ -6,6 +6,8 @@ const {
   getMe,
   updateMe,
   uploadProfileLogo,
+  uploadProfileSignature,
+  deleteProfileSignature,
 } = require("../controllers/authController");
 
 const { authenticate } = require("../middleware/auth");
@@ -20,6 +22,19 @@ router.post(
   authenticate,
   logoUploader.single("logo"),
   uploadProfileLogo
+);
+
+router.post(
+  "/me/signature",
+  authenticate,
+  logoUploader.single("signature"),
+  uploadProfileSignature
+);
+
+router.delete(
+  "/me/signature",
+  authenticate,
+  deleteProfileSignature
 );
 
 router.get("/me", authenticate, getMe);

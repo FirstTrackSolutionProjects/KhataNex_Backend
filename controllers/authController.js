@@ -3,6 +3,7 @@ const jwt = require("jsonwebtoken");
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const { relativeUploadPath } = require("../utils/upload");
+const ApiError = require("../utils/ApiError");
 
 const signToken = (user) =>
   jwt.sign(
@@ -23,6 +24,7 @@ const publicUser = (u) => ({
   pan: u.pan,
   website: u.website,
   logo_path: u.logo_path,
+  signature_path: u.signature_path,
 
   address: u.address,
   address_line1: u.address_line1,
@@ -103,26 +105,26 @@ const getMe = asyncHandler(async (req, res) => {
 // Profile page. Nothing is required; only fields sent are changed.
 const updateMe = asyncHandler(async (req, res) => {
   const {
-  name,
-  phone,
-  business_name,
-  business_type,
-  gstin,
-  pan,
-  website,
-  address,
-  address_line1,
-  address_line2,
-  city,
-  state,
-  pincode,
-  country,
-  currency,
-  tax_type,
-  tcs_enabled,
-  tds_enabled,
-  payment_terms,
-} = req.body;
+    name,
+    phone,
+    business_name,
+    business_type,
+    gstin,
+    pan,
+    website,
+    address,
+    address_line1,
+    address_line2,
+    city,
+    state,
+    pincode,
+    country,
+    currency,
+    tax_type,
+    tcs_enabled,
+    tds_enabled,
+    payment_terms,
+  } = req.body;
   await pool.query(
     `UPDATE users SET
    name = COALESCE(?, name),
@@ -146,27 +148,27 @@ const updateMe = asyncHandler(async (req, res) => {
    payment_terms = COALESCE(?, payment_terms)
  WHERE id = ?`,
     [
-  name ?? null,
-  phone ?? null,
-  business_name ?? null,
-  business_type ?? null,
-  gstin ?? null,
-  pan ?? null,
-  website ?? null,
-  address ?? null,
-  address_line1 ?? null,
-  address_line2 ?? null,
-  city ?? null,
-  state ?? null,
-  pincode ?? null,
-  country ?? null,
-  currency ?? null,
-  tax_type ?? null,
-  tcs_enabled ?? null,
-  tds_enabled ?? null,
-  payment_terms ?? null,
-  req.user.id,
-],
+      name ?? null,
+      phone ?? null,
+      business_name ?? null,
+      business_type ?? null,
+      gstin ?? null,
+      pan ?? null,
+      website ?? null,
+      address ?? null,
+      address_line1 ?? null,
+      address_line2 ?? null,
+      city ?? null,
+      state ?? null,
+      pincode ?? null,
+      country ?? null,
+      currency ?? null,
+      tax_type ?? null,
+      tcs_enabled ?? null,
+      tds_enabled ?? null,
+      payment_terms ?? null,
+      req.user.id,
+    ],
   );
   const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [req.user.id]);
   res.json({ success: true, user: publicUser(rows[0]) });
@@ -194,6 +196,47 @@ const uploadProfileLogo = asyncHandler(async (req, res) => {
     user: publicUser(rows[0]),
   });
 });
+const uploadProfileSignature = asyncHandler(async (req, res) => {
+  if (!req.file) {
+    throw new ApiError(400, "No signature file uploaded.");
+  }
+
+  const signaturePath = relativeUploadPath(req.file.path);
+
+  await pool.query(
+    "UPDATE users SET signature_path = ? WHERE id = ?",
+    [signaturePath, req.user.id]
+  );
+
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE id = ?",
+    [req.user.id]
+  );
+
+  res.json({
+    success: true,
+    message: "Authorized signature uploaded.",
+    user: publicUser(rows[0]),
+  });
+});
+
+const deleteProfileSignature = asyncHandler(async (req, res) => {
+  await pool.query(
+    "UPDATE users SET signature_path = NULL WHERE id = ?",
+    [req.user.id]
+  );
+
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE id = ?",
+    [req.user.id]
+  );
+
+  res.json({
+    success: true,
+    message: "Authorized signature removed.",
+    user: publicUser(rows[0]),
+  });
+});
 
 module.exports = {
   register,
@@ -201,4 +244,6 @@ module.exports = {
   getMe,
   updateMe,
   uploadProfileLogo,
+  uploadProfileSignature,
+  deleteProfileSignature,
 };
