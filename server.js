@@ -20,6 +20,7 @@ const documentRoutes = require("./routes/documentRoutes");
 const vehicleRoutes = require("./routes/vehicleRoutes");
 const settingsRoutes = require("./routes/settingsRoutes");
 const khataRoutes = require("./routes/khataRoutes");
+const bankingRoutes = require("./routes/bankingRoutes");
 
 const app = express();
 
@@ -66,6 +67,7 @@ app.use("/api/documents", documentRoutes);
 app.use("/api/vehicles", vehicleRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/khata", khataRoutes);
+app.use("/api/banking", bankingRoutes);
 
 app.use(notFound);
 app.use(errorHandler);
