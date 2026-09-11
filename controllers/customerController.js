@@ -5,15 +5,114 @@ const ApiError = require("../utils/ApiError");
 // POST /api/customers
 // Nothing is required — a blank submission still creates a row (name
 // falls back to "Unnamed Customer" via the DB default).
-const createCustomer = asyncHandler(async (req, res) => {
-  const { name, phone, email } = req.body;
+
+  const createCustomer = asyncHandler(async (req, res) => {
+  const {
+    title,
+    name,
+    businessName,
+    businessCountry,
+    displayName,
+    entity,
+    gstin,
+    pan,
+    msmeNumber,
+    email,
+    phone,
+    mobileCountry,
+
+    businessAddress,
+    billingAddress,
+    shippingAddress,
+  } = req.body;
 
   const [result] = await pool.query(
-    "INSERT INTO customers (name, phone, email, created_by) VALUES (?, ?, ?, ?)",
-    [name || null, phone || null, email || null, req.user?.id || null]
+    `INSERT INTO customers (
+      title,
+      name,
+      business_name,
+      business_country,
+      display_name,
+      entity,
+      gstin,
+      pan,
+      msme_number,
+      email,
+      phone,
+      mobile_country,
+
+      business_state,
+      business_district,
+      business_pincode,
+      business_city,
+      business_landmark,
+
+      billing_state,
+      billing_district,
+      billing_pincode,
+      billing_city,
+      billing_landmark,
+
+      shipping_state,
+      shipping_district,
+      shipping_pincode,
+      shipping_city,
+      shipping_landmark,
+
+      created_by
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?,
+      ?
+    )`,
+    [
+      title || null,
+      name || null,
+      businessName || null,
+      businessCountry || null,
+      displayName || null,
+      entity || null,
+      gstin || null,
+      pan || null,
+      msmeNumber || null,
+      email || null,
+      phone || null,
+      mobileCountry || null,
+
+      businessAddress?.state || null,
+      businessAddress?.district || null,
+      businessAddress?.pincode || null,
+      businessAddress?.city || null,
+      businessAddress?.landmark || null,
+
+      billingAddress?.state || null,
+      billingAddress?.district || null,
+      billingAddress?.pincode || null,
+      billingAddress?.city || null,
+      billingAddress?.landmark || null,
+
+      shippingAddress?.state || null,
+      shippingAddress?.district || null,
+      shippingAddress?.pincode || null,
+      shippingAddress?.city || null,
+      shippingAddress?.landmark || null,
+
+      req.user?.id || null,
+    ]
   );
-  const [rows] = await pool.query("SELECT * FROM customers WHERE id = ?", [result.insertId]);
-  res.status(201).json({ success: true, customer: rows[0] });
+
+  const [rows] = await pool.query(
+    "SELECT * FROM customers WHERE id = ?",
+    [result.insertId]
+  );
+
+  res.status(201).json({
+    success: true,
+    customer: rows[0],
+  });
+
 });
 
 // GET /api/customers
@@ -63,16 +162,109 @@ const getCustomerProfile = asyncHandler(async (req, res) => {
 
 // PATCH /api/customers/:id
 const updateCustomer = asyncHandler(async (req, res) => {
-  const { name, phone, email } = req.body;
+  const {
+    title,
+    name,
+    businessName,
+    businessCountry,
+    displayName,
+    entity,
+    gstin,
+    pan,
+    msmeNumber,
+    email,
+    phone,
+    mobileCountry,
+
+    businessAddress,
+    billingAddress,
+    shippingAddress,
+  } = req.body;
+
   const { id } = req.params;
-  const [rows] = await pool.query("SELECT id FROM customers WHERE id = ?", [id]);
-  if (!rows.length) throw new ApiError(404, "Customer not found.");
+
+  const [rows] = await pool.query(
+    "SELECT id FROM customers WHERE id = ?",
+    [id]
+  );
+
+  if (!rows.length) {
+    throw new ApiError(404, "Customer not found.");
+  }
 
   await pool.query(
-    "UPDATE customers SET name = COALESCE(?, name), phone = COALESCE(?, phone), email = COALESCE(?, email) WHERE id = ?",
-    [name || null, phone || null, email || null, id]
+    `UPDATE customers SET
+      title = COALESCE(?, title),
+      name = COALESCE(?, name),
+      business_name = COALESCE(?, business_name),
+      business_country = COALESCE(?, business_country),
+      display_name = COALESCE(?, display_name),
+      entity = COALESCE(?, entity),
+      gstin = COALESCE(?, gstin),
+      pan = COALESCE(?, pan),
+      msme_number = COALESCE(?, msme_number),
+      email = COALESCE(?, email),
+      phone = COALESCE(?, phone),
+      mobile_country = COALESCE(?, mobile_country),
+
+      business_state = COALESCE(?, business_state),
+      business_district = COALESCE(?, business_district),
+      business_pincode = COALESCE(?, business_pincode),
+      business_city = COALESCE(?, business_city),
+      business_landmark = COALESCE(?, business_landmark),
+
+      billing_state = COALESCE(?, billing_state),
+      billing_district = COALESCE(?, billing_district),
+      billing_pincode = COALESCE(?, billing_pincode),
+      billing_city = COALESCE(?, billing_city),
+      billing_landmark = COALESCE(?, billing_landmark),
+
+      shipping_state = COALESCE(?, shipping_state),
+      shipping_district = COALESCE(?, shipping_district),
+      shipping_pincode = COALESCE(?, shipping_pincode),
+      shipping_city = COALESCE(?, shipping_city),
+      shipping_landmark = COALESCE(?, shipping_landmark)
+    WHERE id = ?`,
+    [
+      title || null,
+      name || null,
+      businessName || null,
+      businessCountry || null,
+      displayName || null,
+      entity || null,
+      gstin || null,
+      pan || null,
+      msmeNumber || null,
+      email || null,
+      phone || null,
+      mobileCountry || null,
+
+      businessAddress?.state || null,
+      businessAddress?.district || null,
+      businessAddress?.pincode || null,
+      businessAddress?.city || null,
+      businessAddress?.landmark || null,
+
+      billingAddress?.state || null,
+      billingAddress?.district || null,
+      billingAddress?.pincode || null,
+      billingAddress?.city || null,
+      billingAddress?.landmark || null,
+
+      shippingAddress?.state || null,
+      shippingAddress?.district || null,
+      shippingAddress?.pincode || null,
+      shippingAddress?.city || null,
+      shippingAddress?.landmark || null,
+
+      id,
+    ]
   );
-  res.json({ success: true, message: "Customer updated." });
+
+  res.json({
+    success: true,
+    message: "Customer updated.",
+  });
 });
 
 module.exports = { createCustomer, listCustomers, getCustomerProfile, updateCustomer };
