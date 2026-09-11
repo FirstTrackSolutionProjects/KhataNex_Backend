@@ -2,7 +2,7 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
-const ApiError = require("../utils/ApiError");
+const { relativeUploadPath } = require("../utils/upload");
 
 const signToken = (user) =>
   jwt.sign(
@@ -16,8 +16,28 @@ const publicUser = (u) => ({
   name: u.name,
   email: u.email,
   phone: u.phone,
+
   business_name: u.business_name,
+  business_type: u.business_type,
+  gstin: u.gstin,
+  pan: u.pan,
+  website: u.website,
+  logo_path: u.logo_path,
+
   address: u.address,
+  address_line1: u.address_line1,
+  address_line2: u.address_line2,
+  city: u.city,
+  state: u.state,
+  pincode: u.pincode,
+  country: u.country,
+
+  currency: u.currency,
+  tax_type: u.tax_type,
+  tcs_enabled: u.tcs_enabled,
+  tds_enabled: u.tds_enabled,
+  payment_terms: u.payment_terms,
+
   role: u.role,
   employee_role_type: u.employee_role_type,
   status: u.status,
@@ -82,18 +102,103 @@ const getMe = asyncHandler(async (req, res) => {
 // Lets the logged-in user (any role) update their own profile — used by the
 // Profile page. Nothing is required; only fields sent are changed.
 const updateMe = asyncHandler(async (req, res) => {
-  const { name, phone, business_name, address } = req.body;
+  const {
+  name,
+  phone,
+  business_name,
+  business_type,
+  gstin,
+  pan,
+  website,
+  address,
+  address_line1,
+  address_line2,
+  city,
+  state,
+  pincode,
+  country,
+  currency,
+  tax_type,
+  tcs_enabled,
+  tds_enabled,
+  payment_terms,
+} = req.body;
   await pool.query(
     `UPDATE users SET
-       name = COALESCE(?, name),
-       phone = COALESCE(?, phone),
-       business_name = COALESCE(?, business_name),
-       address = COALESCE(?, address)
-     WHERE id = ?`,
-    [name ?? null, phone ?? null, business_name ?? null, address ?? null, req.user.id]
+   name = COALESCE(?, name),
+   phone = COALESCE(?, phone),
+   business_name = COALESCE(?, business_name),
+   business_type = COALESCE(?, business_type),
+   gstin = COALESCE(?, gstin),
+   pan = COALESCE(?, pan),
+   website = COALESCE(?, website),
+   address = COALESCE(?, address),
+   address_line1 = COALESCE(?, address_line1),
+   address_line2 = COALESCE(?, address_line2),
+   city = COALESCE(?, city),
+   state = COALESCE(?, state),
+   pincode = COALESCE(?, pincode),
+   country = COALESCE(?, country),
+   currency = COALESCE(?, currency),
+   tax_type = COALESCE(?, tax_type),
+   tcs_enabled = COALESCE(?, tcs_enabled),
+   tds_enabled = COALESCE(?, tds_enabled),
+   payment_terms = COALESCE(?, payment_terms)
+ WHERE id = ?`,
+    [
+  name ?? null,
+  phone ?? null,
+  business_name ?? null,
+  business_type ?? null,
+  gstin ?? null,
+  pan ?? null,
+  website ?? null,
+  address ?? null,
+  address_line1 ?? null,
+  address_line2 ?? null,
+  city ?? null,
+  state ?? null,
+  pincode ?? null,
+  country ?? null,
+  currency ?? null,
+  tax_type ?? null,
+  tcs_enabled ?? null,
+  tds_enabled ?? null,
+  payment_terms ?? null,
+  req.user.id,
+],
   );
   const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [req.user.id]);
   res.json({ success: true, user: publicUser(rows[0]) });
 });
+const uploadProfileLogo = asyncHandler(async (req, res) => {
+  if (!req.file) {
+    throw new ApiError(400, "No logo file uploaded.");
+  }
 
-module.exports = { register, login, getMe, updateMe };
+  const logoPath = relativeUploadPath(req.file.path);
+
+  await pool.query(
+    "UPDATE users SET logo_path = ? WHERE id = ?",
+    [logoPath, req.user.id]
+  );
+
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE id = ?",
+    [req.user.id]
+  );
+
+  res.json({
+    success: true,
+    message: "Profile logo uploaded.",
+    user: publicUser(rows[0]),
+  });
+});
+
+module.exports = {
+  register,
+  login,
+  getMe,
+  updateMe,
+  uploadProfileLogo,
+};
