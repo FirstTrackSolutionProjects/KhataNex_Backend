@@ -118,13 +118,22 @@ const ApiError = require("../utils/ApiError");
 // GET /api/customers
 // Every customer with how much they currently owe.
 const listCustomers = asyncHandler(async (req, res) => {
-  const { search } = req.query;
+  const { search, created_by } = req.query;
   let sql = `SELECT c.*, u.name AS created_by_name
-             FROM customers c LEFT JOIN users u ON u.id = c.created_by`;
+             FROM customers c LEFT JOIN users u ON u.id = c.created_by WHERE 1=1`;
   const params = [];
+
+  if (req.user.role === "user") {
+    sql += " AND c.created_by = ?";
+    params.push(req.user.id);
+  } else if (created_by) {
+    sql += " AND c.created_by = ?";
+    params.push(created_by);
+  }
+
   if (search) {
-    sql += " WHERE c.name LIKE ? OR c.phone LIKE ?";
-    params.push(`%${search}%`, `%${search}%`);
+    sql += " AND (c.name LIKE ? OR c.phone LIKE ?)";
+    params.push(`%%`, `%%`);
   }
   sql += " ORDER BY c.total_due DESC, c.name ASC";
 
@@ -138,6 +147,10 @@ const getCustomerProfile = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const [custRows] = await pool.query("SELECT * FROM customers WHERE id = ?", [id]);
   if (!custRows.length) throw new ApiError(404, "Customer not found.");
+
+  if (req.user.role === "user" && custRows[0].created_by !== req.user.id) {
+    throw new ApiError(404, "Customer not found.");
+  }
 
   const [sales] = await pool.query(
     `SELECT id, item_name, amount, payment_type, sale_date, created_at
@@ -184,11 +197,15 @@ const updateCustomer = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
   const [rows] = await pool.query(
-    "SELECT id FROM customers WHERE id = ?",
+    "SELECT id, created_by FROM customers WHERE id = ?",
     [id]
   );
 
   if (!rows.length) {
+    throw new ApiError(404, "Customer not found.");
+  }
+
+  if (req.user.role === "user" && rows[0].created_by !== req.user.id) {
     throw new ApiError(404, "Customer not found.");
   }
 
