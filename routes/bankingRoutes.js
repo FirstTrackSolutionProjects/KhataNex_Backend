@@ -10,8 +10,8 @@ const {
 
 const { authenticate, authorize } = require("../middleware/auth");
 
-// Every banking route is super-admin-only.
-router.use(authenticate, authorize("superadmin"));
+// Banking routes are available to authenticated users.
+router.use(authenticate, authorize("user", "employee", "superadmin"));
 
 router.post("/", createBanking);
 router.get("/", listBanking);
