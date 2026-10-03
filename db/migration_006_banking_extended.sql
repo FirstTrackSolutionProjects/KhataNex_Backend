@@ -1,7 +1,7 @@
 -- FIRST TRACK KHATANEX — Extended Banking Details
 -- Adds account details and default-bank support.
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 ALTER TABLE banking
   ADD COLUMN account_holder_name VARCHAR(150) DEFAULT NULL,

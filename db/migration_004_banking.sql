@@ -1,7 +1,7 @@
 -- FIRST TRACK KHATANEX — Banking
 -- Adds bank account details for users.
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 CREATE TABLE IF NOT EXISTS banking (
   id          INT AUTO_INCREMENT PRIMARY KEY,

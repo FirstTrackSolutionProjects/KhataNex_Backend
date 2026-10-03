@@ -1,7 +1,7 @@
 -- FIRST TRACK KHATANEX — Migration 010
 -- Owner Console: employee profiles, permissions and account activity
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 ALTER TABLE users
   ADD COLUMN employee_title VARCHAR(100) DEFAULT NULL AFTER employee_role_type,

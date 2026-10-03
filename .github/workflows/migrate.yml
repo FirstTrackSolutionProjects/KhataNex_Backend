@@ -1,0 +1,56 @@
+name: Database Migration Pipeline
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    name: Test and Deploy Migrations
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:latest
+        env:
+          MARIADB_ROOT_PASSWORD: password1
+          MARIADB_DATABASE: khatanex
+          MYSQL_ROOT_PASSWORD: password1
+          MYSQL_DATABASE: khatanex
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test migration on local MariaDB service
+        env:
+          NODE_ENV: development
+        run: npm run migrate
+
+    #   - name: Run production migration
+    #     env:
+    #       NODE_ENV: production
+    #       DB_HOST: ${{ vars.DB_HOST }}
+    #       DB_PORT: ${{ vars.DB_PORT }}
+    #       DB_USER: ${{ vars.DB_USER }}
+    #       DB_PASSWORD: ${{ vars.DB_PASSWORD }}
+    #       DB_NAME: ${{ vars.DB_NAME }}
+    #     run: npm run migrate

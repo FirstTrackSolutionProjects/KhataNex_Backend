@@ -3,19 +3,19 @@
 -- Migration 011 failed before applying its inventory/purchase-bill changes.
 
 ALTER TABLE stock
-  ADD COLUMN unit VARCHAR(30) DEFAULT NULL AFTER hsn_code;
+  ADD COLUMN IF NOT EXISTS unit VARCHAR(30) DEFAULT NULL AFTER hsn_code;
 
 ALTER TABLE stock
-  ADD COLUMN gst_rate DECIMAL(5,2) DEFAULT 0 AFTER unit;
+  ADD COLUMN IF NOT EXISTS gst_rate DECIMAL(5,2) DEFAULT 0 AFTER unit;
 
 ALTER TABLE stock
-  ADD COLUMN price_inclusive_gst TINYINT(1) NOT NULL DEFAULT 0 AFTER gst_rate;
+  ADD COLUMN IF NOT EXISTS price_inclusive_gst TINYINT(1) NOT NULL DEFAULT 0 AFTER gst_rate;
 
 ALTER TABLE stock
-  ADD COLUMN description TEXT DEFAULT NULL AFTER price_inclusive_gst;
+  ADD COLUMN IF NOT EXISTS description TEXT DEFAULT NULL AFTER price_inclusive_gst;
 
 ALTER TABLE stock
-  ADD COLUMN expense_type VARCHAR(50) DEFAULT NULL AFTER description;
+  ADD COLUMN IF NOT EXISTS expense_type VARCHAR(50) DEFAULT NULL AFTER description;
 
 CREATE TABLE IF NOT EXISTS purchase_bills (
   id            INT AUTO_INCREMENT PRIMARY KEY,
