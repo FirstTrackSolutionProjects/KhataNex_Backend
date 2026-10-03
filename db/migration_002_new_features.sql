@@ -8,7 +8,7 @@
 -- If you are setting up fresh, just run db/schema.sql (already includes
 -- everything below) and skip this file.
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 -- Note: "ADD COLUMN IF NOT EXISTS" requires MySQL 8.0.29+ / MariaDB 10.3+.
 -- On an older server, drop the "IF NOT EXISTS" and just run each ALTER once.

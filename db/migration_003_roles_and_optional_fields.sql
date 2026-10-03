@@ -8,7 +8,7 @@
 --
 -- If you are setting up fresh, just run db/schema.sql and skip this file.
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 -- ---- users: role rename admin -> employee, new profile fields ----
 ALTER TABLE users MODIFY role ENUM('user','employee','superadmin','admin') NOT NULL DEFAULT 'user';

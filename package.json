@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "seed:superadmin": "node scripts/createSuperAdmin.js"
+    "seed:superadmin": "node scripts/createSuperAdmin.js",
+    "migrate": "node scripts/applyMigration.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

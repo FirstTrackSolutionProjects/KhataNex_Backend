@@ -6,10 +6,10 @@
 -- run db/migration_003_roles_and_optional_fields.sql instead (see that file's
 -- header comment for exactly when to use it).
 
-CREATE DATABASE IF NOT EXISTS first_track_khatanex
-  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+-- CREATE DATABASE IF NOT EXISTS first_track_khatanex
+--   CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 -- ---------------------------------------------------------------------
 -- USERS
