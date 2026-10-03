@@ -45,12 +45,12 @@ jobs:
           NODE_ENV: development
         run: npm run migrate
 
-    #   - name: Run production migration
-    #     env:
-    #       NODE_ENV: production
-    #       DB_HOST: ${{ vars.DB_HOST }}
-    #       DB_PORT: ${{ vars.DB_PORT }}
-    #       DB_USER: ${{ vars.DB_USER }}
-    #       DB_PASSWORD: ${{ vars.DB_PASSWORD }}
-    #       DB_NAME: ${{ vars.DB_NAME }}
-    #     run: npm run migrate
+      - name: Run production migration
+        env:
+          NODE_ENV: production
+          DB_HOST: ${{ vars.DB_HOST }}
+          DB_PORT: ${{ vars.DB_PORT }}
+          DB_USER: ${{ vars.DB_USER }}
+          DB_PASSWORD: ${{ vars.DB_PASSWORD }}
+          DB_NAME: ${{ vars.DB_NAME }}
+        run: npm run migrate
