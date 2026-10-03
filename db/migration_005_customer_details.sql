@@ -1,6 +1,6 @@
 -- FIRST TRACK KHATANEX — Migration 005: extended customer details
 
-USE first_track_khatanex;
+-- USE first_track_khatanex;
 
 ALTER TABLE customers
   ADD COLUMN IF NOT EXISTS title VARCHAR(10) DEFAULT NULL AFTER id,

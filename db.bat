@@ -1,0 +1,1 @@
+mysql -h srv1828.hstgr.io -u u817592344_khatanex -p"1e672741-8c79-43b3-9b1c-dafcdc5a184D" -D u817592344_khatanex
