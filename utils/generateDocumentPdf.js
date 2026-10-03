@@ -1688,6 +1688,9 @@ const generateQuotationPdf = ({
             outPath
           );
 
+        pdf.on("error", reject);
+        stream.on("error", reject);
+
         pdf.pipe(stream);
 
         /*
@@ -1696,17 +1699,22 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
-        drawImageIfExists(
-          pdf,
-          logoPath,
-          40,
-          38,
-          {
-            fit: [85, 60],
-            align: "left",
-            valign: "center",
-          }
-        );
+        const logoDrawn = logoPath
+          ? drawImageIfExists(
+              pdf,
+              logoPath,
+              40,
+              38,
+              {
+                fit: [85, 60],
+                align: "left",
+                valign: "center",
+              }
+            )
+          : false;
+
+        const companyX = logoDrawn ? 135 : 40;
+        const companyWidth = logoDrawn ? 245 : 340;
 
         pdf
           .font("Helvetica-Bold")
@@ -1714,10 +1722,10 @@ const generateQuotationPdf = ({
           .fillColor(TEXT)
           .text(
             companyName,
-            135,
+            companyX,
             42,
             {
-              width: 275,
+              width: companyWidth,
             }
           );
 
@@ -1727,17 +1735,17 @@ const generateQuotationPdf = ({
           .fillColor(MUTED)
           .text(
             companyAddress || "",
-            135,
+            companyX,
             68,
             {
-              width: 275,
+              width: companyWidth,
             }
           );
 
         if (doc?.from_phone) {
           pdf.text(
             `Phone: ${doc.from_phone}`,
-            135,
+            companyX,
             88
           );
         }
@@ -1745,7 +1753,7 @@ const generateQuotationPdf = ({
         if (doc?.from_email) {
           pdf.text(
             `Email: ${doc.from_email}`,
-            135,
+            companyX,
             101
           );
         }
@@ -1985,20 +1993,28 @@ const generateQuotationPdf = ({
 
             subtotal += amount;
 
-            if (
-              index % 2 === 0
-            ) {
-              pdf
-                .rect(
-                  40,
-                  y,
-                  515,
-                  28
-                )
-                .fill(
-                  ROW_GREEN
-                );
+            /*
+             * Every quotation item row uses the same row background dynamically;
+             * no alternating-row logic.
+             */
+            if (y + 28 > 740) {
+              pdf.addPage({
+                size: "A4",
+                margin: 40,
+              });
+              y = 50;
             }
+
+            pdf
+              .rect(
+                40,
+                y,
+                515,
+                28
+              )
+              .fill(
+                ROW_GREEN
+              );
 
             pdf
               .font("Helvetica")
@@ -2419,12 +2435,42 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
+        const quotationTerms =
+          doc?.terms_conditions ||
+          "This quotation is valid for the period mentioned above. Prices are subject to the agreed scope and applicable taxes.";
+
+        pdf
+          .font("Helvetica")
+          .fontSize(8);
+
+        const termsHeight =
+          Math.max(
+            35,
+            pdf.heightOfString(
+              quotationTerms,
+              {
+                width: 485,
+              }
+            )
+          );
+
+        const termsBoxHeight =
+          termsHeight + 42;
+
+        if (y + termsBoxHeight > 670) {
+          pdf.addPage({
+            size: "A4",
+            margin: 40,
+          });
+          y = 50;
+        }
+
         pdf
           .roundedRect(
             40,
             y,
             515,
-            68,
+            termsBoxHeight,
             6
           )
           .fillColor(
@@ -2447,17 +2493,15 @@ const generateQuotationPdf = ({
           .fontSize(8)
           .fillColor(TEXT)
           .text(
-            doc?.terms_conditions ||
-            "This quotation is valid for the period mentioned above. Prices are subject to the agreed scope and applicable taxes.",
+            quotationTerms,
             55,
             y + 28,
             {
               width: 485,
-              height: 35,
             }
           );
 
-        y += 82;
+        y += termsBoxHeight + 14;
 
         /*
          * ----------------------------------------------------
@@ -2498,11 +2542,19 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
-        const signatureY =
+        let signatureY =
           Math.max(
             y + 18,
             690
           );
+
+        if (signatureY > 730) {
+          pdf.addPage({
+            size: "A4",
+            margin: 40,
+          });
+          signatureY = 690;
+        }
 
         if (signaturePath) {
           drawImageIfExists(

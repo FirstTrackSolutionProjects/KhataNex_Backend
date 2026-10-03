@@ -66,17 +66,18 @@ const createTrip = asyncHandler(async (req, res) => {
   if (finalTripType === "outgoing") {
     const waybillNumber = `WB-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${tripId}`;
     const company = await getCompanySettings();
-    const [tripRows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [tripId]);
+    const [tripRows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [tripId, req.user.id]);
     const absPdfPath = await generateWaybillPdf({ trip: { ...tripRows[0], waybill_number: waybillNumber }, company });
     const pdfRelPath = relativeUploadPath(absPdfPath);
-    await pool.query("UPDATE vehicle_trips SET waybill_number = ?, waybill_pdf_path = ? WHERE id = ?", [
+    await pool.query("UPDATE vehicle_trips SET waybill_number = ?, waybill_pdf_path = ? WHERE id = ? AND created_by = ?", [
       waybillNumber,
       pdfRelPath,
       tripId,
+      req.user.id,
     ]);
   }
 
-  const [finalRows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [tripId]);
+  const [finalRows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [tripId, req.user.id]);
   res.status(201).json({ success: true, trip: finalRows[0] });
 });
 
@@ -85,11 +86,11 @@ const createTrip = asyncHandler(async (req, res) => {
 // loading photo or other fields were left blank.
 const startTrip = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [id]);
+  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, req.user.id]);
   if (!rows.length) throw new ApiError(404, "Trip not found.");
 
-  await pool.query("UPDATE vehicle_trips SET journey_start_time = NOW(), status = 'in_transit' WHERE id = ?", [id]);
-  const [updated] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [id]);
+  await pool.query("UPDATE vehicle_trips SET journey_start_time = NOW(), status = 'in_transit' WHERE id = ? AND created_by = ?", [id, req.user.id]);
+  const [updated] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, req.user.id]);
   res.json({ success: true, trip: updated[0] });
 });
 
@@ -97,29 +98,24 @@ const startTrip = asyncHandler(async (req, res) => {
 // Stamps journey_end_time = now. No preconditions.
 const markReached = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [id]);
+  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, req.user.id]);
   if (!rows.length) throw new ApiError(404, "Trip not found.");
 
   const unloadingPhotoPath = req.file ? relativeUploadPath(req.file.path) : null;
 
   await pool.query(
-    "UPDATE vehicle_trips SET journey_end_time = NOW(), status = 'completed', unloading_photo = COALESCE(?, unloading_photo) WHERE id = ?",
-    [unloadingPhotoPath, id]
+    "UPDATE vehicle_trips SET journey_end_time = NOW(), status = 'completed', unloading_photo = COALESCE(?, unloading_photo) WHERE id = ? AND created_by = ?",
+    [unloadingPhotoPath, id, req.user.id]
   );
-  const [updated] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [id]);
+  const [updated] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, req.user.id]);
   res.json({ success: true, trip: updated[0] });
 });
 
 // GET /api/vehicles?trip_type=&status=&vehicle_number=
 const listTrips = asyncHandler(async (req, res) => {
   const { trip_type, status, vehicle_number } = req.query;
-  let sql = `SELECT v.*, u.name AS added_by FROM vehicle_trips v LEFT JOIN users u ON u.id = v.created_by WHERE 1=1`;
-  const params = [];
-
-  if (req.user.role === "user") {
-    sql += " AND v.created_by = ?";
-    params.push(req.user.id);
-  }
+  let sql = `SELECT v.*, u.name AS added_by FROM vehicle_trips v LEFT JOIN users u ON u.id = v.created_by WHERE v.created_by = ?`;
+  const params = [req.user.id];
   if (trip_type) {
     sql += " AND v.trip_type = ?";
     params.push(trip_type);
@@ -140,7 +136,7 @@ const listTrips = asyncHandler(async (req, res) => {
 
 // GET /api/vehicles/:id
 const getTrip = asyncHandler(async (req, res) => {
-  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ?", [req.params.id]);
+  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [req.params.id, req.user.id]);
   if (!rows.length) throw new ApiError(404, "Trip not found.");
   res.json({ success: true, trip: rows[0] });
 });
