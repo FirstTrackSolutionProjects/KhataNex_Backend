@@ -2,19 +2,52 @@ const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 
+const DISALLOWED_EXPENSE_TYPES = [
+  "sales of product",
+  "sale of product",
+  "sales of products",
+  "sales of service",
+  "sale of service",
+  "sales of services",
+  "product sale",
+  "service sale",
+];
+
 // POST /api/expenses
-// Nothing is required — description defaults to "Expense", amount to 0.
+// Rejects Sales of Product and Sales of Service as expenses (Requirement 13)
 const addExpense = asyncHandler(async (req, res) => {
   const { description, category, amount, expense_date } = req.body;
-  const finalAmount = amount && Number(amount) > 0 ? amount : 0;
+
+  const normalizedCategory = String(category || "").trim().toLowerCase();
+  const normalizedDesc = String(description || "").trim().toLowerCase();
+
+  if (
+    DISALLOWED_EXPENSE_TYPES.includes(normalizedCategory) ||
+    DISALLOWED_EXPENSE_TYPES.includes(normalizedDesc)
+  ) {
+    throw new ApiError(
+      400,
+      `"${category || description}" cannot be recorded as an expense. Sales must be recorded under Khata Credit or Daily Collections.`
+    );
+  }
+
+  const finalAmount = amount && Number(amount) > 0 ? Number(amount) : 0;
 
   const [result] = await pool.query(
     `INSERT INTO expenses (description, category, amount, expense_date, created_by)
      VALUES (?, ?, ?, COALESCE(?, CURRENT_DATE), ?)`,
     [description || null, category || null, finalAmount, expense_date || null, req.user.id]
   );
-  const [rows] = await pool.query("SELECT * FROM expenses WHERE id = ?", [result.insertId]);
-  res.status(201).json({ success: true, expense: rows[0] });
+
+  const [rows] = await pool.query(
+    "SELECT * FROM expenses WHERE id = ? AND created_by = ?",
+    [result.insertId, req.user.id]
+  );
+
+  res.status(201).json({
+    success: true,
+    expense: rows[0],
+  });
 });
 
 // GET /api/expenses?from=&to=&category=
@@ -23,10 +56,8 @@ const listExpenses = asyncHandler(async (req, res) => {
   let sql = `SELECT e.*, u.name AS added_by FROM expenses e LEFT JOIN users u ON u.id = e.created_by WHERE 1=1`;
   const params = [];
 
-  if (req.user.role === "user") {
-    sql += " AND e.created_by = ?";
-    params.push(req.user.id);
-  }
+  sql += " AND e.created_by = ?";
+  params.push(req.user.id);
   if (from) {
     sql += " AND e.expense_date >= ?";
     params.push(from);
@@ -47,7 +78,7 @@ const listExpenses = asyncHandler(async (req, res) => {
 
 // GET /api/expenses/summary — daily/weekly/monthly totals (business cash outflow)
 const getExpenseSummary = asyncHandler(async (req, res) => {
-  const userScope = req.user.role === "user" ? req.user.id : req.query.user_id || null;
+  const userScope = req.user.id;
 
   const build = async (dateCondition) => {
     let sql = `SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS entries FROM expenses WHERE ${dateCondition}`;

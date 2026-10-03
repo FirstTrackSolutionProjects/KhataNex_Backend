@@ -1,3 +1,4 @@
+const fs = require("fs");
 const path = require("path");
 
 const pool = require("../config/db");
@@ -91,7 +92,7 @@ const getUserProfile = async (userId) => {
   return rows[0];
 };
 
-const getCustomer = async (customerId) => {
+const getCustomer = async (customerId, userId) => {
   if (!customerId) {
     return null;
   }
@@ -99,8 +100,9 @@ const getCustomer = async (customerId) => {
   const [rows] = await pool.query(
     `SELECT *
      FROM customers
-     WHERE id = ?`,
-    [customerId]
+     WHERE id = ?
+       AND created_by = ?`,
+    [customerId, userId]
   );
 
   return rows[0] || null;
@@ -323,7 +325,8 @@ const createDocument =
 
     const customer =
       await getCustomer(
-        body.customer_id
+        body.customer_id,
+        req.user.id
       );
 
     const manualCustomer =
@@ -573,6 +576,11 @@ const createDocument =
         subtotal += taxableAmount;
 
         return {
+          product_id:
+            rawItem.product_id ||
+            rawItem.id ||
+            null,
+
           product_name:
             rawItem.product_name ||
             rawItem.name ||
@@ -1006,9 +1014,67 @@ const createDocument =
           const item of
             totals.calculatedItems
         ) {
+          let resolvedProductId = item.product_id || null;
+          const reqQty = cleanNumber(item.quantity, 1);
+
+          if (item.item_type !== "service") {
+            let stockRow = null;
+
+            if (resolvedProductId) {
+              const [rows] = await conn.query(
+                "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
+                [resolvedProductId, req.user.id]
+              );
+              if (rows.length) stockRow = rows[0];
+            }
+
+            if (!stockRow && item.product_name) {
+              const [rows] = await conn.query(
+                "SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ? FOR UPDATE",
+                [item.product_name, req.user.id]
+              );
+              if (rows.length) stockRow = rows[0];
+            }
+
+            if (!stockRow) {
+              await conn.rollback();
+              throw new ApiError(
+                400,
+                `Insufficient stock for product "${item.product_name}". Requested: ${reqQty}, Available: 0`,
+                {
+                  product_name: item.product_name,
+                  requested_quantity: reqQty,
+                  available_stock: 0,
+                }
+              );
+            }
+
+            const availableStock = Number(stockRow.quantity || 0);
+            if (availableStock < reqQty) {
+              await conn.rollback();
+              throw new ApiError(
+                400,
+                `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
+                {
+                  product_name: stockRow.product_name,
+                  requested_quantity: reqQty,
+                  available_stock: availableStock,
+                }
+              );
+            }
+
+            await conn.query(
+              "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
+              [reqQty, stockRow.id, req.user.id]
+            );
+
+            resolvedProductId = stockRow.id;
+          }
+
           await conn.query(
             `INSERT INTO invoice_items (
               invoice_id,
+              product_id,
               product_name,
               hsn_code,
               quantity,
@@ -1027,13 +1093,15 @@ const createDocument =
             VALUES (
               ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?,
+              ?
             )`,
             [
               docId,
+              resolvedProductId,
               item.product_name,
               item.hsn_code,
-              item.quantity || 1,
+              reqQty,
               item.price,
               item.amount,
               item.description,
@@ -1458,10 +1526,7 @@ const createDocument =
       pdfRelPath =
         relativeUploadPath(
           absPdfPath
-        ).replace(
-          /#/g,
-          "%23"
-        );
+        ) ;
 
       if (
         docType === "quotation"
@@ -1489,8 +1554,15 @@ const createDocument =
     } catch (err) {
       console.error(
         "Document PDF generation failed:",
-        err
+        err.stack || err.message || err
       );
+
+      if (docType === "quotation") {
+        throw new ApiError(
+          500,
+          `Failed to generate quotation PDF: ${err.message || "Unknown error"}`
+        );
+      }
     }
 
     /*
@@ -1626,6 +1698,11 @@ const createDocument =
       items:
         itemRows,
 
+      pdf_path:
+        pdfRelPath ||
+        finalDocument?.pdf_path ||
+        null,
+
       download_url:
         pdfRelPath || null,
 
@@ -1690,7 +1767,8 @@ const createMoneyReceipt =
 
     const customer =
       await getCustomer(
-        body.customer_id
+        body.customer_id,
+        req.user.id
       );
 
     /*
@@ -2052,12 +2130,14 @@ const createMoneyReceipt =
              id,
              customer_id,
              total_amount,
-             document_status
+             document_status,
+             created_by
            FROM invoices
            WHERE id = ?
              AND doc_type = 'invoice'
+             AND created_by = ?
            FOR UPDATE`,
-          [invoiceId]
+          [invoiceId, req.user.id]
         );
 
         if (
@@ -2071,43 +2151,6 @@ const createMoneyReceipt =
 
         const invoice =
           invoiceRows[0];
-
-        /*
-         * If a normal user is creating the receipt,
-         * the invoice must belong to that same user.
-         *
-         * Superadmin is allowed to work with all invoices,
-         * matching the existing document visibility behavior.
-         */
-        if (
-          req.user.role === "user"
-        ) {
-          const [
-            ownerRows,
-          ] = await conn.query(
-            `SELECT created_by
-             FROM invoices
-             WHERE id = ?
-             LIMIT 1`,
-            [invoiceId]
-          );
-
-          if (
-            !ownerRows.length ||
-            Number(
-              ownerRows[0]
-                .created_by
-            ) !==
-              Number(
-                req.user.id
-              )
-          ) {
-            throw new ApiError(
-              403,
-              `Invoice ${invoiceId} does not belong to your account.`
-            );
-          }
-        }
 
         /*
          * Customer safety check.
@@ -2276,8 +2319,8 @@ const createMoneyReceipt =
     ] = await pool.query(
       `SELECT *
        FROM money_receipts
-       WHERE id = ?`,
-      [receiptId]
+       WHERE id = ? AND created_by = ?`,
+      [receiptId, req.user.id]
     );
 
     const receipt =
@@ -2291,8 +2334,11 @@ const createMoneyReceipt =
         i.invoice_number,
         i.total_amount
        FROM money_receipt_allocations mra
+       JOIN money_receipts mr
+         ON mr.id = mra.money_receipt_id
        JOIN invoices i
          ON i.id = mra.invoice_id
+        AND i.created_by = mr.created_by
        WHERE mra.money_receipt_id = ?
        ORDER BY mra.id ASC`,
       [receiptId]
@@ -2414,18 +2460,16 @@ const createMoneyReceipt =
       pdfRelPath =
         relativeUploadPath(
           absPdfPath
-        ).replace(
-          /#/g,
-          "%23"
-        );
+        ) ;
 
       await pool.query(
         `UPDATE money_receipts
          SET pdf_path = ?
-         WHERE id = ?`,
+         WHERE id = ? AND created_by = ?`,
         [
           pdfRelPath,
           receiptId,
+          req.user.id,
         ]
       );
     } catch (err) {
@@ -2437,8 +2481,8 @@ const createMoneyReceipt =
     ] = await pool.query(
       `SELECT *
        FROM money_receipts
-       WHERE id = ?`,
-      [receiptId]
+       WHERE id = ? AND created_by = ?`,
+      [receiptId, req.user.id]
     );
 
     res.status(201).json({
@@ -2514,16 +2558,12 @@ const listDocuments =
 
       const invoiceParams = [];
 
-      if (
-        req.user.role === "user"
-      ) {
-        invoiceSql +=
-          " AND i.created_by = ?";
+      invoiceSql +=
+        " AND i.created_by = ?";
 
-        invoiceParams.push(
-          req.user.id
-        );
-      }
+      invoiceParams.push(
+        req.user.id
+      );
 
       if (customer_id) {
         invoiceSql +=
@@ -2612,16 +2652,12 @@ const listDocuments =
 
       const quotationParams = [];
 
-      if (
-        req.user.role === "user"
-      ) {
-        quotationSql +=
-          " AND q.created_by = ?";
+      quotationSql +=
+        " AND q.created_by = ?";
 
-        quotationParams.push(
-          req.user.id
-        );
-      }
+      quotationParams.push(
+        req.user.id
+      );
 
       if (customer_id) {
         quotationSql +=
@@ -2698,14 +2734,22 @@ const listDocuments =
       );
     });
 
+    const enrichedDocuments = rows.map((doc) => ({
+      ...doc,
+      download_url:
+        doc.pdf_path
+          ? `${process.env.BASE_URL || ""}${doc.pdf_path}`
+          : null,
+    }));
+
     res.json({
       success: true,
 
       count:
-        rows.length,
+        enrichedDocuments.length,
 
       documents:
-        rows,
+        enrichedDocuments,
     });
   });
 
@@ -2744,16 +2788,12 @@ const listMoneyReceipts =
 
     const params = [];
 
-    if (
-      req.user.role === "user"
-    ) {
-      sql +=
-        " AND mr.created_by = ?";
+    sql +=
+      " AND mr.created_by = ?";
 
-      params.push(
-        req.user.id
-      );
-    }
+    params.push(
+      req.user.id
+    );
 
     if (customer_id) {
       sql +=
@@ -2851,6 +2891,7 @@ const getDocument =
            FROM quotations q
            LEFT JOIN customers c
              ON c.id = q.customer_id
+            AND c.created_by = q.created_by
            WHERE q.id = ?`,
           [id]
         );
@@ -2863,7 +2904,6 @@ const getDocument =
       }
 
       if (
-        req.user.role === "user" &&
         Number(
           rows[0].created_by
         ) !==
@@ -2911,6 +2951,7 @@ const getDocument =
            FROM invoices i
            LEFT JOIN customers c
              ON c.id = i.customer_id
+            AND c.created_by = i.created_by
            WHERE i.id = ?
              AND i.doc_type = 'invoice'`,
           [id]
@@ -2924,7 +2965,6 @@ const getDocument =
       }
 
       if (
-        req.user.role === "user" &&
         Number(
           rows[0].created_by
         ) !==
@@ -2958,9 +2998,24 @@ const getDocument =
     res.json({
       success: true,
 
-      document,
+      document: {
+        ...document,
+        download_url:
+          document?.pdf_path
+            ? `${process.env.BASE_URL || ""}${document.pdf_path}`
+            : null,
+      },
 
       items,
+
+      pdf_path:
+        document?.pdf_path ||
+        null,
+
+      download_url:
+        document?.pdf_path
+          ? `${process.env.BASE_URL || ""}${document.pdf_path}`
+          : null,
     });
   });
 
@@ -2982,6 +3037,7 @@ const getMoneyReceipt =
          FROM money_receipts mr
          LEFT JOIN customers c
            ON c.id = mr.customer_id
+          AND c.created_by = mr.created_by
          WHERE mr.id = ?`,
         [req.params.id]
       );
@@ -2994,7 +3050,6 @@ const getMoneyReceipt =
     }
 
     if (
-      req.user.role === "user" &&
       Number(
         rows[0].created_by
       ) !==
@@ -3018,6 +3073,9 @@ const getMoneyReceipt =
        FROM money_receipt_allocations mra
        JOIN invoices i
          ON i.id = mra.invoice_id
+        AND i.created_by = mr.created_by
+       JOIN money_receipts mr
+         ON mr.id = mra.money_receipt_id
        WHERE mra.money_receipt_id = ?
        ORDER BY mra.id ASC`,
       [req.params.id]
@@ -3068,6 +3126,7 @@ const resendDocumentEmail =
            FROM quotations q
            LEFT JOIN customers c
              ON c.id = q.customer_id
+            AND c.created_by = q.created_by
            WHERE q.id = ?`,
           [req.params.id]
         );
@@ -3087,6 +3146,7 @@ const resendDocumentEmail =
            FROM invoices i
            LEFT JOIN customers c
              ON c.id = i.customer_id
+            AND c.created_by = i.created_by
            WHERE i.id = ?
              AND i.doc_type = 'invoice'`,
           [req.params.id]
@@ -3104,7 +3164,6 @@ const resendDocumentEmail =
       rows[0];
 
     if (
-      req.user.role === "user" &&
       Number(
         doc.created_by
       ) !==
@@ -3220,6 +3279,173 @@ const resendDocumentEmail =
     });
   });
 
+/*
+ * ============================================================
+ * DELETE INVOICE
+ * ============================================================
+ */
+
+const deleteInvoice = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const [rows] = await pool.query(
+    "SELECT * FROM invoices WHERE id = ? AND doc_type = 'invoice'",
+    [id]
+  );
+
+  if (!rows.length) {
+    throw new ApiError(404, "Invoice not found.");
+  }
+
+  const invoice = rows[0];
+
+  if (
+    req.user.role !== "superadmin" &&
+    Number(invoice.created_by) !== Number(req.user.id)
+  ) {
+    throw new ApiError(403, "You are not allowed to delete this invoice.");
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [invItems] = await conn.query(
+      "SELECT product_id, product_name, quantity, item_type FROM invoice_items WHERE invoice_id = ?",
+      [id]
+    );
+
+    for (const item of invItems) {
+      if (item.item_type !== "service") {
+        const qty = Number(item.quantity || 0);
+        if (qty > 0) {
+          if (item.product_id) {
+            await conn.query(
+              "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
+              [qty, item.product_id, invoice.created_by]
+            );
+          } else if (item.product_name) {
+            await conn.query(
+              "UPDATE stock SET quantity = quantity + ? WHERE product_name = ? AND created_by = ?",
+              [qty, item.product_name, invoice.created_by]
+            );
+          }
+        }
+      }
+    }
+
+    await conn.query("DELETE FROM invoices WHERE id = ?", [id]);
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  if (invoice.pdf_path) {
+    try {
+      const fullPath = path.resolve(
+        path.join(__dirname, "..", invoice.pdf_path.replace(/^\//, ""))
+      );
+      if (fs.existsSync(fullPath)) {
+        await fs.promises.unlink(fullPath);
+      }
+    } catch (err) {
+      console.warn("Could not remove invoice PDF file:", err.message);
+    }
+  }
+
+  res.json({
+    success: true,
+    message: "Invoice deleted successfully.",
+  });
+});
+
+/*
+ * ============================================================
+ * DELETE QUOTATION
+ * ============================================================
+ */
+
+const deleteQuotation = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const [rows] = await pool.query(
+    "SELECT * FROM quotations WHERE id = ?",
+    [id]
+  );
+
+  if (!rows.length) {
+    throw new ApiError(404, "Quotation not found.");
+  }
+
+  const quotation = rows[0];
+
+  if (
+    req.user.role !== "superadmin" &&
+    Number(quotation.created_by) !== Number(req.user.id)
+  ) {
+    throw new ApiError(403, "You are not allowed to delete this quotation.");
+  }
+
+  await pool.query("DELETE FROM quotations WHERE id = ?", [id]);
+
+  if (quotation.pdf_path) {
+    try {
+      const fullPath = path.resolve(
+        path.join(__dirname, "..", quotation.pdf_path.replace(/^\//, ""))
+      );
+      if (fs.existsSync(fullPath)) {
+        await fs.promises.unlink(fullPath);
+      }
+    } catch (err) {
+      console.warn("Could not remove quotation PDF file:", err.message);
+    }
+  }
+
+  res.json({
+    success: true,
+    message: "Quotation deleted successfully.",
+  });
+});
+
+/*
+ * ============================================================
+ * DELETE DOCUMENT (Unified)
+ * ============================================================
+ */
+
+const deleteDocument = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const requestedType = req.query.doc_type;
+
+  if (requestedType === "quotation") {
+    return deleteQuotation(req, res);
+  }
+  if (requestedType === "invoice") {
+    return deleteInvoice(req, res);
+  }
+
+  const [qRows] = await pool.query(
+    "SELECT id FROM quotations WHERE id = ?",
+    [id]
+  );
+  if (qRows.length) {
+    return deleteQuotation(req, res);
+  }
+
+  const [iRows] = await pool.query(
+    "SELECT id FROM invoices WHERE id = ? AND doc_type = 'invoice'",
+    [id]
+  );
+  if (iRows.length) {
+    return deleteInvoice(req, res);
+  }
+
+  throw new ApiError(404, "Document not found.");
+});
+
 module.exports = {
   createDocument,
   createMoneyReceipt,
@@ -3228,4 +3454,7 @@ module.exports = {
   getDocument,
   getMoneyReceipt,
   resendDocumentEmail,
+  deleteInvoice,
+  deleteQuotation,
+  deleteDocument,
 };

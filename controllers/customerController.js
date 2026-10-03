@@ -104,8 +104,8 @@ const ApiError = require("../utils/ApiError");
   );
 
   const [rows] = await pool.query(
-    "SELECT * FROM customers WHERE id = ?",
-    [result.insertId]
+    "SELECT * FROM customers WHERE id = ? AND created_by = ?",
+    [result.insertId, req.user.id]
   );
 
   res.status(201).json({
@@ -150,15 +150,22 @@ const getCustomerProfile = asyncHandler(async (req, res) => {
 
   const [sales] = await pool.query(
     `SELECT id, item_name, amount, payment_type, sale_date, created_at
-     FROM collections WHERE customer_id = ? ORDER BY sale_date DESC, created_at DESC`,
-    [id]
+     FROM collections WHERE customer_id = ? AND created_by = ? ORDER BY sale_date DESC, created_at DESC`,
+    [id, req.user.id]
   );
 
   const [duePayments] = await pool.query(
     `SELECT id, amount, payment_mode, purpose, payment_date, created_at
-     FROM payments WHERE customer_id = ? AND payment_category = 'due_received'
+     FROM payments WHERE customer_id = ? AND created_by = ? AND payment_category = 'due_received'
      ORDER BY payment_date DESC, created_at DESC`,
-    [id]
+    [id, req.user.id]
+  );
+
+  const [dues] = await pool.query(
+    `SELECT * FROM customer_dues
+     WHERE customer_id = ? AND created_by = ? AND status != 'settled'
+     ORDER BY created_at ASC, id ASC`,
+    [id, req.user.id]
   );
 
   res.json({
@@ -166,7 +173,20 @@ const getCustomerProfile = asyncHandler(async (req, res) => {
     customer: custRows[0],
     sales_history: sales,
     due_payments_history: duePayments,
+    outstanding_dues: dues,
+    dues,
   });
+});
+
+const getCustomerDues = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const [rows] = await pool.query(
+    `SELECT * FROM customer_dues
+     WHERE customer_id = ? AND created_by = ? AND status != 'settled'
+     ORDER BY created_at ASC, id ASC`,
+    [id, req.user.id]
+  );
+  res.json({ success: true, count: rows.length, dues: rows });
 });
 
 // PATCH /api/customers/:id
@@ -237,7 +257,7 @@ const updateCustomer = asyncHandler(async (req, res) => {
       shipping_pincode = COALESCE(?, shipping_pincode),
       shipping_city = COALESCE(?, shipping_city),
       shipping_landmark = COALESCE(?, shipping_landmark)
-    WHERE id = ?`,
+    WHERE id = ? AND created_by = ?`,
     [
       title || null,
       name || null,
@@ -271,6 +291,7 @@ const updateCustomer = asyncHandler(async (req, res) => {
       shippingAddress?.landmark || null,
 
       id,
+      req.user.id,
     ]
   );
 
@@ -280,4 +301,88 @@ const updateCustomer = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { createCustomer, listCustomers, getCustomerProfile, updateCustomer };
+const deleteCustomer = asyncHandler(async (req, res) => {
+  const customerId = req.params.id;
+  const targetUserId =
+    req.query.user_id && req.user.role === "superadmin"
+      ? Number(req.query.user_id)
+      : req.user.id;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    let checkSql = "SELECT id, name, created_by FROM customers WHERE id = ?";
+    let checkParams = [customerId];
+
+    if (req.user.role !== "superadmin") {
+      checkSql += " AND created_by = ?";
+      checkParams.push(req.user.id);
+    } else if (req.query.user_id) {
+      checkSql += " AND created_by = ?";
+      checkParams.push(targetUserId);
+    }
+
+    const [rows] = await conn.query(checkSql, checkParams);
+    if (!rows.length) {
+      await conn.rollback();
+      throw new ApiError(404, "Customer not found.");
+    }
+
+    const customer = rows[0];
+
+    // Safely unlink or clean up references before deleting the customer:
+    await conn.query(
+      "UPDATE collections SET customer_id = NULL WHERE customer_id = ?",
+      [customerId]
+    );
+
+    await conn.query(
+      "UPDATE payments SET customer_id = NULL WHERE customer_id = ?",
+      [customerId]
+    );
+
+    await conn.query(
+      "UPDATE invoices SET customer_id = NULL WHERE customer_id = ?",
+      [customerId]
+    );
+
+    await conn.query(
+      "UPDATE quotations SET customer_id = NULL WHERE customer_id = ?",
+      [customerId]
+    );
+
+    await conn.query(
+      "UPDATE money_receipts SET customer_id = NULL WHERE customer_id = ?",
+      [customerId]
+    );
+
+    await conn.query(
+      "DELETE FROM customer_dues WHERE customer_id = ?",
+      [customerId]
+    );
+
+    await conn.query("DELETE FROM customers WHERE id = ?", [customerId]);
+
+    await conn.commit();
+
+    res.json({
+      success: true,
+      message: `Customer "${customer.name || customerId}" deleted successfully.`,
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+module.exports = {
+  createCustomer,
+  listCustomers,
+  getCustomerProfile,
+  getCustomerDues,
+  updateCustomer,
+  deleteCustomer,
+};

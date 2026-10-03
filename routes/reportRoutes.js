@@ -8,6 +8,8 @@ const { authenticate, authorize } = require("../middleware/auth");
 router.use(authenticate, authorize("user", "employee", "superadmin"));
 
 router.get("/profit-loss", getProfitLoss);
+router.get("/sales-vs-expenses", getProfitLoss);
 router.get("/monthly-trend", getMonthlyTrend);
+router.get("/", getProfitLoss);
 
 module.exports = router;

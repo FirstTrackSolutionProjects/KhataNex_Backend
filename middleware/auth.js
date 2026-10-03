@@ -20,7 +20,7 @@ const authenticate = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     const [rows] = await pool.query(
-      "SELECT id, name, email, role, employee_role_type, status FROM users WHERE id = ?",
+      "SELECT id, name, email, role, employee_role_type, permissions, status FROM users WHERE id = ?",
       [decoded.id]
     );
 
@@ -29,6 +29,10 @@ const authenticate = async (req, res, next) => {
     if (user.status !== "active") {
       throw new ApiError(403, "Your account has been deactivated. Contact the super admin.");
     }
+
+    await pool.query("UPDATE users SET last_active_at = NOW() WHERE id = ?", [user.id]);
+
+    user.last_active_at = new Date();
 
     req.user = user; // always reflects the latest role from the DB
     next();
@@ -69,4 +73,34 @@ const authorizeEmployeeRoleType = (...types) => (req, res, next) => {
   next(new ApiError(403, "Your role does not have access to this section."));
 };
 
-module.exports = { authenticate, authorize, authorizeEmployeeRoleType };
+/**
+ * authorizePermission(...permissions) — allows super admin automatically,
+ * otherwise requires an employee to have at least one of the requested
+ * permissions in the users.permissions JSON field.
+ */
+const authorizePermission = (...requiredPermissions) => (req, res, next) => {
+  if (!req.user) return next(new ApiError(401, "Not authenticated."));
+  if (req.user.role === "superadmin") return next();
+
+  if (req.user.role !== "employee") {
+    return next(new ApiError(403, "Only authorized employees can perform this action."));
+  }
+
+  let granted = req.user.permissions;
+  if (typeof granted === "string") {
+    try {
+      granted = JSON.parse(granted);
+    } catch (err) {
+      granted = [];
+    }
+  }
+
+  if (!Array.isArray(granted)) granted = [];
+
+  const allowed = requiredPermissions.some((permission) => granted.includes(permission));
+  if (allowed) return next();
+
+  next(new ApiError(403, "You do not have the required permission for this action."));
+};
+
+module.exports = { authenticate, authorize, authorizeEmployeeRoleType, authorizePermission };

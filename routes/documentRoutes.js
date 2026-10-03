@@ -8,6 +8,9 @@ const {
   createMoneyReceipt,
   listMoneyReceipts,
   getMoneyReceipt,
+  deleteInvoice,
+  deleteQuotation,
+  deleteDocument,
 } = require("../controllers/documentController");
 
 const {
@@ -20,6 +23,11 @@ router.use(
   authorize("user", "employee", "superadmin")
 );
 
+const {
+  getUnlinkedMoneyReceipts,
+  linkMoneyReceiptToPayment,
+} = require("../controllers/paymentController");
+
 // --------------------------------------------------
 // Money Receipts
 // --------------------------------------------------
@@ -27,6 +35,16 @@ router.use(
 router.post(
   "/money-receipts",
   createMoneyReceipt
+);
+
+router.get(
+  "/money-receipts/unlinked",
+  getUnlinkedMoneyReceipts
+);
+
+router.post(
+  "/money-receipts/:id/link-payment",
+  linkMoneyReceiptToPayment
 );
 
 router.get(
@@ -48,6 +66,10 @@ router.post("/", createDocument);
 router.get("/", listDocuments);
 
 router.get("/:id", getDocument);
+
+router.delete("/invoices/:id", deleteInvoice);
+router.delete("/quotations/:id", deleteQuotation);
+router.delete("/:id", deleteDocument);
 
 router.post(
   "/:id/resend-email",

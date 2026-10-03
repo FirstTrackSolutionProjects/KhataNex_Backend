@@ -5,7 +5,7 @@ const fs = require("fs");
 const UPLOAD_ROOT = path.join(__dirname, "..", "uploads");
 
 // Make sure every subfolder we use actually exists on disk.
-["logos", "loading-photos", "unloading-photos", "waybills-uploaded", "waybills-generated", "purchase-invoices", "invoices"].forEach(
+["logos", "employee-photos", "loading-photos", "unloading-photos", "waybills-uploaded", "waybills-generated", "purchase-invoices", "invoices"].forEach(
   (dir) => {
     const full = path.join(UPLOAD_ROOT, dir);
     if (!fs.existsSync(full)) fs.mkdirSync(full, { recursive: true });
@@ -37,6 +37,7 @@ const maxSize = (mb) => ({ fileSize: mb * 1024 * 1024 });
 
 // Named uploaders — pick the one matching what's being uploaded.
 const uploadLogo = multer({ storage: storage("logos"), fileFilter: imageFilter, limits: maxSize(5) });
+const uploadEmployeePhoto = multer({ storage: storage("employee-photos"), fileFilter: imageFilter, limits: maxSize(5) });
 const uploadLoadingPhoto = multer({ storage: storage("loading-photos"), fileFilter: imageFilter, limits: maxSize(10) });
 const uploadUnloadingPhoto = multer({ storage: storage("unloading-photos"), fileFilter: imageFilter, limits: maxSize(10) });
 const uploadWaybillDoc = multer({ storage: storage("waybills-uploaded"), fileFilter: documentFilter, limits: maxSize(10) });
@@ -82,6 +83,7 @@ const relativeUploadPath = (absPath) => {
 module.exports = {
   UPLOAD_ROOT,
   uploadLogo,
+  uploadEmployeePhoto,
   uploadLoadingPhoto,
   uploadUnloadingPhoto,
   uploadWaybillDoc,

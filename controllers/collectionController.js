@@ -23,7 +23,10 @@ const addCollection = asyncHandler(async (req, res) => {
 
     if (finalPaymentType === "due") {
       if (customer_id) {
-        const [existing] = await conn.query("SELECT id FROM customers WHERE id = ?", [customer_id]);
+        const [existing] = await conn.query(
+          "SELECT id FROM customers WHERE id = ? AND created_by = ?",
+          [customer_id, req.user.id]
+        );
         if (existing.length) finalCustomerId = customer_id;
       } else if (customer_name) {
         const [result] = await conn.query(
@@ -36,7 +39,10 @@ const addCollection = asyncHandler(async (req, res) => {
       // without a linked customer rather than being rejected.
 
       if (finalCustomerId) {
-        await conn.query("UPDATE customers SET total_due = total_due + ? WHERE id = ?", [finalAmount, finalCustomerId]);
+        await conn.query(
+          "UPDATE customers SET total_due = total_due + ? WHERE id = ? AND created_by = ?",
+          [finalAmount, finalCustomerId, req.user.id]
+        );
       }
     }
 
@@ -50,8 +56,8 @@ const addCollection = asyncHandler(async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT c.*, cu.name AS customer_name FROM collections c
-       LEFT JOIN customers cu ON cu.id = c.customer_id WHERE c.id = ?`,
-      [saleResult.insertId]
+       LEFT JOIN customers cu ON cu.id = c.customer_id WHERE c.id = ? AND c.created_by = ?`,
+      [saleResult.insertId, req.user.id]
     );
     res.status(201).json({ success: true, collection: rows[0] });
   } catch (err) {
@@ -72,14 +78,8 @@ const listCollections = asyncHandler(async (req, res) => {
              LEFT JOIN users u ON u.id = c.created_by WHERE 1=1`;
   const params = [];
 
-  // A plain 'user' can only ever see their own entries.
-  if (req.user.role === "user") {
-    sql += " AND c.created_by = ?";
-    params.push(req.user.id);
-  } else if (created_by) {
-    sql += " AND c.created_by = ?";
-    params.push(created_by);
-  }
+  sql += " AND c.created_by = ?";
+  params.push(req.user.id);
 
   if (from) {
     sql += " AND c.sale_date >= ?";
@@ -123,7 +123,7 @@ const summarize = async (dateCondition, params, userScope) => {
 // A plain user only ever sees their own numbers; employee/superadmin can pass
 // ?user_id=<id> to see a specific user's numbers, or omit it to see everyone's.
 const getSummary = asyncHandler(async (req, res) => {
-  const userScope = req.user.role === "user" ? req.user.id : req.query.user_id || null;
+  const userScope = req.user.id;
 
   const [today, weekly, monthly] = await Promise.all([
     summarize("sale_date = CURRENT_DATE", [], userScope),
@@ -133,7 +133,7 @@ const getSummary = asyncHandler(async (req, res) => {
 
   res.json({
     success: true,
-    scope: userScope ? `user_id=${userScope}` : "all users",
+    scope: `user_id=${userScope}`,
     today,
     this_week: weekly,
     this_month: monthly,

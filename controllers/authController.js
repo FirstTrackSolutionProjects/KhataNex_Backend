@@ -90,6 +90,14 @@ const login = asyncHandler(async (req, res) => {
   const match = await bcrypt.compare(password, user.password);
   if (!match) throw new ApiError(401, "Invalid email or password.");
 
+  await pool.query(
+    "UPDATE users SET last_login_at = NOW(), last_active_at = NOW() WHERE id = ?",
+    [user.id]
+  );
+
+  user.last_login_at = new Date();
+  user.last_active_at = new Date();
+
   const token = signToken(user);
   res.json({ success: true, token, user: publicUser(user) });
 });
