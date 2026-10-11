@@ -39,6 +39,10 @@ const publicUser = (u) => ({
   tcs_enabled: u.tcs_enabled,
   tds_enabled: u.tds_enabled,
   payment_terms: u.payment_terms,
+  watermark_enabled:
+    u.watermark_enabled !== undefined && u.watermark_enabled !== null
+      ? Boolean(u.watermark_enabled === 1 || u.watermark_enabled === true || u.watermark_enabled === "1")
+      : true,
 
   role: u.role,
   employee_role_type: u.employee_role_type,
@@ -132,7 +136,20 @@ const updateMe = asyncHandler(async (req, res) => {
     tcs_enabled,
     tds_enabled,
     payment_terms,
+    watermark_enabled,
+    remove_watermark,
+    show_watermark,
   } = req.body;
+
+  let effectiveWatermark = null;
+  if (watermark_enabled !== undefined && watermark_enabled !== null) {
+    effectiveWatermark = watermark_enabled ? 1 : 0;
+  } else if (remove_watermark !== undefined && remove_watermark !== null) {
+    effectiveWatermark = remove_watermark ? 0 : 1;
+  } else if (show_watermark !== undefined && show_watermark !== null) {
+    effectiveWatermark = show_watermark ? 1 : 0;
+  }
+
   await pool.query(
     `UPDATE users SET
    name = COALESCE(?, name),
@@ -153,7 +170,8 @@ const updateMe = asyncHandler(async (req, res) => {
    tax_type = COALESCE(?, tax_type),
    tcs_enabled = COALESCE(?, tcs_enabled),
    tds_enabled = COALESCE(?, tds_enabled),
-   payment_terms = COALESCE(?, payment_terms)
+   payment_terms = COALESCE(?, payment_terms),
+   watermark_enabled = COALESCE(?, watermark_enabled)
  WHERE id = ?`,
     [
       name ?? null,
@@ -175,6 +193,7 @@ const updateMe = asyncHandler(async (req, res) => {
       tcs_enabled ?? null,
       tds_enabled ?? null,
       payment_terms ?? null,
+      effectiveWatermark,
       req.user.id,
     ],
   );

@@ -3,6 +3,7 @@ const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { relativeUploadPath } = require("../utils/upload");
+const { calculateReportMetrics, calculateGraphPoints, resolvePeriodRange, executeReportDrilldown } = require("./reportController");
 
 const ALLOWED_EMPLOYEE_PERMISSIONS = [
   "support_chat",
@@ -151,10 +152,14 @@ const listUsers = asyncHandler(async (req, res) => {
        ) AS net_credit,
 
        COALESCE((
-         SELECT SUM(p.amount)
-         FROM payments p
-         WHERE p.created_by = u.id
-           AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill')
+         SELECT SUM(sub.amount)
+         FROM (
+           SELECT MAX(p.amount) AS amount
+           FROM payments p
+           WHERE p.created_by = u.id
+             AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+           GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+         ) sub
        ), 0) AS debit,
 
        (
@@ -195,10 +200,14 @@ const listUsers = asyncHandler(async (req, res) => {
          ), 0)
          +
          COALESCE((
-           SELECT SUM(p.amount)
-           FROM payments p
-           WHERE p.created_by = u.id
-             AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill')
+           SELECT SUM(sub.amount)
+           FROM (
+             SELECT MAX(p.amount) AS amount
+             FROM payments p
+             WHERE p.created_by = u.id
+               AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+             GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+           ) sub
          ), 0)
          +
          COALESCE((
@@ -247,10 +256,14 @@ const listUsers = asyncHandler(async (req, res) => {
            ), 0)
            +
            COALESCE((
-             SELECT SUM(p.amount)
-             FROM payments p
-             WHERE p.created_by = u.id
-               AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill')
+             SELECT SUM(sub.amount)
+             FROM (
+               SELECT MAX(p.amount) AS amount
+               FROM payments p
+               WHERE p.created_by = u.id
+                 AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+               GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+             ) sub
            ), 0)
            +
            COALESCE((
@@ -287,10 +300,14 @@ const listUsers = asyncHandler(async (req, res) => {
            ), 0)
            +
            COALESCE((
-             SELECT SUM(p.amount)
-             FROM payments p
-             WHERE p.created_by = u.id
-               AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill')
+             SELECT SUM(sub.amount)
+             FROM (
+               SELECT MAX(p.amount) AS amount
+               FROM payments p
+               WHERE p.created_by = u.id
+                 AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+               GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+             ) sub
            ), 0)
            +
            COALESCE((
@@ -463,9 +480,13 @@ const getUserOverview = asyncHandler(async (req, res) => {
       [id]
     ),
     pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total
-       FROM payments
-       WHERE created_by = ? AND (payment_category IN ('paid_by_business', 'purchase_bill') OR purpose = 'Purchase Bill')`,
+      `SELECT COALESCE(SUM(sub.amount), 0) AS total
+       FROM (
+         SELECT MAX(p.amount) AS amount
+         FROM payments p
+         WHERE created_by = ? AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+         GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+       ) sub`,
       [id]
     ),
     calculateUserReports(id),
@@ -678,174 +699,74 @@ const setUserStatus = asyncHandler(async (req, res) => {
  * ============================================================
  */
 
-const calculateUserReports = async (id) => {
+const calculateUserReports = async (id, rangeFrom = null, rangeTo = null, period = null) => {
   const [
     customerResult,
-    invoiceResult,
-    revenueResult,
-    expenseResult,
-    paidByBusinessResult,
-    unlinkedDebitsResult,
-    advPaymentsResult,
-    unlinkedMrAdvancesResult,
-    dueReceivedResult,
-    creditEntryCountResult,
-    debitEntryCountResult,
-    monthlySalesResult,
-    monthlyExpenseResult,
+    metrics,
+    graphPoints,
   ] = await Promise.all([
     pool.query("SELECT COUNT(*) AS count FROM customers WHERE created_by = ?", [id]),
-    pool.query("SELECT COUNT(*) AS count FROM invoices WHERE created_by = ? AND doc_type = 'invoice'", [id]),
-    pool.query(
-      `SELECT (
-         COALESCE((SELECT SUM(amount) FROM collections WHERE created_by = ?), 0)
-         +
-         COALESCE((SELECT SUM(amount) FROM khata_entries WHERE created_by = ? AND type = 'credit'), 0)
-       ) AS total`,
-      [id, id]
-    ),
-    pool.query("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE created_by = ?", [id]),
-    pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total
-       FROM payments
-       WHERE created_by = ? AND (payment_category IN ('paid_by_business', 'purchase_bill') OR purpose = 'Purchase Bill')`,
-      [id]
-    ),
-    pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total
-       FROM khata_entries
-       WHERE created_by = ? AND type = 'debit' AND (is_linked_to_payment = 0 OR is_linked_to_payment IS NULL)`,
-      [id]
-    ),
-    pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total
-       FROM payments
-       WHERE created_by = ? AND (payment_category = 'advance_from_investor' OR purpose IN ('Investor Advance', 'Advance'))`,
-      [id]
-    ),
-    pool.query(
-      `SELECT COALESCE(SUM(amount_received), 0) AS total
-       FROM money_receipts
-       WHERE created_by = ? AND against_type = 'advance' AND (is_linked_to_payment = 0 OR is_linked_to_payment IS NULL)`,
-      [id]
-    ),
-    pool.query(
-      "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE created_by = ? AND payment_category = 'due_received'",
-      [id]
-    ),
-    pool.query(
-      `SELECT (
-         (SELECT COUNT(*) FROM collections WHERE created_by = ?)
-         +
-         (SELECT COUNT(*) FROM customer_dues WHERE created_by = ?)
-       ) AS count`,
-      [id, id]
-    ),
-    pool.query(
-      "SELECT COUNT(*) AS count FROM khata_entries WHERE created_by = ? AND type = 'debit'",
-      [id]
-    ),
-    pool.query(
-      `SELECT month, COALESCE(SUM(sale_amount), 0) AS sales
-       FROM (
-         SELECT DATE_FORMAT(sale_date, '%Y-%m') AS month, amount AS sale_amount
-         FROM collections
-         WHERE created_by = ? AND sale_date >= DATE_SUB(CURRENT_DATE, INTERVAL 6 MONTH)
-
-         UNION ALL
-
-         SELECT DATE_FORMAT(entry_date, '%Y-%m') AS month, amount AS sale_amount
-         FROM khata_entries
-         WHERE created_by = ? AND type = 'credit'
-           AND entry_date >= DATE_SUB(CURRENT_DATE, INTERVAL 6 MONTH)
-       ) combined_sales
-       GROUP BY month
-       ORDER BY month ASC`,
-      [id, id]
-    ),
-    pool.query(
-      `SELECT month, COALESCE(SUM(exp_amount), 0) AS expenses
-       FROM (
-         SELECT DATE_FORMAT(expense_date, '%Y-%m') AS month, amount AS exp_amount
-         FROM expenses
-         WHERE created_by = ? AND expense_date >= DATE_SUB(CURRENT_DATE, INTERVAL 6 MONTH)
-
-         UNION ALL
-
-         SELECT DATE_FORMAT(payment_date, '%Y-%m') AS month, amount AS exp_amount
-         FROM payments
-         WHERE created_by = ? AND (payment_category IN ('paid_by_business', 'purchase_bill') OR purpose = 'Purchase Bill')
-           AND payment_date >= DATE_SUB(CURRENT_DATE, INTERVAL 6 MONTH)
-
-         UNION ALL
-
-         SELECT DATE_FORMAT(entry_date, '%Y-%m') AS month, amount AS exp_amount
-         FROM khata_entries
-         WHERE created_by = ? AND type = 'debit' AND (is_linked_to_payment = 0 OR is_linked_to_payment IS NULL)
-           AND entry_date >= DATE_SUB(CURRENT_DATE, INTERVAL 6 MONTH)
-       ) combined_exp
-       GROUP BY month
-       ORDER BY month ASC`,
-      [id, id, id]
-    ),
+    calculateReportMetrics(id, rangeFrom, rangeTo),
+    calculateGraphPoints(id, period || "last_6_months", rangeFrom, rangeTo),
   ]);
 
-  const totalSales = Math.round(Number(revenueResult[0][0].total || 0) * 100) / 100;
-  const directExpenses = Math.round(Number(expenseResult[0][0].total || 0) * 100) / 100;
-  const paidByBusiness = Math.round(Number(paidByBusinessResult[0][0].total || 0) * 100) / 100;
-  const unlinkedDebits = Math.round(Number(unlinkedDebitsResult[0][0].total || 0) * 100) / 100;
-  const totalExpenses = Math.round((directExpenses + paidByBusiness + unlinkedDebits) * 100) / 100;
-
-  const dueReceived = Math.round(Number(dueReceivedResult[0][0].total || 0) * 100) / 100;
-  const investorAdvance = Math.round(
-    (Number(advPaymentsResult[0][0].total || 0) +
-      Number(unlinkedMrAdvancesResult[0][0].total || 0)) *
-      100
-  ) / 100;
-
-  const creditEntries = Number(creditEntryCountResult[0][0].count || 0);
-  const debitEntries = Number(debitEntryCountResult[0][0].count || 0);
-  const customerCount = Number(customerResult[0][0].count || 0);
-  const netProfit = Math.round((totalSales - totalExpenses) * 100) / 100;
-
-  const salesByMonth = new Map(monthlySalesResult[0].map((r) => [r.month, Number(r.sales || 0)]));
-  const expensesByMonth = new Map(monthlyExpenseResult[0].map((r) => [r.month, Number(r.expenses || 0)]));
-
-  const monthlyTrend = [];
-  const now = new Date();
-  for (let i = 5; i >= 0; i -= 1) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    const m = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-    monthlyTrend.push({
-      month: m,
-      sales: Math.round((salesByMonth.get(m) || 0) * 100) / 100,
-      expenses: Math.round((expensesByMonth.get(m) || 0) * 100) / 100,
-    });
-  }
+  const customerCount = Number(customerResult[0][0]?.count || 0);
+  const creditEntries = metrics.creditEntriesCount;
+  const debitEntries = metrics.debitEntriesCount;
 
   return {
-    total_sales: totalSales,
-    total_revenue: totalSales,
-    due_received: dueReceived,
-    expenses: totalExpenses,
-    expenses_breakdown: {
-      direct_expenses: directExpenses,
-      paid_by_business_payments: paidByBusiness,
-      unlinked_khata_debits: unlinkedDebits,
-    },
-    investor_advance: investorAdvance,
-    net_profit: netProfit,
-    profit_or_loss: netProfit,
-    sales_vs_expenses: {
-      sales: totalSales,
-      expenses: totalExpenses,
-    },
+    total_sales: metrics.totalSales,
+    total_revenue: metrics.totalSales,
+    sales: metrics.totalSales,
+    purchases: metrics.totalPurchases,
+    total_purchases: metrics.totalPurchases,
+    expenses: metrics.totalExpenses,
+    total_expenses: metrics.totalExpenses,
+    total_expense: metrics.totalExpenses,
+    due_received: 0,
+    advance_receivable: metrics.advanceReceivable,
+    investor_advance: metrics.advanceReceivable,
+    advance_payable: metrics.advancePayable,
+    cash_in_hand: metrics.cashInHand,
+    cash_in_bank: metrics.cashInBank,
+    net_profit: metrics.netProfit,
+    profit_or_loss: metrics.netProfit,
     credit_entries: creditEntries,
     debit_entries: debitEntries,
+    credit_entries_count: creditEntries,
+    debit_entries_count: debitEntries,
+    expenses_breakdown: {
+      purchases: metrics.breakdown.purchases,
+      debit_entries: metrics.breakdown.debit_entries,
+      debit_entries_count: debitEntries,
+      credit_entries: creditEntries,
+      credit_entries_count: creditEntries,
+      business_pay_out: metrics.breakdown.business_pay_out,
+      advance_payable: metrics.breakdown.advance_payable,
+      other_expenses: metrics.breakdown.other_expenses,
+      direct_expenses: metrics.breakdown.other_expenses,
+      khata_debits: metrics.breakdown.debit_entries,
+      paid_out_payments: metrics.breakdown.business_pay_out,
+      paid_by_business_payments: metrics.breakdown.business_pay_out,
+      unlinked_khata_debits: metrics.breakdown.debit_entries,
+      total_expense: metrics.totalExpenses,
+    },
+    breakdown: metrics.breakdown,
+    sales_vs_expenses: {
+      sales: metrics.totalSales,
+      total_expense: metrics.totalExpenses,
+      expenses: metrics.totalExpenses,
+      purchases: metrics.totalPurchases,
+      net_profit: metrics.netProfit,
+    },
     total_customers: customerCount,
-    monthly_business_performance: monthlyTrend,
-    monthly_trend: monthlyTrend,
-    last_6_months: monthlyTrend,
+    monthly_business_performance: graphPoints,
+    monthly_trend: graphPoints,
+    graph: graphPoints,
+    points: graphPoints,
+    trend: graphPoints,
+    sales_vs_expenses_graph: graphPoints,
+    last_6_months: graphPoints,
   };
 };
 
@@ -879,63 +800,138 @@ const getUserData = asyncHandler(async (req, res) => {
     }
 
     case "khata": {
-      const [sales] = await pool.query(
-        `SELECT c.id, c.amount, c.sale_date AS date, c.created_at,
-                COALESCE(cu.name, 'Walk-in') AS name,
-                CONCAT('Sale', IF(c.item_name IS NOT NULL, CONCAT(' - ', c.item_name), '')) AS description,
-                'credit' AS type,
-                c.payment_type,
-                c.customer_id,
-                c.item_name AS product_name,
-                NULL AS quantity,
-                NULL AS unit_price,
-                0 AS is_linked_to_payment
-         FROM collections c
-         LEFT JOIN customers cu ON cu.id = c.customer_id
-         WHERE c.created_by = ?`,
-        [id]
-      );
+      const from = req.query.from || req.query.start_date || req.query.startDate;
+      const to = req.query.to || req.query.end_date || req.query.endDate;
+      const customerId = req.query.customer_id;
+      const entryType = req.query.entry_type || req.query.entryType;
 
-      const [debits] = await pool.query(
-        `SELECT ke.id, ke.amount, ke.entry_date AS date, ke.created_at,
-                COALESCE(cu.name, 'Walk-in') AS name,
-                ke.description,
-                'debit' AS type,
-                NULL AS payment_type,
-                ke.customer_id,
-                s.product_name,
-                ke.quantity,
-                ke.unit_price,
-                ke.is_linked_to_payment,
-                ke.payment_id
-         FROM khata_entries ke
-         LEFT JOIN customers cu ON cu.id = ke.customer_id
-         LEFT JOIN stock s ON s.id = ke.product_id
-         WHERE ke.created_by = ?`,
-        [id]
-      );
+      let salesSql = `
+        SELECT c.id, c.amount, c.sale_date AS date,
+               TIME(c.created_at) AS time,
+               c.created_at,
+               COALESCE(cu.name, 'Walk-in') AS name,
+               COALESCE(cu.name, 'Walk-in') AS party_name,
+               COALESCE(cu.name, 'Walk-in') AS customer_name,
+               CONCAT('Sale', IF(c.item_name IS NOT NULL, CONCAT(' - ', c.item_name), '')) AS description,
+               CASE WHEN LOWER(COALESCE(c.payment_type, '')) = 'due' THEN 'due' ELSE 'credit' END AS type,
+               c.payment_type AS payment_mode,
+               c.payment_type,
+               c.customer_id,
+               c.item_name AS product_name,
+               NULL AS product_id,
+               NULL AS quantity,
+               NULL AS unit_price,
+               NULL AS items,
+               0 AS is_linked_to_payment,
+               NULL AS payment_id,
+               'collection' AS source
+        FROM collections c
+        LEFT JOIN customers cu ON cu.id = c.customer_id
+        WHERE c.created_by = ?
+      `;
+      const salesParams = [id];
+      if (customerId) {
+        salesSql += " AND c.customer_id = ?";
+        salesParams.push(customerId);
+      }
+      if (from) {
+        salesSql += " AND c.sale_date >= ?";
+        salesParams.push(from);
+      }
+      if (to) {
+        salesSql += " AND c.sale_date <= ?";
+        salesParams.push(to);
+      }
 
-      const [dues] = await pool.query(
-        `SELECT cd.id, cd.amount, cd.remaining_amount,
-                COALESCE(cd.due_date, DATE(cd.created_at)) AS date,
-                cd.created_at,
-                COALESCE(cu.name, 'Customer') AS name,
-                cd.description,
-                'due' AS type,
-                cd.status,
-                cd.customer_id,
-                s.product_name,
-                cd.quantity,
-                cd.unit_price,
-                0 AS is_linked_to_payment
-         FROM customer_dues cd
-         LEFT JOIN customers cu ON cu.id = cd.customer_id
-         LEFT JOIN stock s ON s.id = cd.product_id
-         WHERE cd.created_by = ?`,
-        [id]
-      );
+      let khataSql = `
+        SELECT ke.id, ke.amount, ke.entry_date AS date,
+               COALESCE(ke.entry_time, TIME(ke.created_at)) AS time,
+               ke.created_at,
+               COALESCE(cu.name, 'Walk-in') AS name,
+               COALESCE(cu.name, 'Walk-in') AS party_name,
+               COALESCE(cu.name, 'Walk-in') AS customer_name,
+               ke.description,
+               ke.type,
+               COALESCE(ke.payment_mode, 'cash') AS payment_mode,
+               COALESCE(ke.payment_mode, 'cash') AS payment_type,
+               ke.customer_id,
+               s.product_name,
+               ke.product_id,
+               ke.quantity,
+               ke.unit_price,
+               ke.items,
+               ke.is_linked_to_payment,
+               ke.payment_id,
+               'khata_entry' AS source
+        FROM khata_entries ke
+        LEFT JOIN customers cu ON cu.id = ke.customer_id
+        LEFT JOIN stock s ON s.id = ke.product_id
+        WHERE ke.created_by = ?
+      `;
+      const khataParams = [id];
+      if (customerId) {
+        khataSql += " AND ke.customer_id = ?";
+        khataParams.push(customerId);
+      }
+      if (from) {
+        khataSql += " AND ke.entry_date >= ?";
+        khataParams.push(from);
+      }
+      if (to) {
+        khataSql += " AND ke.entry_date <= ?";
+        khataParams.push(to);
+      }
 
-      rows = [...sales, ...debits, ...dues].sort(
+      let duesSql = `
+        SELECT cd.id, cd.amount, cd.remaining_amount,
+               COALESCE(cd.due_date, DATE(cd.created_at)) AS date,
+               COALESCE(cd.due_time, TIME(cd.created_at)) AS time,
+               cd.created_at,
+               COALESCE(cu.name, 'Customer') AS name,
+               COALESCE(cu.name, 'Customer') AS party_name,
+               COALESCE(cu.name, 'Customer') AS customer_name,
+               cd.description,
+               'due' AS type,
+               COALESCE(cd.payment_mode, 'credit') AS payment_mode,
+               cd.status,
+               cd.customer_id,
+               s.product_name,
+               cd.product_id,
+               cd.quantity,
+               cd.unit_price,
+               cd.items,
+               0 AS is_linked_to_payment,
+               NULL AS payment_id,
+               'customer_due' AS source
+        FROM customer_dues cd
+        LEFT JOIN customers cu ON cu.id = cd.customer_id
+        LEFT JOIN stock s ON s.id = cd.product_id
+        WHERE cd.created_by = ?
+      `;
+      const duesParams = [id];
+      if (customerId) {
+        duesSql += " AND cd.customer_id = ?";
+        duesParams.push(customerId);
+      }
+      if (from) {
+        duesSql += " AND COALESCE(cd.due_date, DATE(cd.created_at)) >= ?";
+        duesParams.push(from);
+      }
+      if (to) {
+        duesSql += " AND COALESCE(cd.due_date, DATE(cd.created_at)) <= ?";
+        duesParams.push(to);
+      }
+
+      const [sales] = await pool.query(salesSql, salesParams);
+      const [khataEntries] = await pool.query(khataSql, khataParams);
+      const [dues] = await pool.query(duesSql, duesParams);
+
+      rows = [...sales, ...khataEntries, ...dues];
+      if (entryType && entryType !== "khata" && entryType !== "all") {
+        const et = String(entryType).trim().toLowerCase();
+        rows = rows.filter((r) => r.type === et || r.category === et);
+      }
+      rows.sort(
         (a, b) =>
           new Date(b.date) - new Date(a.date) ||
           new Date(b.created_at) - new Date(a.created_at)
@@ -944,16 +940,109 @@ const getUserData = asyncHandler(async (req, res) => {
     }
 
     case "payments": {
-      const [result] = await pool.query(
-        `SELECT p.*, u.name AS added_by, cu.name AS customer_name
-         FROM payments p
-         LEFT JOIN users u ON u.id = p.created_by
-         LEFT JOIN customers cu ON cu.id = p.customer_id
-         WHERE p.created_by = ?
-         ORDER BY p.payment_date DESC, p.created_at DESC`,
-        [id]
-      );
+      const from = req.query.from || req.query.start_date || req.query.startDate;
+      const to = req.query.to || req.query.end_date || req.query.endDate;
+      const customerId = req.query.customer_id;
+      const cat = req.query.payment_category || req.query.category;
+
+      let paySql = `
+        SELECT p.*, u.name AS added_by, cu.name AS customer_name
+        FROM payments p
+        LEFT JOIN users u ON u.id = p.created_by
+        LEFT JOIN customers cu ON cu.id = p.customer_id
+        WHERE p.created_by = ?
+      `;
+      const payParams = [id];
+      if (customerId) {
+        paySql += " AND p.customer_id = ?";
+        payParams.push(customerId);
+      }
+      if (from) {
+        paySql += " AND p.payment_date >= ?";
+        payParams.push(from);
+      }
+      if (to) {
+        paySql += " AND p.payment_date <= ?";
+        payParams.push(to);
+      }
+      if (cat) {
+        paySql += " AND p.payment_category = ?";
+        payParams.push(cat);
+      }
+
+      paySql += " ORDER BY p.payment_date DESC, p.created_at DESC";
+      const [result] = await pool.query(paySql, payParams);
       rows = result;
+      break;
+    }
+
+    case "purchase-bills":
+    case "purchase_bills":
+    case "purchases": {
+      const from = req.query.from || req.query.start_date || req.query.startDate;
+      const to = req.query.to || req.query.end_date || req.query.endDate;
+      const isPaid = req.query.is_paid;
+
+      let pbSql = `
+        SELECT pb.*, u.name AS added_by,
+               COALESCE(p.payment_mode, CASE WHEN pb.is_paid = 1 THEN 'cash' ELSE 'unpaid' END) AS payment_mode,
+               p.payment_category,
+               p.purpose AS payment_reference
+        FROM purchase_bills pb
+        LEFT JOIN users u ON u.id = pb.created_by
+        LEFT JOIN payments p ON p.id = pb.payment_id
+        WHERE pb.created_by = ?
+      `;
+      const pbParams = [id];
+      if (from) {
+        pbSql += " AND pb.bill_date >= ?";
+        pbParams.push(from);
+      }
+      if (to) {
+        pbSql += " AND pb.bill_date <= ?";
+        pbParams.push(to);
+      }
+      if (isPaid !== undefined && isPaid !== null && isPaid !== "") {
+        pbSql += " AND pb.is_paid = ?";
+        pbParams.push(Number(isPaid) ? 1 : 0);
+      }
+
+      pbSql += " ORDER BY pb.bill_date DESC, pb.id DESC";
+      const [billRows] = await pool.query(pbSql, pbParams);
+
+      if (billRows.length) {
+        const billIds = billRows.map((b) => b.id);
+        const [itemRows] = await pool.query(
+          `SELECT pbi.*, s.product_name AS linked_stock_name
+           FROM purchase_bill_items pbi
+           LEFT JOIN stock s ON s.id = pbi.product_id
+           WHERE pbi.purchase_bill_id IN (?)
+           ORDER BY pbi.id ASC`,
+          [billIds]
+        );
+
+        const itemsByBill = {};
+        for (const item of itemRows) {
+          if (!itemsByBill[item.purchase_bill_id]) itemsByBill[item.purchase_bill_id] = [];
+          itemsByBill[item.purchase_bill_id].push(item);
+        }
+
+        for (const bill of billRows) {
+          bill.items = itemsByBill[bill.id] || [];
+          bill.total_amount = Math.round(
+            bill.items.reduce((acc, it) => {
+              const qty = Number(it.quantity || 0);
+              const pr = Number(it.price || 0);
+              const disc = Number(it.discount || 0);
+              const gst = Number(it.gst_rate || 0);
+              const base = Math.max(0, qty * pr - disc);
+              return acc + base * (1 + gst / 100);
+            }, 0) * 100
+          ) / 100;
+        }
+      }
+
+      rows = billRows;
       break;
     }
 
@@ -1067,19 +1156,39 @@ const getUserData = asyncHandler(async (req, res) => {
     }
 
     case "reports": {
-      const reports = await calculateUserReports(id);
+      const from = req.query.from || req.query.start_date || req.query.startDate;
+      const to = req.query.to || req.query.end_date || req.query.endDate;
+      const period = req.query.period || req.query.timeframe || req.query.range;
+      const range = resolvePeriodRange(period, from, to);
+      const reports = await calculateUserReports(id, range.from, range.to, period);
       return res.json({
         success: true,
         user: userRows[0],
         type: "reports",
+        period: period || "all-time",
+        range: { from: range.from || "all-time", to: range.to || "all-time" },
         reports,
+      });
+    }
+
+    case "reports-drilldown":
+    case "drilldown": {
+      const metricParam = (req.query.metric || req.params.metric || "").trim().toLowerCase();
+      const categoryParam = (req.query.category || req.query.sub_metric || req.query.subMetric || "").trim().toLowerCase();
+      const from = req.query.from || req.query.start_date || req.query.startDate;
+      const to = req.query.to || req.query.end_date || req.query.endDate;
+      const period = req.query.period || req.query.timeframe || req.query.range;
+      const result = await executeReportDrilldown(id, metricParam, period, from, to, categoryParam);
+      return res.json({
+        ...result,
+        user: userRows[0],
       });
     }
 
     default:
       throw new ApiError(
         400,
-        "Invalid data type. Use customers, khata, payments, invoices, quotations, money-receipts, inventory, vehicles, or reports."
+        "Invalid data type. Use customers, khata, payments, purchase-bills, invoices, quotations, money-receipts, inventory, vehicles, or reports."
       );
   }
 
@@ -1089,6 +1198,14 @@ const getUserData = asyncHandler(async (req, res) => {
     type,
     count: rows.length,
     [type === "money-receipts" ? "receipts" : type]: rows,
+    records: rows,
+    data: rows,
+    purchase_bills: rows,
+    purchaseBills: rows,
+    bills: rows,
+    khata: rows,
+    entries: rows,
+    ledger: rows,
   });
 });
 
@@ -1326,6 +1443,145 @@ const getUserRecord = asyncHandler(async (req, res) => {
     }
 
     record = rows[0];
+  } else if (
+    type === "purchase-bill" ||
+    type === "purchase_bill" ||
+    type === "purchase-bills" ||
+    type === "purchase_bills" ||
+    type === "purchases"
+  ) {
+    const [pbRows] = await pool.query(
+      `SELECT pb.*, u.name AS added_by,
+              COALESCE(p.payment_mode, CASE WHEN pb.is_paid = 1 THEN 'cash' ELSE 'unpaid' END) AS payment_mode,
+              p.payment_category,
+              p.purpose AS payment_reference
+       FROM purchase_bills pb
+       LEFT JOIN users u ON u.id = pb.created_by
+       LEFT JOIN payments p ON p.id = pb.payment_id
+       WHERE pb.id = ? AND pb.created_by = ?`,
+      [recordId, id]
+    );
+
+    if (!pbRows.length) {
+      throw new ApiError(404, "Purchase bill not found.");
+    }
+
+    const [itemRows] = await pool.query(
+      `SELECT pbi.*, s.product_name AS linked_stock_name
+       FROM purchase_bill_items pbi
+       LEFT JOIN stock s ON s.id = pbi.product_id
+       WHERE pbi.purchase_bill_id = ?
+       ORDER BY pbi.id ASC`,
+      [recordId]
+    );
+
+    record = pbRows[0];
+    items = itemRows;
+    const enrichedItems = itemRows.map((it) => {
+      const qty = Number(it.quantity || 0);
+      const price = Number(it.price || 0);
+      const discount = Number(it.discount || 0);
+      const gstRate = Number(it.gst_rate || 0);
+      const taxable = Math.max(0, qty * price - discount);
+      const gstAmt = Math.round(((taxable * gstRate) / 100) * 100) / 100;
+      const totalAmt = Math.round((taxable + gstAmt) * 100) / 100;
+      return {
+        ...it,
+        taxable_amount: taxable,
+        gst_amount: gstAmt,
+        total_amount: totalAmt,
+      };
+    });
+    const totalAmount = Math.round(enrichedItems.reduce((acc, it) => acc + it.total_amount, 0) * 100) / 100;
+    record.items = enrichedItems;
+    record.total_amount = totalAmount;
+    record.item_names = enrichedItems.map((i) => i.item_name).filter(Boolean).join(", ");
+  } else if (
+    type === "khata" ||
+    type === "khata-entry" ||
+    type === "khata_entry" ||
+    type === "khata-entries" ||
+    type === "khata_entries" ||
+    type === "collection" ||
+    type === "customer_due" ||
+    type === "due"
+  ) {
+    const sourceParam = String(req.query.source || "").toLowerCase().trim();
+
+    const fetchKe = async () => {
+      const [rows] = await pool.query(
+        `SELECT ke.*, cu.name AS customer_name, cu.phone AS customer_phone, cu.email AS customer_email,
+                s.product_name
+         FROM khata_entries ke
+         LEFT JOIN customers cu ON cu.id = ke.customer_id
+         LEFT JOIN stock s ON s.id = ke.product_id
+         WHERE ke.id = ? AND ke.created_by = ?`,
+        [recordId, id]
+      );
+      if (rows.length) {
+        return {
+          ...rows[0],
+          entry_type: rows[0].type,
+          source: "khata_entry",
+        };
+      }
+      return null;
+    };
+
+    const fetchDue = async () => {
+      const [rows] = await pool.query(
+        `SELECT cd.*, cu.name AS customer_name, cu.phone AS customer_phone, cu.email AS customer_email,
+                s.product_name
+         FROM customer_dues cd
+         LEFT JOIN customers cu ON cu.id = cd.customer_id
+         LEFT JOIN stock s ON s.id = cd.product_id
+         WHERE cd.id = ? AND cd.created_by = ?`,
+        [recordId, id]
+      );
+      if (rows.length) {
+        return {
+          ...rows[0],
+          type: "due",
+          entry_type: "due",
+          source: "customer_due",
+        };
+      }
+      return null;
+    };
+
+    const fetchCol = async () => {
+      const [rows] = await pool.query(
+        `SELECT c.*, cu.name AS customer_name, cu.phone AS customer_phone, cu.email AS customer_email
+         FROM collections c
+         LEFT JOIN customers cu ON cu.id = c.customer_id
+         WHERE c.id = ? AND c.created_by = ?`,
+        [recordId, id]
+      );
+      if (rows.length) {
+        const isDue = String(rows[0].payment_type || "").toLowerCase() === "due";
+        return {
+          ...rows[0],
+          type: isDue ? "due" : "credit",
+          entry_type: isDue ? "due" : "credit",
+          source: "collection",
+        };
+      }
+      return null;
+    };
+
+    if (sourceParam === "collection" || type === "collection") {
+      record = (await fetchCol()) || (await fetchKe()) || (await fetchDue());
+    } else if (sourceParam === "customer_due" || type === "customer_due" || type === "due") {
+      record = (await fetchDue()) || (await fetchKe()) || (await fetchCol());
+    } else if (sourceParam === "khata_entry" || type === "khata_entry" || type === "khata-entry") {
+      record = (await fetchKe()) || (await fetchDue()) || (await fetchCol());
+    } else {
+      record = (await fetchKe()) || (await fetchDue()) || (await fetchCol());
+    }
+
+    if (!record) {
+      throw new ApiError(404, "Khata record not found.");
+    }
   } else {
     throw new ApiError(
       400,
@@ -1382,65 +1638,139 @@ const getUserKhata = asyncHandler(async (req, res) => {
   );
   if (!userRows.length) throw new ApiError(404, "User not found.");
 
-  const [sales] = await pool.query(
-    `SELECT c.id, c.amount, c.sale_date AS date, c.created_at,
-            COALESCE(cu.name, 'Walk-in') AS name,
-            CONCAT('Sale', IF(c.item_name IS NOT NULL, CONCAT(' - ', c.item_name), '')) AS description,
-            'credit' AS type, c.payment_type,
-            c.customer_id,
-            c.item_name AS product_name,
-            NULL AS product_id,
-            NULL AS quantity,
-            NULL AS unit_price,
-            0 AS is_linked_to_payment,
-            NULL AS payment_id
-     FROM collections c
-     LEFT JOIN customers cu ON cu.id = c.customer_id
-     WHERE c.created_by = ?`,
-    [id]
-  );
+  let { customer_id, from, to, start_date, startDate, end_date, endDate, type, period, timeframe, range } = req.query;
+  from = from || start_date || startDate;
+  to = to || end_date || endDate;
+  const resolvedPeriod = period || timeframe || range;
+  if (resolvedPeriod && (!from || !to)) {
+    const boundaries = resolvePeriodRange(resolvedPeriod);
+    if (boundaries.from && !from) from = boundaries.from;
+    if (boundaries.to && !to) to = boundaries.to;
+  }
 
-  const [khataRows] = await pool.query(
-    `SELECT ke.id, ke.amount, ke.entry_date AS date, ke.created_at,
-            COALESCE(cu.name, 'Walk-in') AS name,
-            ke.description,
-            ke.type,
-            NULL AS payment_type,
-            ke.customer_id,
-            s.product_name,
-            ke.product_id,
-            ke.quantity,
-            ke.unit_price,
-            ke.is_linked_to_payment,
-            ke.payment_id
-     FROM khata_entries ke
-     LEFT JOIN customers cu ON cu.id = ke.customer_id
-     LEFT JOIN stock s ON s.id = ke.product_id
-     WHERE ke.created_by = ?`,
-    [id]
-  );
+  // 1. Collections (sales)
+  let salesSql = `
+    SELECT c.id, c.amount, c.sale_date AS date,
+           TIME(c.created_at) AS time,
+           c.created_at,
+           COALESCE(cu.name, 'Walk-in') AS name,
+           COALESCE(cu.name, 'Walk-in') AS party_name,
+           COALESCE(cu.name, 'Walk-in') AS customer_name,
+           CONCAT('Sale', IF(c.item_name IS NOT NULL, CONCAT(' - ', c.item_name), '')) AS description,
+           CASE WHEN LOWER(COALESCE(c.payment_type, '')) = 'due' THEN 'due' ELSE 'credit' END AS type,
+           c.payment_type AS payment_mode,
+           c.payment_type,
+           c.customer_id,
+           c.item_name AS product_name,
+           NULL AS product_id,
+           NULL AS quantity,
+           NULL AS unit_price,
+           NULL AS items,
+           0 AS is_linked_to_payment,
+           NULL AS payment_id,
+           'collection' AS source
+    FROM collections c
+    LEFT JOIN customers cu ON cu.id = c.customer_id
+    WHERE c.created_by = ?
+  `;
+  const salesParams = [id];
+  if (customer_id) {
+    salesSql += " AND c.customer_id = ?";
+    salesParams.push(customer_id);
+  }
+  if (from) {
+    salesSql += " AND c.sale_date >= ?";
+    salesParams.push(from);
+  }
+  if (to) {
+    salesSql += " AND c.sale_date <= ?";
+    salesParams.push(to);
+  }
 
-  const [dues] = await pool.query(
-    `SELECT cd.id, cd.amount, cd.remaining_amount,
-            COALESCE(cd.due_date, DATE(cd.created_at)) AS date,
-            cd.created_at,
-            COALESCE(cu.name, 'Customer') AS name,
-            cd.description,
-            'due' AS type,
-            cd.status,
-            cd.customer_id,
-            s.product_name,
-            cd.product_id,
-            cd.quantity,
-            cd.unit_price,
-            0 AS is_linked_to_payment,
-            NULL AS payment_id
-     FROM customer_dues cd
-     LEFT JOIN customers cu ON cu.id = cd.customer_id
-     LEFT JOIN stock s ON s.id = cd.product_id
-     WHERE cd.created_by = ?`,
-    [id]
-  );
+  // 2. Khata entries (Credit & Debit)
+  let khataSql = `
+    SELECT ke.id, ke.amount, ke.entry_date AS date,
+           COALESCE(ke.entry_time, TIME(ke.created_at)) AS time,
+           ke.created_at,
+           COALESCE(cu.name, 'Walk-in') AS name,
+           COALESCE(cu.name, 'Walk-in') AS party_name,
+           COALESCE(cu.name, 'Walk-in') AS customer_name,
+           ke.description,
+           ke.type,
+           COALESCE(ke.payment_mode, 'cash') AS payment_mode,
+           COALESCE(ke.payment_mode, 'cash') AS payment_type,
+           ke.customer_id,
+           s.product_name,
+           ke.product_id,
+           ke.quantity,
+           ke.unit_price,
+           ke.items,
+           ke.is_linked_to_payment,
+           ke.payment_id,
+           'khata_entry' AS source
+    FROM khata_entries ke
+    LEFT JOIN customers cu ON cu.id = ke.customer_id
+    LEFT JOIN stock s ON s.id = ke.product_id
+    WHERE ke.created_by = ?
+  `;
+  const khataParams = [id];
+  if (customer_id) {
+    khataSql += " AND ke.customer_id = ?";
+    khataParams.push(customer_id);
+  }
+  if (from) {
+    khataSql += " AND ke.entry_date >= ?";
+    khataParams.push(from);
+  }
+  if (to) {
+    khataSql += " AND ke.entry_date <= ?";
+    khataParams.push(to);
+  }
+
+  // 3. Customer Dues
+  let duesSql = `
+    SELECT cd.id, cd.amount, cd.remaining_amount,
+           COALESCE(cd.due_date, DATE(cd.created_at)) AS date,
+           COALESCE(cd.due_time, TIME(cd.created_at)) AS time,
+           cd.created_at,
+           COALESCE(cu.name, 'Customer') AS name,
+           COALESCE(cu.name, 'Customer') AS party_name,
+           COALESCE(cu.name, 'Customer') AS customer_name,
+           cd.description,
+           'due' AS type,
+           COALESCE(cd.payment_mode, 'credit') AS payment_mode,
+           cd.status,
+           cd.customer_id,
+           s.product_name,
+           cd.product_id,
+           cd.quantity,
+           cd.unit_price,
+           cd.items,
+           0 AS is_linked_to_payment,
+           NULL AS payment_id,
+           'customer_due' AS source
+    FROM customer_dues cd
+    LEFT JOIN customers cu ON cu.id = cd.customer_id
+    LEFT JOIN stock s ON s.id = cd.product_id
+    WHERE cd.created_by = ?
+  `;
+  const duesParams = [id];
+  if (customer_id) {
+    duesSql += " AND cd.customer_id = ?";
+    duesParams.push(customer_id);
+  }
+  if (from) {
+    duesSql += " AND COALESCE(cd.due_date, DATE(cd.created_at)) >= ?";
+    duesParams.push(from);
+  }
+  if (to) {
+    duesSql += " AND COALESCE(cd.due_date, DATE(cd.created_at)) <= ?";
+    duesParams.push(to);
+  }
+
+  const [sales] = await pool.query(salesSql, salesParams);
+  const [khataRows] = await pool.query(khataSql, khataParams);
+  const [dues] = await pool.query(duesSql, duesParams);
 
   const normalizedSales = sales.map((row) => ({
     ...row,
@@ -1476,7 +1806,13 @@ const getUserKhata = asyncHandler(async (req, res) => {
     signed_amount: Number(row.amount || 0),
   }));
 
-  const entries = [...normalizedSales, ...normalizedKhata, ...normalizedDues].sort(
+  let entries = [...normalizedSales, ...normalizedKhata, ...normalizedDues];
+  if (type) {
+    const t = String(type).trim().toLowerCase();
+    entries = entries.filter((e) => e.type === t || e.category === t);
+  }
+
+  entries.sort(
     (a, b) =>
       new Date(b.date) - new Date(a.date) ||
       new Date(b.created_at) - new Date(a.created_at)
@@ -1520,6 +1856,165 @@ const getUserKhata = asyncHandler(async (req, res) => {
     },
     entries,
     khata: entries,
+    ledger: entries,
+    data: entries,
+  });
+});
+
+const getUserPayments = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  let { customer_id, from, to, start_date, startDate, end_date, endDate, type, payment_type, payment_category } = req.query;
+  from = from || start_date || startDate;
+  to = to || end_date || endDate;
+  const cat = type || payment_type || payment_category;
+
+  let sql = `
+    SELECT p.*, u.name AS added_by, cu.name AS customer_name
+    FROM payments p
+    LEFT JOIN users u ON u.id = p.created_by
+    LEFT JOIN customers cu ON cu.id = p.customer_id
+    WHERE p.created_by = ?
+  `;
+  const params = [id];
+
+  if (customer_id) {
+    sql += " AND p.customer_id = ?";
+    params.push(customer_id);
+  }
+  if (from) {
+    sql += " AND p.payment_date >= ?";
+    params.push(from);
+  }
+  if (to) {
+    sql += " AND p.payment_date <= ?";
+    params.push(to);
+  }
+  if (cat) {
+    sql += " AND p.payment_category = ?";
+    params.push(cat);
+  }
+
+  sql += " ORDER BY p.payment_date DESC, p.created_at DESC";
+
+  const [rows] = await pool.query(sql, params);
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    count: rows.length,
+    payments: rows,
+    data: rows,
+  });
+});
+
+const getUserPurchaseBills = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  let { from, to, start_date, startDate, end_date, endDate, is_paid } = req.query;
+  from = from || start_date || startDate;
+  to = to || end_date || endDate;
+
+  let sql = `
+    SELECT pb.*, u.name AS added_by,
+           COALESCE(p.payment_mode, CASE WHEN pb.is_paid = 1 THEN 'cash' ELSE 'unpaid' END) AS payment_mode,
+           p.payment_category,
+           p.purpose AS payment_reference
+    FROM purchase_bills pb
+    LEFT JOIN users u ON u.id = pb.created_by
+    LEFT JOIN payments p ON p.id = pb.payment_id
+    WHERE pb.created_by = ?
+  `;
+  const params = [id];
+
+  if (from) {
+    sql += " AND pb.bill_date >= ?";
+    params.push(from);
+  }
+  if (to) {
+    sql += " AND pb.bill_date <= ?";
+    params.push(to);
+  }
+  if (is_paid !== undefined && is_paid !== null && is_paid !== "") {
+    sql += " AND pb.is_paid = ?";
+    params.push(Number(is_paid) ? 1 : 0);
+  }
+
+  sql += " ORDER BY pb.bill_date DESC, pb.id DESC";
+
+  const [billRows] = await pool.query(sql, params);
+
+  if (billRows.length) {
+    const billIds = billRows.map((b) => b.id);
+    const [itemRows] = await pool.query(
+      `SELECT pbi.*, s.product_name AS linked_stock_name
+       FROM purchase_bill_items pbi
+       LEFT JOIN stock s ON s.id = pbi.product_id
+       WHERE pbi.purchase_bill_id IN (?)
+       ORDER BY pbi.id ASC`,
+      [billIds]
+    );
+
+    const itemsByBill = {};
+    for (const item of itemRows) {
+      if (!itemsByBill[item.purchase_bill_id]) itemsByBill[item.purchase_bill_id] = [];
+      itemsByBill[item.purchase_bill_id].push(item);
+    }
+
+    for (const bill of billRows) {
+      bill.items = itemsByBill[bill.id] || [];
+      bill.total_amount = Math.round(
+        bill.items.reduce((acc, it) => {
+          const qty = Number(it.quantity || 0);
+          const pr = Number(it.price || 0);
+          const disc = Number(it.discount || 0);
+          const gst = Number(it.gst_rate || 0);
+          const base = Math.max(0, qty * pr - disc);
+          return acc + base * (1 + gst / 100);
+        }, 0) * 100
+      ) / 100;
+    }
+  }
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    count: billRows.length,
+    purchase_bills: billRows,
+    purchaseBills: billRows,
+    bills: billRows,
+    data: billRows,
+  });
+});
+
+const getUserReportDrilldown = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  const metricParam = (req.params.metric || req.query.metric || "").trim().toLowerCase();
+  const categoryParam = (req.query.category || req.query.sub_metric || req.query.subMetric || "").trim().toLowerCase();
+  const from = req.query.from || req.query.start_date || req.query.startDate;
+  const to = req.query.to || req.query.end_date || req.query.endDate;
+  const period = req.query.period || req.query.timeframe || req.query.range;
+
+  const result = await executeReportDrilldown(id, metricParam, period, from, to, categoryParam);
+  res.json({
+    ...result,
+    user: userRows[0],
   });
 });
 
@@ -1628,12 +2123,51 @@ const getUserReports = asyncHandler(async (req, res) => {
   );
   if (!userRows.length) throw new ApiError(404, "User not found.");
 
-  const reports = await calculateUserReports(id);
+  const from = req.query.from || req.query.start_date || req.query.startDate;
+  const to = req.query.to || req.query.end_date || req.query.endDate;
+  const period = req.query.period || req.query.timeframe || req.query.range;
+  const range = resolvePeriodRange(period, from, to);
+  const reports = await calculateUserReports(id, range.from, range.to, period);
 
   res.json({
     success: true,
     user: userRows[0],
+    period: period || "all-time",
+    range: { from: range.from || "all-time", to: range.to || "all-time" },
     reports,
+  });
+});
+
+const getUserReportGraph = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  const from = req.query.from || req.query.start_date || req.query.startDate;
+  const to = req.query.to || req.query.end_date || req.query.endDate;
+  const period = req.query.period || req.query.timeframe || req.query.range;
+  const monthsParam = Number(req.query.months);
+
+  let p = period ? String(period).trim().toLowerCase() : "";
+  if (!p) {
+    if (monthsParam === 12) p = "last_12_months";
+    else if (from || to) p = "custom";
+    else p = "last_6_months";
+  }
+
+  const points = await calculateGraphPoints(id, p, from, to);
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    period: p,
+    points,
+    trend: points,
+    graph: points,
+    sales_vs_expenses: points,
   });
 });
 
@@ -1686,6 +2220,10 @@ module.exports = {
   getUserInventory,
   getUserVehicles,
   getUserReports,
+  getUserReportGraph,
+  getUserPayments,
+  getUserPurchaseBills,
+  getUserReportDrilldown,
   deleteUserCustomer,
   listUsers,
   getUser,

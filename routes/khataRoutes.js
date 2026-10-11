@@ -11,11 +11,21 @@ const {
   linkKhataDebitToPayment,
   skipKhataDebit,
   unskipKhataDebit,
+  updateKhataEntry,
+  deleteKhataEntry,
+  searchKhataCustomers,
+  searchKhataProducts,
 } = require("../controllers/khataController");
 const { authenticate, authorize } = require("../middleware/auth");
 
 router.use(authenticate, authorize("user", "employee", "superadmin"));
 
+router.get("/search/customers", searchKhataCustomers);
+router.get("/search/products", searchKhataProducts);
+router.get("/search-customers", searchKhataCustomers);
+router.get("/search-products", searchKhataProducts);
+router.get("/customers", searchKhataCustomers);
+router.get("/products", searchKhataProducts);
 router.get("/dashboard", getKhataDashboard);
 router.get("/summary", getKhataDashboard);
 router.get("/unlinked-debits", getUnlinkedKhataDebits);
@@ -28,5 +38,8 @@ router.post("/debit", addKhataDebit);
 router.post("/credit", addKhataCredit);
 router.post("/", addKhataEntry);
 router.get("/", getKhata);
+router.put("/:id", updateKhataEntry);
+router.patch("/:id", updateKhataEntry);
+router.delete("/:id", deleteKhataEntry);
 
 module.exports = router;

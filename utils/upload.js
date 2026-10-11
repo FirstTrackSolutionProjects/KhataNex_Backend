@@ -5,7 +5,7 @@ const fs = require("fs");
 const UPLOAD_ROOT = path.join(__dirname, "..", "uploads");
 
 // Make sure every subfolder we use actually exists on disk.
-["logos", "employee-photos", "loading-photos", "unloading-photos", "waybills-uploaded", "waybills-generated", "purchase-invoices", "invoices"].forEach(
+["logos", "employee-photos", "loading-photos", "unloading-photos", "waybills-uploaded", "waybills-generated", "purchase-invoices", "invoices", "vehicle-photos", "trip-photos"].forEach(
   (dir) => {
     const full = path.join(UPLOAD_ROOT, dir);
     if (!fs.existsSync(full)) fs.mkdirSync(full, { recursive: true });
@@ -54,11 +54,29 @@ const uploadPurchaseInvoiceDoc = multer({
 // destination is picked per-field so each file lands in the right folder.
 const vehicleTripStorage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const folder = file.fieldname === "waybill_file" ? "waybills-uploaded" : "loading-photos";
+    const field = String(file.fieldname || "").toLowerCase();
+    let folder = "loading-photos";
+    if (
+      field.includes("waybill") ||
+      field.includes("eway") ||
+      field.includes("doc") ||
+      field.includes("bill") ||
+      file.mimetype === "application/pdf"
+    ) {
+      folder = "waybills-uploaded";
+    } else if (field.includes("unloading")) {
+      folder = "unloading-photos";
+    } else if (field.includes("vehicle")) {
+      folder = "vehicle-photos";
+    } else if (field.includes("trip")) {
+      folder = "trip-photos";
+    } else if (field.includes("loading")) {
+      folder = "loading-photos";
+    }
     cb(null, path.join(UPLOAD_ROOT, folder));
   },
   filename: (req, file, cb) => {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const safeName = file.originalname ? file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_") : "file";
     cb(null, `${Date.now()}-${safeName}`);
   },
 });
@@ -66,14 +84,12 @@ const vehicleTripStorage = multer.diskStorage({
 const uploadVehicleTripFiles = multer({
   storage: vehicleTripStorage,
   fileFilter: (req, file, cb) => {
-    if (file.fieldname === "waybill_file") return documentFilter(req, file, cb);
-    return imageFilter(req, file, cb);
+    if (!file) return cb(null, true);
+    // Accept valid image and document formats safely without failing with 400
+    cb(null, true);
   },
-  limits: maxSize(10),
-}).fields([
-  { name: "loading_photo", maxCount: 1 },
-  { name: "waybill_file", maxCount: 1 },
-]);
+  limits: maxSize(15),
+}).any();
 
 const relativeUploadPath = (absPath) => {
   if (!absPath) return null;

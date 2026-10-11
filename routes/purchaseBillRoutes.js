@@ -6,6 +6,7 @@ const {
   getPurchaseBill,
   updatePurchaseBill,
   deletePurchaseBill,
+  searchPurchaseItems,
 } = require("../controllers/purchaseBillController");
 
 const {
@@ -26,6 +27,8 @@ router.use(
   )
 );
 
+router.get("/items", searchPurchaseItems);
+router.get("/search-items", searchPurchaseItems);
 router.get("/", listPurchaseBills);
 router.get("/:id", getPurchaseBill);
 router.post("/", addPurchaseBill);

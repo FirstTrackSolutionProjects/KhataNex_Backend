@@ -150,36 +150,93 @@ const addPurchaseInvoice = asyncHandler(async (req, res) => {
 });
 
 const lookupByHsn = asyncHandler(async (req, res) => {
-  const { hsn_code } = req.query;
+  const hsn_code = req.query.hsn_code || req.query.hsn;
+  const search = req.query.search || req.query.q;
 
-  if (!hsn_code) {
+  if (!hsn_code && !search) {
     return res.json({
       success: true,
       found: false,
     });
   }
 
-  const [rows] = await pool.query(
-    `SELECT product_name, hsn_code, quantity, price,
-            seller_name, invoice_date
-     FROM purchase_invoices
-     WHERE hsn_code = ? AND created_by = ?
-     ORDER BY invoice_date DESC, created_at DESC
-     LIMIT 1`,
-    [hsn_code, req.user.id]
-  );
+  // 1. Search modern purchase_bill_items first
+  let billSql = `
+    SELECT pbi.item_name AS product_name,
+           pbi.item_name,
+           pbi.hsn_code,
+           pbi.quantity,
+           pbi.price AS purchase_price,
+           pbi.price,
+           pbi.unit,
+           pbi.gst_rate,
+           pbi.item_type,
+           pb.vendor_name AS seller_name,
+           pb.vendor_name,
+           pb.bill_date AS invoice_date,
+           pb.bill_number,
+           pb.id AS purchase_bill_id,
+           pbi.id AS purchase_bill_item_id
+    FROM purchase_bill_items pbi
+    JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
+    WHERE pb.created_by = ?
+  `;
+  const billParams = [req.user.id];
+  if (hsn_code) {
+    billSql += " AND pbi.hsn_code = ?";
+    billParams.push(hsn_code);
+  }
+  if (search) {
+    billSql += " AND (pbi.item_name LIKE ? OR pbi.hsn_code LIKE ? OR pb.vendor_name LIKE ? OR pb.bill_number LIKE ?)";
+    const term = `%${search}%`;
+    billParams.push(term, term, term, term);
+  }
+  billSql += " ORDER BY pb.bill_date DESC, pbi.id DESC LIMIT 1";
 
-  if (!rows.length) {
+  const [billRows] = await pool.query(billSql, billParams);
+  if (billRows.length) {
     return res.json({
       success: true,
-      found: false,
+      found: true,
+      match: billRows[0],
+      product: billRows[0],
+      item: billRows[0],
+    });
+  }
+
+  // 2. Fallback to purchase_invoices
+  let legacySql = `
+    SELECT product_name, hsn_code, quantity, price AS purchase_price, price,
+           seller_name, invoice_date
+    FROM purchase_invoices
+    WHERE created_by = ?
+  `;
+  const legacyParams = [req.user.id];
+  if (hsn_code) {
+    legacySql += " AND hsn_code = ?";
+    legacyParams.push(hsn_code);
+  }
+  if (search) {
+    legacySql += " AND (product_name LIKE ? OR hsn_code LIKE ? OR seller_name LIKE ?)";
+    const term = `%${search}%`;
+    legacyParams.push(term, term, term);
+  }
+  legacySql += " ORDER BY invoice_date DESC, created_at DESC LIMIT 1";
+
+  const [legacyRows] = await pool.query(legacySql, legacyParams);
+  if (legacyRows.length) {
+    return res.json({
+      success: true,
+      found: true,
+      match: legacyRows[0],
+      product: legacyRows[0],
+      item: legacyRows[0],
     });
   }
 
   res.json({
     success: true,
-    found: true,
-    match: rows[0],
+    found: false,
   });
 });
 

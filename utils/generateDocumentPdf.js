@@ -241,6 +241,89 @@ const amountInWordsINR = (
  * ============================================================
  */
 
+
+/*
+ * ============================================================
+ * WATERMARK HELPERS
+ * ============================================================
+ */
+
+const resolveWatermarkEnabled = (doc, company) => {
+  if (doc?.remove_watermark === 1 || doc?.remove_watermark === true || doc?.remove_watermark === "1") return false;
+  if (doc?.show_watermark === 0 || doc?.show_watermark === false || doc?.show_watermark === "0") return false;
+  if (company?.remove_watermark === 1 || company?.remove_watermark === true || company?.remove_watermark === "1") return false;
+  if (company?.show_watermark === 0 || company?.show_watermark === false || company?.show_watermark === "0") return false;
+
+  if (doc?.watermark_enabled !== undefined && doc?.watermark_enabled !== null) {
+    return Boolean(doc.watermark_enabled === 1 || doc.watermark_enabled === true || doc.watermark_enabled === "1");
+  }
+  if (company?.watermark_enabled !== undefined && company?.watermark_enabled !== null) {
+    return Boolean(company.watermark_enabled === 1 || company.watermark_enabled === true || company.watermark_enabled === "1");
+  }
+
+  return true;
+};
+
+const getKhataNexLogoPath = () => {
+  const candidates = [
+    path.join(__dirname, "../public/images/Logo2.png"),
+    path.join(__dirname, "../assets/images/Logo2.png"),
+    path.join(UPLOAD_ROOT, "logos/khatanex-logo.png"),
+    path.join(__dirname, "../public/images/Logo.jpeg"),
+    path.join(__dirname, "../assets/images/Logo.jpeg"),
+    "/Users/swarajbasu/Downloads/KhataNex-main/public/images/Logo2.png",
+    "/Users/swarajbasu/Downloads/KhataNex-main/public/images/Logo.jpeg",
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+};
+
+const drawKhataNexLogoMark = (pdf, x, y, size = 10) => {
+  const logoPath = getKhataNexLogoPath();
+  if (logoPath) {
+    try {
+      pdf.image(logoPath, x, y, {
+        fit: [size, size],
+        align: "center",
+        valign: "center",
+      });
+      return;
+    } catch (_) {}
+  }
+
+  pdf.save();
+  pdf
+    .roundedRect(x, y, size, size, 2)
+    .fillColor("#4338CA")
+    .fill();
+  pdf.restore();
+};
+
+const drawKhataNexWatermark = (pdf, centerX, y) => {
+  const logoSize = 10;
+  const gap = 5;
+  const text = "Powered by KhataNex";
+  pdf.font("Helvetica-Bold").fontSize(7.5);
+  const textWidth = pdf.widthOfString(text);
+  const totalWidth = logoSize + gap + textWidth;
+  const startX = centerX - totalWidth / 2;
+
+  drawKhataNexLogoMark(pdf, startX, y - 1, logoSize);
+
+  pdf
+    .font("Helvetica-Bold")
+    .fontSize(7.5)
+    .fillColor("#6B7280")
+    .text(text, startX + logoSize + gap, y, {
+      lineBreak: false,
+    });
+};
+
 const drawImageIfExists = (
   pdf,
   filePath,
@@ -451,7 +534,7 @@ const generateInvoicePdf = ({
       const PAGE_LEFT = 36;
       const PAGE_RIGHT = 559;
       const PAGE_TOP = 36;
-      const PAGE_BOTTOM = 806;
+      const PAGE_BOTTOM = 750;
       const CONTENT_WIDTH = PAGE_RIGHT - PAGE_LEFT;
 
       const GREEN = "#16A34A";
@@ -478,11 +561,12 @@ const generateInvoicePdf = ({
        */
 
       const drawFooter = () => {
-        const footerY = PAGE_BOTTOM - 24;
+        const dividerY = 770;
+        const footerY = 778;
 
         pdf
-          .moveTo(PAGE_LEFT, footerY - 8)
-          .lineTo(PAGE_RIGHT, footerY - 8)
+          .moveTo(PAGE_LEFT, dividerY)
+          .lineTo(PAGE_RIGHT, dividerY)
           .lineWidth(0.6)
           .strokeColor(BORDER)
           .stroke();
@@ -492,26 +576,48 @@ const generateInvoicePdf = ({
           companyAddress,
           doc?.from_phone,
           doc?.from_email,
-          doc?.from_website,
+          doc?.from_website || company?.website,
         ]
           .filter(Boolean)
           .join("  |  ");
 
-        pdf
-          .font("Helvetica")
-          .fontSize(7.5)
-          .fillColor(MUTED)
-          .text(
-            footerText,
-            PAGE_LEFT,
-            footerY,
-            {
-              width: CONTENT_WIDTH,
-              align: "center",
-              lineBreak: false,
-              ellipsis: true,
-            }
-          );
+        const isWatermarkEnabled = resolveWatermarkEnabled(doc, company);
+
+        if (isWatermarkEnabled) {
+          pdf
+            .font("Helvetica")
+            .fontSize(7.5)
+            .fillColor(MUTED)
+            .text(
+              footerText,
+              PAGE_LEFT,
+              footerY,
+              {
+                width: CONTENT_WIDTH,
+                align: "center",
+                lineBreak: false,
+                ellipsis: true,
+              }
+            );
+
+          drawKhataNexWatermark(pdf, (PAGE_LEFT + PAGE_RIGHT) / 2, 798);
+        } else {
+          pdf
+            .font("Helvetica")
+            .fontSize(7.5)
+            .fillColor(MUTED)
+            .text(
+              footerText,
+              PAGE_LEFT,
+              footerY + 4,
+              {
+                width: CONTENT_WIDTH,
+                align: "center",
+                lineBreak: false,
+                ellipsis: true,
+              }
+            );
+        }
       };
 
       const drawPageHeader = () => {
@@ -563,20 +669,29 @@ const generateInvoicePdf = ({
       const companyTextX =
         logoDrawn ? 155 : PAGE_LEFT;
 
+      const companyWidth = logoDrawn ? 225 : 340;
+      const compNameHeight = pdf.heightOfString(companyName, {
+        width: companyWidth,
+        font: "Helvetica-Bold",
+        fontSize: 15,
+      });
+
       pdf
         .font("Helvetica-Bold")
-        .fontSize(16)
+        .fontSize(15)
         .fillColor(DARK_GREEN)
         .text(
           companyName,
           companyTextX,
           y + 2,
           {
-            width: 245,
-            lineBreak: false,
+            width: companyWidth,
+            height: 38,
             ellipsis: true,
           }
         );
+
+      const nextHeaderY = y + 2 + Math.min(compNameHeight, 38) + 3;
 
       if (doc?.from_website) {
         pdf
@@ -586,9 +701,9 @@ const generateInvoicePdf = ({
           .text(
             doc.from_website,
             companyTextX,
-            y + 22,
+            nextHeaderY,
             {
-              width: 245,
+              width: companyWidth,
               lineBreak: false,
               ellipsis: true,
             }
@@ -798,6 +913,9 @@ const generateInvoicePdf = ({
           : null,
         doc?.from_email
           ? `Email: ${doc.from_email}`
+          : null,
+        doc?.from_website || company?.website
+          ? `Website: ${doc?.from_website || company?.website}`
           : null,
       ].filter(Boolean);
 
@@ -1141,6 +1259,16 @@ const generateInvoicePdf = ({
         .stroke();
 
       y += 18;
+
+      if (y + 130 > 740) {
+        drawFooter();
+        pdf.addPage({
+          size: "A4",
+          margin: 36,
+        });
+        drawPageHeader();
+        y = 55;
+      }
 
       /*
        * ----------------------------------------------------
@@ -1530,10 +1658,20 @@ const generateInvoicePdf = ({
        * ----------------------------------------------------
        */
 
+      if (y + 65 > 740) {
+        drawFooter();
+        pdf.addPage({
+          size: "A4",
+          margin: 36,
+        });
+        drawPageHeader();
+        y = 45;
+      }
+
       const signatureY =
         Math.min(
-          Math.max(y + 10, 675),
-          PAGE_BOTTOM - 75
+          Math.max(y + 10, 665),
+          700
         );
 
       if (signaturePath) {
@@ -1543,12 +1681,19 @@ const generateInvoicePdf = ({
           415,
           signatureY,
           {
-            fit: [105, 45],
+            fit: [105, 42],
             align: "center",
             valign: "center",
           }
         );
       }
+
+      pdf
+        .moveTo(395, signatureY + 44)
+        .lineTo(535, signatureY + 44)
+        .lineWidth(0.6)
+        .strokeColor(BORDER)
+        .stroke();
 
       pdf
         .font("Helvetica")
@@ -1557,19 +1702,12 @@ const generateInvoicePdf = ({
         .text(
           "Authorized Signature",
           395,
-          signatureY + 52,
+          signatureY + 50,
           {
             width: 140,
             align: "center",
           }
         );
-
-      pdf
-        .moveTo(395, signatureY + 48)
-        .lineTo(535, signatureY + 48)
-        .lineWidth(0.6)
-        .strokeColor(BORDER)
-        .stroke();
 
       /*
        * ----------------------------------------------------
@@ -1718,44 +1856,77 @@ const generateQuotationPdf = ({
 
         pdf
           .font("Helvetica-Bold")
-          .fontSize(20)
-          .fillColor(TEXT)
-          .text(
-            companyName,
-            companyX,
-            42,
-            {
-              width: companyWidth,
-            }
-          );
+          .fontSize(18)
+          .fillColor(TEXT);
 
-        pdf
-          .font("Helvetica")
-          .fontSize(8.5)
-          .fillColor(MUTED)
-          .text(
-            companyAddress || "",
-            companyX,
-            68,
-            {
-              width: companyWidth,
-            }
-          );
+        const compNameHeight = pdf.heightOfString(companyName, {
+          width: companyWidth,
+        });
+
+        pdf.text(
+          companyName,
+          companyX,
+          42,
+          {
+            width: companyWidth,
+          }
+        );
+
+        let compY = 42 + compNameHeight + 6;
+        if (companyAddress) {
+          pdf
+            .font("Helvetica")
+            .fontSize(8.5)
+            .fillColor(MUTED)
+            .text(
+              companyAddress,
+              companyX,
+              compY,
+              {
+                width: companyWidth,
+              }
+            );
+          compY += pdf.heightOfString(companyAddress, { width: companyWidth, font: "Helvetica", fontSize: 8.5 }) + 3;
+        }
 
         if (doc?.from_phone) {
-          pdf.text(
+          pdf.font("Helvetica").fontSize(8.5).fillColor(MUTED).text(
             `Phone: ${doc.from_phone}`,
             companyX,
-            88
+            compY,
+            { width: companyWidth }
           );
+          compY += 12;
         }
 
         if (doc?.from_email) {
-          pdf.text(
+          pdf.font("Helvetica").fontSize(8.5).fillColor(MUTED).text(
             `Email: ${doc.from_email}`,
             companyX,
-            101
+            compY,
+            { width: companyWidth }
           );
+          compY += 12;
+        }
+
+        if (doc?.from_website || company?.website) {
+          pdf.font("Helvetica").fontSize(8.5).fillColor(MUTED).text(
+            `Website: ${doc?.from_website || company?.website}`,
+            companyX,
+            compY,
+            { width: companyWidth }
+          );
+          compY += 12;
+        }
+
+        if (doc?.from_gstin || company?.gstin) {
+          pdf.font("Helvetica").fontSize(8.5).fillColor(MUTED).text(
+            `GSTIN: ${doc?.from_gstin || company?.gstin}`,
+            companyX,
+            compY,
+            { width: companyWidth }
+          );
+          compY += 12;
         }
 
         pdf
@@ -1797,9 +1968,11 @@ const generateQuotationPdf = ({
             }
           );
 
+        const headerLineY = Math.max(compY + 8, 130);
+
         pdf
-          .moveTo(40, 130)
-          .lineTo(555, 130)
+          .moveTo(40, headerLineY)
+          .lineTo(555, headerLineY)
           .lineWidth(2)
           .strokeColor(GREEN)
           .stroke();
@@ -1810,12 +1983,31 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
+        const boxTop = headerLineY + 14;
+
+        let leftH = 36;
+        if (customerBusiness) leftH += 18;
+        if (customerAddress) {
+          leftH += pdf.heightOfString(customerAddress, { width: 275, font: "Helvetica", fontSize: 8.5 }) + 4;
+        }
+
+        let rightH = 20;
+        if (doc?.to_phone || customer?.phone) {
+          rightH += pdf.heightOfString(`Phone: ${doc?.to_phone || customer?.phone}`, { width: 190, font: "Helvetica", fontSize: 8.5 }) + 4;
+        }
+        if (doc?.to_email || customer?.email) {
+          rightH += pdf.heightOfString(`Email: ${doc?.to_email || customer?.email}`, { width: 190, font: "Helvetica", fontSize: 8.5 }) + 4;
+        }
+        if (doc?.to_gstin || customer?.gstin) rightH += 15;
+
+        const boxHeight = Math.max(leftH, rightH, 80) + 14;
+
         pdf
           .roundedRect(
             40,
-            150,
+            boxTop,
             515,
-            90,
+            boxHeight,
             7
           )
           .fillColor(
@@ -1830,83 +2022,107 @@ const generateQuotationPdf = ({
           .text(
             "QUOTED TO",
             55,
-            166
+            boxTop + 14
           );
 
         pdf
           .font("Helvetica-Bold")
-          .fontSize(12)
+          .fontSize(11)
           .fillColor(TEXT)
           .text(
             customerName,
             55,
-            184
+            boxTop + 30,
+            { width: 275 }
           );
+
+        let custY = boxTop + 30 + pdf.heightOfString(customerName, { width: 275, font: "Helvetica-Bold", fontSize: 11 }) + 3;
 
         if (customerBusiness) {
           pdf
             .font("Helvetica")
             .fontSize(9)
+            .fillColor(TEXT)
             .text(
               customerBusiness,
               55,
-              202
+              custY,
+              { width: 275 }
+            );
+          custY += 14;
+        }
+
+        if (customerAddress) {
+          pdf
+            .font("Helvetica")
+            .fontSize(8.5)
+            .fillColor(MUTED)
+            .text(
+              customerAddress,
+              55,
+              custY,
+              {
+                width: 275,
+              }
             );
         }
 
-        pdf
-          .font("Helvetica")
-          .fontSize(8.5)
-          .fillColor(MUTED)
-          .text(
-            customerAddress || "",
-            55,
-            218,
-            {
-              width: 275,
-            }
-          );
+        let custRightY = boxTop + 30;
 
         if (
           doc?.to_phone ||
           customer?.phone
         ) {
-          pdf.text(
-            `Phone: ${doc?.to_phone ||
-            customer?.phone
-            }`,
-            350,
-            184
-          );
+          const phoneText = `Phone: ${doc?.to_phone || customer?.phone}`;
+          pdf
+            .font("Helvetica")
+            .fontSize(8.5)
+            .fillColor(MUTED)
+            .text(
+              phoneText,
+              350,
+              custRightY,
+              { width: 190 }
+            );
+          custRightY += pdf.heightOfString(phoneText, { width: 190, font: "Helvetica", fontSize: 8.5 }) + 4;
         }
 
         if (
           doc?.to_email ||
           customer?.email
         ) {
-          pdf.text(
-            `Email: ${doc?.to_email ||
-            customer?.email
-            }`,
-            350,
-            201,
-            {
-              width: 190,
-            }
-          );
+          const emailText = `Email: ${doc?.to_email || customer?.email}`;
+          pdf
+            .font("Helvetica")
+            .fontSize(8.5)
+            .fillColor(MUTED)
+            .text(
+              emailText,
+              350,
+              custRightY,
+              {
+                width: 190,
+              }
+            );
+          custRightY += pdf.heightOfString(emailText, { width: 190, font: "Helvetica", fontSize: 8.5 }) + 4;
         }
 
         if (
           doc?.to_gstin ||
           customer?.gstin
         ) {
-          pdf.text(
-            `GSTIN: ${doc?.to_gstin ||
-            customer?.gstin
-            }`,
-            350,
-            218
-          );
+          pdf
+            .font("Helvetica")
+            .fontSize(8.5)
+            .fillColor(MUTED)
+            .text(
+              `GSTIN: ${doc?.to_gstin ||
+              customer?.gstin
+              }`,
+              350,
+              custRightY,
+              { width: 190 }
+            );
         }
 
         /*
@@ -1915,63 +2131,114 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
-        let y = 265;
+        const drawQuotationFooter = () => {
+          const isWatermarkEnabled = resolveWatermarkEnabled(doc, company);
+          const dividerY = 770;
+          const footerY = 778;
 
-        pdf
-          .rect(
-            40,
-            y,
-            515,
-            28
-          )
-          .fill(GREEN);
+          pdf
+            .moveTo(40, dividerY)
+            .lineTo(555, dividerY)
+            .lineWidth(0.6)
+            .strokeColor(BORDER)
+            .stroke();
 
-        pdf
-          .font("Helvetica-Bold")
-          .fontSize(8.5)
-          .fillColor(WHITE)
-          .text(
-            "#",
-            48,
-            y + 9
-          )
-          .text(
-            "DESCRIPTION",
-            75,
-            y + 9,
-            {
-              width: 225,
-            }
-          )
-          .text(
-            "QTY",
-            315,
-            y + 9,
-            {
-              width: 40,
-              align: "center",
-            }
-          )
-          .text(
-            "RATE",
-            365,
-            y + 9,
-            {
-              width: 85,
-              align: "right",
-            }
-          )
-          .text(
-            "AMOUNT",
-            465,
-            y + 9,
-            {
-              width: 85,
-              align: "right",
-            }
-          );
+          const quotationFooterText = [
+            companyName,
+            companyAddress,
+            doc?.from_phone,
+            doc?.from_email,
+            doc?.from_website || company?.website,
+          ]
+            .filter(Boolean)
+            .join("  |  ");
 
-        y += 28;
+          pdf
+            .font("Helvetica")
+            .fontSize(7.5)
+            .fillColor(MUTED)
+            .text(
+              quotationFooterText,
+              40,
+              footerY,
+              {
+                width: 515,
+                align: "center",
+                lineBreak: false,
+                ellipsis: true,
+              }
+            );
+
+          if (isWatermarkEnabled) {
+            drawKhataNexWatermark(pdf, 297.5, 798);
+          }
+        };
+
+        const drawQuotationTableHeader = () => {
+          pdf
+            .rect(
+              40,
+              y,
+              515,
+              28
+            )
+            .fill(GREEN);
+
+          pdf
+            .font("Helvetica-Bold")
+            .fontSize(8.5)
+            .fillColor(WHITE)
+            .text(
+              "#",
+              48,
+              y + 9
+            )
+            .text(
+              "DESCRIPTION",
+              75,
+              y + 9,
+              {
+                width: 225,
+              }
+            )
+            .text(
+              "QTY",
+              315,
+              y + 9,
+              {
+                width: 40,
+                align: "center",
+              }
+            )
+            .text(
+              "RATE",
+              365,
+              y + 9,
+              {
+                width: 85,
+                align: "right",
+              }
+            )
+            .text(
+              "AMOUNT",
+              465,
+              y + 9,
+              {
+                width: 85,
+                align: "right",
+              }
+            );
+
+          y += 28;
+        };
+
+        if (y > 580) {
+          drawQuotationFooter();
+          pdf.addPage({ size: "A4", margin: 40 });
+          y = 45;
+        }
+
+        drawQuotationTableHeader();
 
         let subtotal = 0;
 
@@ -1995,14 +2262,16 @@ const generateQuotationPdf = ({
 
             /*
              * Every quotation item row uses the same row background dynamically;
-             * no alternating-row logic.
+             * paginate before entering footer area.
              */
-            if (y + 28 > 740) {
+            if (y + 28 > 715) {
+              drawQuotationFooter();
               pdf.addPage({
                 size: "A4",
                 margin: 40,
               });
-              y = 50;
+              y = 45;
+              drawQuotationTableHeader();
             }
 
             pdf
@@ -2074,6 +2343,15 @@ const generateQuotationPdf = ({
          */
 
         y += 15;
+
+        if (y + 130 > 735) {
+          drawQuotationFooter();
+          pdf.addPage({
+            size: "A4",
+            margin: 40,
+          });
+          y = 45;
+        }
 
         const discount = Number(
           doc?.discount_amount || 0
@@ -2324,6 +2602,15 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
+        if (y + 45 > 735) {
+          drawQuotationFooter();
+          pdf.addPage({
+            size: "A4",
+            margin: 40,
+          });
+          y = 45;
+        }
+
         pdf
           .font("Helvetica-Bold")
           .fontSize(8.5)
@@ -2362,6 +2649,14 @@ const generateQuotationPdf = ({
           bank.accountNumber ||
           bank.ifsc
         ) {
+          if (y + 70 > 735) {
+            drawQuotationFooter();
+            pdf.addPage({
+              size: "A4",
+              margin: 40,
+            });
+            y = 45;
+          }
           pdf
             .roundedRect(
               40,
@@ -2457,12 +2752,13 @@ const generateQuotationPdf = ({
         const termsBoxHeight =
           termsHeight + 42;
 
-        if (y + termsBoxHeight > 670) {
+        if (y + termsBoxHeight > 730) {
+          drawQuotationFooter();
           pdf.addPage({
             size: "A4",
             margin: 40,
           });
-          y = 50;
+          y = 45;
         }
 
         pdf
@@ -2510,6 +2806,15 @@ const generateQuotationPdf = ({
          */
 
         if (doc?.notes) {
+          if (y + 55 > 735) {
+            drawQuotationFooter();
+            pdf.addPage({
+              size: "A4",
+              margin: 40,
+            });
+            y = 45;
+          }
+
           pdf
             .font("Helvetica-Bold")
             .fontSize(9)
@@ -2542,19 +2847,23 @@ const generateQuotationPdf = ({
          * ----------------------------------------------------
          */
 
-        let signatureY =
-          Math.max(
-            y + 18,
-            690
-          );
-
-        if (signatureY > 730) {
+        if (y + 65 > 735) {
+          drawQuotationFooter();
           pdf.addPage({
             size: "A4",
             margin: 40,
           });
-          signatureY = 690;
+          y = 45;
         }
+
+        const signatureY =
+          Math.min(
+            Math.max(
+              y + 10,
+              665
+            ),
+            700
+          );
 
         if (signaturePath) {
           drawImageIfExists(
@@ -2573,11 +2882,11 @@ const generateQuotationPdf = ({
         pdf
           .moveTo(
             400,
-            signatureY + 50
+            signatureY + 44
           )
           .lineTo(
             555,
-            signatureY + 50
+            signatureY + 44
           )
           .lineWidth(1)
           .strokeColor(BORDER)
@@ -2590,26 +2899,14 @@ const generateQuotationPdf = ({
           .text(
             "Authorized Signature",
             400,
-            signatureY + 58,
+            signatureY + 50,
             {
               width: 155,
               align: "center",
             }
           );
 
-        pdf
-          .font("Helvetica")
-          .fontSize(7.5)
-          .fillColor(MUTED)
-          .text(
-            companyName,
-            40,
-            800,
-            {
-              width: 515,
-              align: "center",
-            }
-          );
+        drawQuotationFooter();
 
         pdf.end();
 
@@ -2803,29 +3100,38 @@ const generateMoneyReceiptPdf = ({
 
         pdf
           .font("Helvetica-Bold")
-          .fontSize(15)
-          .fillColor(DARK_GREEN)
-          .text(
-            companyName,
-            620,
-            32,
-            {
-              width: 250,
-              align: "right",
-            }
-          );
+          .fontSize(14)
+          .fillColor(DARK_GREEN);
+
+        const compNameHeight = pdf.heightOfString(companyName, {
+          width: 250,
+        });
+
+        pdf.text(
+          companyName,
+          620,
+          32,
+          {
+            width: 250,
+            align: "right",
+          }
+        );
+
+        const compAddressTop = Math.max(32 + compNameHeight + 3, 52);
 
         pdf
           .font("Helvetica")
-          .fontSize(9)
+          .fontSize(8.5)
           .fillColor(MUTED)
           .text(
             companyAddress,
             620,
-            55,
+            compAddressTop,
             {
               width: 250,
               align: "right",
+              height: Math.max(140 - compAddressTop, 20),
+              ellipsis: true,
             }
           );
 
@@ -3200,19 +3506,39 @@ const generateMoneyReceiptPdf = ({
          * ----------------------------------------------------
          */
 
-        pdf
-          .font("Helvetica")
-          .fontSize(7.5)
-          .fillColor(MUTED)
-          .text(
-            "Thank you for your business.",
-            34,
-            486,
-            {
-              width: 854,
-              align: "center",
-            }
-          );
+        const isWatermarkEnabled = resolveWatermarkEnabled(receiptData, company);
+
+        if (isWatermarkEnabled) {
+          pdf
+            .font("Helvetica")
+            .fontSize(7.5)
+            .fillColor(MUTED)
+            .text(
+              "Thank you for your business.",
+              34,
+              476,
+              {
+                width: 854,
+                align: "center",
+              }
+            );
+
+          drawKhataNexWatermark(pdf, 461, 491);
+        } else {
+          pdf
+            .font("Helvetica")
+            .fontSize(7.5)
+            .fillColor(MUTED)
+            .text(
+              "Thank you for your business.",
+              34,
+              484,
+              {
+                width: 854,
+                align: "center",
+              }
+            );
+        }
 
         pdf.end();
 
@@ -3285,4 +3611,5 @@ const generateDocumentPdf = ({
 
 module.exports = {
   generateDocumentPdf,
+  resolveWatermarkEnabled,
 };

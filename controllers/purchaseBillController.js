@@ -164,6 +164,16 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
   try {
     await connection.beginTransaction();
 
+    if (bill_number && String(bill_number).trim()) {
+      const [existingBill] = await connection.query(
+        "SELECT id FROM purchase_bills WHERE bill_number = ? AND created_by = ? LIMIT 1",
+        [String(bill_number).trim(), req.user.id]
+      );
+      if (existingBill.length) {
+        throw new ApiError(400, `Purchase bill '${bill_number}' already exists.`);
+      }
+    }
+
     const [billResult] = await connection.query(
       `INSERT INTO purchase_bills
        (bill_number, vendor_name, bill_date, gst_rate, created_by)
@@ -178,12 +188,16 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
 
     const purchaseBillId = billResult.insertId;
 
+    let billTotal = 0;
+    const stockUpdates = new Map(); // productId -> aggregated quantity to increment
+
     for (const item of validItems) {
-      let productId = item.product_id;
+      billTotal += Number(item.total_amount || 0);
+      let productId = item.product_id ? Number(item.product_id) : null;
       if (!productId && item.item_name) {
         const [matching] = await connection.query(
-          "SELECT id FROM stock WHERE product_name = ? AND created_by = ? LIMIT 1",
-          [item.item_name, req.user.id]
+          "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
+          [item.item_name, item.item_name, req.user.id]
         );
         if (matching.length) {
           productId = matching[0].id;
@@ -219,20 +233,88 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
         ]
       );
 
-      /*
-       * Goods purchase increases matching Product Master stock.quantity.
-       * Services do not affect stock.
-       * Never change Product Master selling price from purchase price.
-       */
-      if (item.item_type === "goods" && productId && item.quantity > 0) {
+      // Existing linked product in stock: aggregate quantity so stock is updated exactly once
+      if (item.item_type === "goods" && productId && Number(item.quantity || 0) > 0) {
+        stockUpdates.set(productId, (stockUpdates.get(productId) || 0) + Number(item.quantity));
+      }
+    }
+
+    // Apply stock updates: exactly ONE update per linked product
+    for (const [prodId, totalQty] of stockUpdates.entries()) {
+      if (prodId && totalQty > 0) {
         await connection.query(
           `UPDATE stock
            SET quantity = quantity + ?
            WHERE id = ? AND created_by = ?`,
-          [item.quantity, productId, req.user.id]
+          [totalQty, prodId, req.user.id]
         );
       }
     }
+
+    // Fall back to supplied body amount if no item lines were entered
+    if (validItems.length === 0) {
+      const suppliedAmount = Number(req.body.total_amount || req.body.amount || req.body.total || 0);
+      if (suppliedAmount > 0) {
+        billTotal = suppliedAmount;
+      }
+    }
+    billTotal = Math.round(billTotal * 100) / 100;
+
+    // Auto-create linked payment: exactly one payment per purchase bill
+    const paymentMode = (req.body.payment_mode && String(req.body.payment_mode).trim().toLowerCase() === "cash") ? "cash" : "online";
+    const partyName = (req.body.party_name || vendor_name) ? String(req.body.party_name || vendor_name).trim() : "Vendor";
+    const paymentDate = bill_date || req.body.payment_date || null;
+    const purpose = req.body.purpose || req.body.description || req.body.notes || (bill_number ? `Purchase Bill #${bill_number}` : "Purchase Bill");
+
+    const [existingPayments] = await connection.query(
+      `SELECT id FROM payments
+       WHERE (purchase_bill_id = ?
+              OR (purpose = ? AND ? != '')
+              OR (purpose = ? AND ? != ''))
+         AND created_by = ?
+       ORDER BY id ASC`,
+      [
+        purchaseBillId,
+        bill_number ? `Purchase Bill #${bill_number}` : "",
+        bill_number || "",
+        bill_number ? `Purchase Bill ${bill_number}` : "",
+        bill_number || "",
+        req.user.id
+      ]
+    );
+
+    let paymentId;
+    if (existingPayments.length > 0) {
+      paymentId = existingPayments[0].id;
+      await connection.query(
+        `UPDATE payments
+         SET payment_category = 'paid_by_business', party_name = ?, purpose = ?,
+             amount = ?, payment_mode = ?, payment_date = COALESCE(?, CURRENT_DATE),
+             purchase_bill_id = ?
+         WHERE id = ? AND created_by = ?`,
+        [partyName, purpose, billTotal, paymentMode, paymentDate, purchaseBillId, paymentId, req.user.id]
+      );
+      if (existingPayments.length > 1) {
+        const extraIds = existingPayments.slice(1).map((p) => p.id);
+        await connection.query(
+          "UPDATE payments SET purchase_bill_id = ?, payment_category = 'paid_by_business' WHERE id IN (?) AND created_by = ?",
+          [purchaseBillId, extraIds, req.user.id]
+        );
+      }
+    } else {
+      const [payRes] = await connection.query(
+        `INSERT INTO payments
+          (payment_category, party_name, purpose, amount, payment_mode, payment_date, purchase_bill_id, add_to_khata, created_by)
+         VALUES ('paid_by_business', ?, ?, ?, ?, COALESCE(?, CURRENT_DATE), ?, 0, ?)`,
+        [partyName, purpose, billTotal, paymentMode, paymentDate, purchaseBillId, req.user.id]
+      );
+      paymentId = payRes.insertId;
+    }
+
+    await connection.query(
+      "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ?",
+      [paymentId, purchaseBillId]
+    );
 
     await connection.commit();
 
@@ -381,28 +463,35 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
       [id]
     );
 
-    // 2. Reverse old purchase quantities (goods only) inside transaction
+    // 2. Reverse old purchase quantities (goods only) inside transaction - aggregated per product
+    const oldStockUpdates = new Map();
     for (const oldItem of oldItems) {
       const oldItemType = oldItem.item_type === "service" ? "service" : "goods";
       if (oldItemType === "goods") {
-        let productId = oldItem.product_id;
+        let productId = oldItem.product_id ? Number(oldItem.product_id) : null;
         if (!productId && oldItem.item_name) {
           const [matching] = await connection.query(
-            "SELECT id FROM stock WHERE product_name = ? AND created_by = ? LIMIT 1",
-            [oldItem.item_name, req.user.id]
+            "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
+            [oldItem.item_name, oldItem.item_name, req.user.id]
           );
           if (matching.length) {
             productId = matching[0].id;
           }
         }
         if (productId && Number(oldItem.quantity || 0) > 0) {
-          await connection.query(
-            `UPDATE stock
-             SET quantity = quantity - ?
-             WHERE id = ? AND created_by = ?`,
-            [Number(oldItem.quantity || 0), productId, req.user.id]
-          );
+          oldStockUpdates.set(productId, (oldStockUpdates.get(productId) || 0) + Number(oldItem.quantity));
         }
+      }
+    }
+
+    for (const [prodId, totalQty] of oldStockUpdates.entries()) {
+      if (prodId && totalQty > 0) {
+        await connection.query(
+          `UPDATE stock
+           SET quantity = quantity - ?
+           WHERE id = ? AND created_by = ?`,
+          [totalQty, prodId, req.user.id]
+        );
       }
     }
 
@@ -431,13 +520,17 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
       [id]
     );
 
+    let updatedBillTotal = 0;
+    const newStockUpdates = new Map();
+
     // Insert new valid items and apply new stock quantities (goods only)
     for (const item of validItems) {
-      let productId = item.product_id;
+      updatedBillTotal += Number(item.total_amount || 0);
+      let productId = item.product_id ? Number(item.product_id) : null;
       if (!productId && item.item_name) {
         const [matching] = await connection.query(
-          "SELECT id FROM stock WHERE product_name = ? AND created_by = ? LIMIT 1",
-          [item.item_name, req.user.id]
+          "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
+          [item.item_name, item.item_name, req.user.id]
         );
         if (matching.length) {
           productId = matching[0].id;
@@ -473,20 +566,102 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
         ]
       );
 
-      /*
-       * Apply new purchase quantities:
-       * Goods only affect stock.
-       * Services do not affect stock.
-       * Never change Product Master selling price from purchase price.
-       */
-      if (item.item_type === "goods" && productId && item.quantity > 0) {
+      if (item.item_type === "goods" && productId && Number(item.quantity || 0) > 0) {
+        newStockUpdates.set(productId, (newStockUpdates.get(productId) || 0) + Number(item.quantity));
+      }
+    }
+
+    // Existing linked product updates stock exactly once
+    for (const [prodId, totalQty] of newStockUpdates.entries()) {
+      if (prodId && totalQty > 0) {
         await connection.query(
           `UPDATE stock
            SET quantity = quantity + ?
            WHERE id = ? AND created_by = ?`,
-          [item.quantity, productId, req.user.id]
+          [totalQty, prodId, req.user.id]
         );
       }
+    }
+
+    if (validItems.length === 0) {
+      const suppliedAmount = Number(req.body.total_amount || req.body.amount || req.body.total || 0);
+      if (suppliedAmount > 0) {
+        updatedBillTotal = suppliedAmount;
+      }
+    }
+    updatedBillTotal = Math.round(updatedBillTotal * 100) / 100;
+
+    // Sync linked payment details - guarantee single payment per purchase bill
+    const paymentMode = req.body.payment_mode ? ((String(req.body.payment_mode).trim().toLowerCase() === "cash") ? "cash" : "online") : undefined;
+    const partyName = (req.body.party_name || vendor_name) ? String(req.body.party_name || vendor_name).trim() : null;
+    const purpose = req.body.purpose || req.body.description || req.body.notes || (bill_number ? `Purchase Bill #${bill_number}` : undefined);
+
+    const [existingPayments] = await connection.query(
+      `SELECT id FROM payments
+       WHERE (purchase_bill_id = ?
+              OR (purpose = ? AND ? != '')
+              OR (purpose = ? AND ? != ''))
+         AND created_by = ?
+       ORDER BY id ASC`,
+      [
+        id,
+        bill_number ? `Purchase Bill #${bill_number}` : "",
+        bill_number || "",
+        bill_number ? `Purchase Bill ${bill_number}` : "",
+        bill_number || "",
+        req.user.id
+      ]
+    );
+    if (existingPayments.length > 0) {
+      const primaryPaymentId = existingPayments[0].id;
+      await connection.query(
+        `UPDATE payments
+         SET amount = ?,
+             party_name = COALESCE(?, party_name),
+             payment_mode = COALESCE(?, payment_mode),
+             purpose = COALESCE(?, purpose),
+             payment_date = COALESCE(?, payment_date)
+         WHERE id = ? AND created_by = ?`,
+        [
+          updatedBillTotal,
+          partyName,
+          paymentMode || null,
+          purpose || null,
+          bill_date || null,
+          primaryPaymentId,
+          req.user.id,
+        ]
+      );
+      if (existingPayments.length > 1) {
+        const extraIds = existingPayments.slice(1).map((p) => p.id);
+        await connection.query(
+          "UPDATE payments SET purchase_bill_id = ?, payment_category = 'paid_by_business' WHERE id IN (?) AND created_by = ?",
+          [id, extraIds, req.user.id]
+        );
+      }
+      await connection.query(
+        "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
+        [primaryPaymentId, id, req.user.id]
+      );
+    } else {
+      const [payRes] = await connection.query(
+        `INSERT INTO payments
+          (payment_category, party_name, purpose, amount, payment_mode, payment_date, purchase_bill_id, add_to_khata, created_by)
+         VALUES ('paid_by_business', ?, ?, ?, ?, COALESCE(?, CURRENT_DATE), ?, 0, ?)`,
+        [
+          partyName || "Vendor",
+          purpose || "Purchase Bill",
+          updatedBillTotal,
+          paymentMode || "online",
+          bill_date || null,
+          id,
+          req.user.id,
+        ]
+      );
+      await connection.query(
+        "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
+        [payRes.insertId, id, req.user.id]
+      );
     }
 
     await connection.commit();
@@ -534,28 +709,35 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
       [id]
     );
 
-    // 2. Subtract goods quantities from Product Master stock (services do nothing)
+    // 2. Subtract goods quantities from Product Master stock (services do nothing) - aggregated per product
+    const stockReversals = new Map();
     for (const item of existingItems) {
       const itemType = item.item_type === "service" ? "service" : "goods";
       if (itemType === "goods") {
-        let productId = item.product_id;
+        let productId = item.product_id ? Number(item.product_id) : null;
         if (!productId && item.item_name) {
           const [matching] = await connection.query(
-            "SELECT id FROM stock WHERE product_name = ? AND created_by = ? LIMIT 1",
-            [item.item_name, req.user.id]
+            "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
+            [item.item_name, item.item_name, req.user.id]
           );
           if (matching.length) {
             productId = matching[0].id;
           }
         }
         if (productId && Number(item.quantity || 0) > 0) {
-          await connection.query(
-            `UPDATE stock
-             SET quantity = quantity - ?
-             WHERE id = ? AND created_by = ?`,
-            [Number(item.quantity || 0), productId, req.user.id]
-          );
+          stockReversals.set(productId, (stockReversals.get(productId) || 0) + Number(item.quantity));
         }
+      }
+    }
+
+    for (const [prodId, totalQty] of stockReversals.entries()) {
+      if (prodId && totalQty > 0) {
+        await connection.query(
+          `UPDATE stock
+           SET quantity = quantity - ?
+           WHERE id = ? AND created_by = ?`,
+          [totalQty, prodId, req.user.id]
+        );
       }
     }
 
@@ -564,6 +746,13 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
       `DELETE FROM purchase_bill_items
        WHERE purchase_bill_id = ?`,
       [id]
+    );
+
+    // Clean up linked payment
+    await connection.query(
+      `DELETE FROM payments
+       WHERE (purchase_bill_id = ? OR id = ?) AND created_by = ?`,
+      [id, existing[0].payment_id || 0, req.user.id]
     );
 
     await connection.query(
@@ -586,10 +775,69 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
   }
 });
 
+// GET /api/purchase-bills/items
+const searchPurchaseItems = asyncHandler(async (req, res) => {
+  const query = String(req.query.search || req.query.q || req.query.query || req.query.hsn_code || req.query.hsn || "").trim();
+  const purchaseBillId = req.query.purchase_bill_id || req.query.purchaseBillId || req.query.bill_id;
+
+  let sql = `
+    SELECT pbi.id AS purchase_bill_item_id,
+           pbi.id,
+           pbi.purchase_bill_id,
+           pb.bill_number,
+           pb.vendor_name,
+           pb.bill_date,
+           pbi.product_id,
+           pbi.item_name AS product_name,
+           pbi.item_name,
+           pbi.hsn_code,
+           pbi.quantity,
+           pbi.unit,
+           pbi.price AS purchase_price,
+           pbi.price,
+           pbi.discount,
+           pbi.item_type,
+           pbi.gst_rate
+    FROM purchase_bill_items pbi
+    JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
+    WHERE pb.created_by = ?
+  `;
+  const params = [req.user.id];
+
+  if (purchaseBillId) {
+    sql += " AND pb.id = ?";
+    params.push(Number(purchaseBillId));
+  }
+
+  if (query) {
+    sql += ` AND (
+      pbi.item_name LIKE ?
+      OR pbi.hsn_code LIKE ?
+      OR pb.bill_number LIKE ?
+      OR pb.vendor_name LIKE ?
+    )`;
+    const term = `%${query}%`;
+    params.push(term, term, term, term);
+  }
+
+  sql += " ORDER BY pb.bill_date DESC, pbi.id DESC LIMIT 50";
+
+  const [items] = await pool.query(sql, params);
+
+  res.json({
+    success: true,
+    count: items.length,
+    items,
+    data: items,
+    purchase_items: items,
+  });
+});
+
 module.exports = {
   addPurchaseBill,
   listPurchaseBills,
   getPurchaseBill,
   updatePurchaseBill,
   deletePurchaseBill,
+  searchPurchaseItems,
 };

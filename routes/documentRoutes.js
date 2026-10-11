@@ -2,10 +2,14 @@ const router = require("express").Router();
 
 const {
   createDocument,
+  updateDocument,
+  regenerateDocuments,
   listDocuments,
   getDocument,
   resendDocumentEmail,
   createMoneyReceipt,
+  updateMoneyReceipt,
+  deleteMoneyReceipt,
   listMoneyReceipts,
   getMoneyReceipt,
   deleteInvoice,
@@ -57,15 +61,40 @@ router.get(
   getMoneyReceipt
 );
 
+router.put(
+  "/money-receipts/:id",
+  updateMoneyReceipt
+);
+
+router.patch(
+  "/money-receipts/:id",
+  updateMoneyReceipt
+);
+
+router.delete(
+  "/money-receipts/:id",
+  deleteMoneyReceipt
+);
+
 // --------------------------------------------------
 // Invoices / Quotations
 // --------------------------------------------------
 
 router.post("/", createDocument);
+router.post("/regenerate", regenerateDocuments);
 
 router.get("/", listDocuments);
 
 router.get("/:id", getDocument);
+
+router.put("/invoices/:id", updateDocument);
+router.patch("/invoices/:id", updateDocument);
+
+router.put("/quotations/:id", updateDocument);
+router.patch("/quotations/:id", updateDocument);
+
+router.put("/:id", updateDocument);
+router.patch("/:id", updateDocument);
 
 router.delete("/invoices/:id", deleteInvoice);
 router.delete("/quotations/:id", deleteQuotation);

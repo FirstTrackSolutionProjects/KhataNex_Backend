@@ -116,9 +116,9 @@ const ApiError = require("../utils/ApiError");
 });
 
 // GET /api/customers
-// Every customer with how much they currently owe.
+// Every customer with how much they currently owe. Supports keyword autocomplete/search.
 const listCustomers = asyncHandler(async (req, res) => {
-  const { search } = req.query;
+  const keyword = String(req.query.search || req.query.query || req.query.q || "").trim();
 
   let sql = `SELECT c.*, u.name AS created_by_name
              FROM customers c
@@ -126,9 +126,16 @@ const listCustomers = asyncHandler(async (req, res) => {
              WHERE c.created_by = ?`;
   const params = [req.user.id];
 
-  if (search) {
-    sql += " AND (c.name LIKE ? OR c.phone LIKE ?)";
-    params.push("%" + search + "%", "%" + search + "%");
+  if (keyword) {
+    sql += ` AND (
+      c.name LIKE ?
+      OR c.display_name LIKE ?
+      OR c.business_name LIKE ?
+      OR c.phone LIKE ?
+      OR c.email LIKE ?
+    )`;
+    const pattern = `%${keyword}%`;
+    params.push(pattern, pattern, pattern, pattern, pattern);
   }
 
   sql += " ORDER BY c.total_due DESC, c.name ASC";

@@ -76,7 +76,8 @@ const getUserProfile = async (userId) => {
       tds_enabled,
       payment_terms,
       logo_path,
-      signature_path
+      signature_path,
+      watermark_enabled
      FROM users
      WHERE id = ?`,
     [userId]
@@ -141,7 +142,7 @@ const getDefaultBankAccount = async (
     `SELECT *
      FROM banking
      WHERE created_by = ?
-     ORDER BY id ASC
+     ORDER BY is_default DESC, id ASC
      LIMIT 1`,
     [userId]
   );
@@ -149,52 +150,45 @@ const getDefaultBankAccount = async (
   return rows[0] || null;
 };
 
-const buildFromSnapshot = (user) => ({
-  from_name:
-    user?.name || null,
+const resolveWatermarkFromContext = (body = {}, user = {}) => {
+  if (body?.remove_watermark !== undefined && body?.remove_watermark !== null) {
+    return (body.remove_watermark === 1 || body.remove_watermark === true || body.remove_watermark === "1" || body.remove_watermark === "true") ? 0 : 1;
+  }
+  if (body?.watermark_enabled !== undefined && body?.watermark_enabled !== null) {
+    return (body.watermark_enabled === 1 || body.watermark_enabled === true || body.watermark_enabled === "1" || body.watermark_enabled === "true") ? 1 : 0;
+  }
+  if (body?.show_watermark !== undefined && body?.show_watermark !== null) {
+    return (body.show_watermark === 1 || body.show_watermark === true || body.show_watermark === "1" || body.show_watermark === "true") ? 1 : 0;
+  }
+  if (user?.watermark_enabled !== undefined && user?.watermark_enabled !== null) {
+    return Number(user.watermark_enabled) === 0 ? 0 : 1;
+  }
+  return 1;
+};
 
-  from_business_name:
-    user?.business_name || null,
-
-  from_email:
-    user?.email || null,
-
-  from_phone:
-    user?.phone || null,
-
-  from_gstin:
-    user?.gstin || null,
-
-  from_pan:
-    user?.pan || null,
-
-  from_website:
-    user?.website || null,
-
-  from_address_line1:
-    user?.address_line1 || null,
-
-  from_address_line2:
-    user?.address_line2 || null,
-
-  from_city:
-    user?.city || null,
-
-  from_state:
-    user?.state || null,
-
-  from_pincode:
-    user?.pincode || null,
-
-  from_country:
-    user?.country || "India",
-
-  from_logo_path:
-    user?.logo_path || null,
-
-  from_signature_path:
-    user?.signature_path || null,
-});
+const buildFromSnapshot = (user, body = {}) => {
+  const wm = resolveWatermarkFromContext(body, user);
+  return {
+    from_name: user?.name || null,
+    from_business_name: user?.business_name || null,
+    from_email: user?.email || null,
+    from_phone: user?.phone || null,
+    from_gstin: user?.gstin || null,
+    from_pan: user?.pan || null,
+    from_website: user?.website || null,
+    from_address_line1: user?.address_line1 || null,
+    from_address_line2: user?.address_line2 || null,
+    from_city: user?.city || null,
+    from_state: user?.state || null,
+    from_pincode: user?.pincode || null,
+    from_country: user?.country || "India",
+    from_logo_path: user?.logo_path || null,
+    from_signature_path: user?.signature_path || null,
+    watermark_enabled: wm,
+    remove_watermark: wm === 0 ? 1 : 0,
+    show_watermark: wm === 1 ? 1 : 0,
+  };
+};
 
 const buildBankSnapshot = (bank) => ({
   bank_name:
@@ -1281,6 +1275,56 @@ const createDocument =
           const item of
             totals.calculatedItems
         ) {
+          let resolvedProductId = item.product_id || null;
+          const reqQty = cleanNumber(item.quantity, 1);
+
+          if (item.item_type !== "service") {
+            let stockRow = null;
+
+            if (resolvedProductId) {
+              const [rows] = await conn.query(
+                "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?",
+                [resolvedProductId, req.user.id]
+              );
+              if (rows.length) stockRow = rows[0];
+            }
+
+            if (!stockRow && item.product_name) {
+              const [rows] = await conn.query(
+                "SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?",
+                [item.product_name, req.user.id]
+              );
+              if (rows.length) stockRow = rows[0];
+            }
+
+            if (!stockRow) {
+              await conn.rollback();
+              throw new ApiError(
+                400,
+                `Insufficient stock for product "${item.product_name}". Requested: ${reqQty}, Available: 0`,
+                {
+                  product_name: item.product_name,
+                  requested_quantity: reqQty,
+                  available_stock: 0,
+                }
+              );
+            }
+
+            const availableStock = Number(stockRow.quantity || 0);
+            if (availableStock < reqQty) {
+              await conn.rollback();
+              throw new ApiError(
+                400,
+                `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
+                {
+                  product_name: stockRow.product_name,
+                  requested_quantity: reqQty,
+                  available_stock: availableStock,
+                }
+              );
+            }
+          }
+
           await conn.query(
             `INSERT INTO quotation_items (
               quotation_id,
@@ -1485,6 +1529,13 @@ const createDocument =
       signature_path:
         doc.from_signature_path ||
         null,
+
+      watermark_enabled:
+        resolveWatermarkFromContext(body, user),
+      remove_watermark:
+        resolveWatermarkFromContext(body, user) === 0 ? 1 : 0,
+      show_watermark:
+        resolveWatermarkFromContext(body, user) === 1 ? 1 : 0,
     };
 
     let absPdfPath = null;
@@ -1497,6 +1548,7 @@ const createDocument =
      */
 
     try {
+      const wm = resolveWatermarkFromContext(body, user);
       const pdfDoc = {
         ...doc,
 
@@ -1512,6 +1564,10 @@ const createDocument =
           docType === "quotation"
             ? doc.quotation_date
             : doc.invoice_date,
+
+        watermark_enabled: wm,
+        remove_watermark: wm === 0 ? 1 : 0,
+        show_watermark: wm === 1 ? 1 : 0,
       };
 
       absPdfPath =
@@ -1743,6 +1799,9 @@ const createMoneyReceipt =
         ? body.payment_mode
         : "cash";
 
+    const transferType = body.transfer_type ? String(body.transfer_type).trim().toUpperCase() : null;
+    const receiptTime = body.receipt_time || body.time || null;
+
     const amountReceived =
       roundMoney(
         cleanNumber(
@@ -1947,6 +2006,10 @@ const createMoneyReceipt =
 
         paymentMode,
 
+        transferType,
+
+        receiptTime,
+
         body.transaction_reference ||
           null,
 
@@ -2034,6 +2097,8 @@ const createMoneyReceipt =
             against_type,
             amount_received,
             payment_mode,
+            transfer_type,
+            receipt_time,
             transaction_reference,
             bank_account_id,
             bank_name,
@@ -2415,6 +2480,13 @@ const createMoneyReceipt =
       signature_path:
         receipt.from_signature_path ||
         null,
+
+      watermark_enabled:
+        resolveWatermarkFromContext(body, user),
+      remove_watermark:
+        resolveWatermarkFromContext(body, user) === 0 ? 1 : 0,
+      show_watermark:
+        resolveWatermarkFromContext(body, user) === 1 ? 1 : 0,
     };
 
     let absPdfPath = null;
@@ -2427,6 +2499,7 @@ const createMoneyReceipt =
      */
 
     try {
+      const wm = resolveWatermarkFromContext(body, user);
       absPdfPath =
         await generateDocumentPdf({
           doc: {
@@ -2446,6 +2519,10 @@ const createMoneyReceipt =
 
             subtotal:
               receipt.amount_received,
+
+            watermark_enabled: wm,
+            remove_watermark: wm === 0 ? 1 : 0,
+            show_watermark: wm === 1 ? 1 : 0,
           },
 
           customer,
@@ -2518,6 +2595,7 @@ const listDocuments =
       from,
       to,
       document_status,
+      item_type,
     } = req.query;
 
     const rows = [];
@@ -2598,6 +2676,15 @@ const listDocuments =
 
         invoiceParams.push(
           to
+        );
+      }
+
+      if (item_type && String(item_type).trim().toLowerCase() !== "all") {
+        invoiceSql +=
+          " AND EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id AND ii.item_type = ?)";
+
+        invoiceParams.push(
+          String(item_type).trim().toLowerCase()
         );
       }
 
@@ -2695,6 +2782,15 @@ const listDocuments =
         );
       }
 
+      if (item_type && String(item_type).trim().toLowerCase() !== "all") {
+        quotationSql +=
+          " AND EXISTS (SELECT 1 FROM quotation_items qi WHERE qi.quotation_id = q.id AND qi.item_type = ?)";
+
+        quotationParams.push(
+          String(item_type).trim().toLowerCase()
+        );
+      }
+
       const [
         quotationRows,
       ] = await pool.query(
@@ -2766,6 +2862,10 @@ const listMoneyReceipts =
       from,
       to,
       document_status,
+      transfer_type,
+      search,
+      query,
+      q,
     } = req.query;
 
     let sql = `
@@ -2811,6 +2911,24 @@ const listMoneyReceipts =
       params.push(
         document_status
       );
+    }
+
+    if (transfer_type) {
+      sql +=
+        " AND mr.transfer_type = ?";
+
+      params.push(
+        String(transfer_type).trim().toUpperCase()
+      );
+    }
+
+    const keyword = search || query || q;
+    if (keyword) {
+      sql +=
+        " AND (mr.receipt_number LIKE ? OR mr.transfer_type LIKE ? OR mr.received_from_name LIKE ? OR c.name LIKE ? OR mr.transaction_reference LIKE ?)";
+
+      const term = `%${String(keyword).trim()}%`;
+      params.push(term, term, term, term, term);
     }
 
     if (from) {
@@ -3446,9 +3564,707 @@ const deleteDocument = asyncHandler(async (req, res) => {
   throw new ApiError(404, "Document not found.");
 });
 
+/*
+ * ============================================================
+ * UPDATE INVOICE / QUOTATION
+ * ============================================================
+ */
+
+const updateDocument = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+
+  // Check if target is invoice or quotation
+  let isQuotation = body.doc_type === "quotation" || req.query.doc_type === "quotation";
+  if (!isQuotation) {
+    const [qCheck] = await pool.query("SELECT id FROM quotations WHERE id = ?", [id]);
+    if (qCheck.length) {
+      const [iCheck] = await pool.query("SELECT id FROM invoices WHERE id = ? AND doc_type = 'invoice'", [id]);
+      if (!iCheck.length) {
+        isQuotation = true;
+      }
+    }
+  }
+
+  const user = await getUserProfile(req.user.id);
+  const customer = await getCustomer(body.customer_id, req.user.id);
+  const manualCustomer = body.manual_customer || {};
+
+  const customerForDocument = customer || {
+    name: manualCustomer.name || null,
+    display_name: manualCustomer.display_name || manualCustomer.name || null,
+    business_name: manualCustomer.business_name || null,
+    email: manualCustomer.email || null,
+    phone: manualCustomer.phone || null,
+    gstin: manualCustomer.gstin || null,
+    pan: manualCustomer.pan || null,
+    billing_state: manualCustomer.billing_state || null,
+    billing_district: manualCustomer.billing_district || null,
+    billing_city: manualCustomer.billing_city || null,
+    billing_pincode: manualCustomer.billing_pincode || null,
+    billing_landmark: manualCustomer.billing_landmark || null,
+    shipping_state: manualCustomer.shipping_state || null,
+    shipping_district: manualCustomer.shipping_district || null,
+    shipping_city: manualCustomer.shipping_city || null,
+    shipping_pincode: manualCustomer.shipping_pincode || null,
+    shipping_landmark: manualCustomer.shipping_landmark || null,
+  };
+
+  const bank = body.bank_account_id
+    ? await getBankAccount(body.bank_account_id, req.user.id)
+    : await getDefaultBankAccount(req.user.id);
+
+  const documentDate = body.invoice_date ? new Date(body.invoice_date) : new Date();
+  if (Number.isNaN(documentDate.getTime())) {
+    throw new ApiError(400, "Invalid document date.");
+  }
+
+  const documentStatus = ["draft", "issued", "cancelled"].includes(body.document_status)
+    ? body.document_status
+    : "issued";
+
+  const documentDiscountPercent = Math.max(cleanNumber(body.discount_percent, 0), 0);
+  const cgstRate = Math.max(cleanNumber(body.cgst_rate, 0), 0);
+  const sgstRate = Math.max(cleanNumber(body.sgst_rate, 0), 0);
+  const igstRate = Math.max(cleanNumber(body.igst_rate, 0), 0);
+  const tcsRate = Math.max(cleanNumber(body.tcs_rate, 0), 0);
+  const tdsRate = Math.max(cleanNumber(body.tds_rate, 0), 0);
+
+  const safeItems = Array.isArray(body.items) ? body.items : [];
+  let subtotal = 0;
+  const calculatedItems = safeItems.map((rawItem) => {
+    const quantity = Math.max(cleanNumber(rawItem.quantity, 1), 0.0001);
+    const price = Math.max(cleanNumber(rawItem.price, 0), 0);
+    const amount = roundMoney(quantity * price);
+    const itemDiscountPercent = Math.max(cleanNumber(rawItem.discount_percent, 0), 0);
+    const itemDiscountAmount = roundMoney((amount * itemDiscountPercent) / 100);
+    const taxableAmount = Math.max(0, amount - itemDiscountAmount);
+    const itemTaxRate = Math.max(cleanNumber(rawItem.tax_rate, 0), 0);
+    const itemTaxAmount = roundMoney((taxableAmount * itemTaxRate) / 100);
+    const lineTotal = roundMoney(taxableAmount + itemTaxAmount);
+    subtotal += taxableAmount;
+    return {
+      product_id: rawItem.product_id || rawItem.id || null,
+      product_name: rawItem.product_name || rawItem.name || "Item",
+      hsn_code: rawItem.hsn_code || rawItem.hsn || null,
+      quantity,
+      price,
+      amount,
+      description: rawItem.description || null,
+      category: rawItem.category || null,
+      item_type: rawItem.item_type === "service" ? "service" : "goods",
+      unit: rawItem.unit || null,
+      discount_percent: itemDiscountPercent,
+      discount_amount: itemDiscountAmount,
+      tax_rate: itemTaxRate,
+      tax_amount: itemTaxAmount,
+      line_total: lineTotal,
+    };
+  });
+
+  subtotal = roundMoney(subtotal);
+  const discountAmount = roundMoney((subtotal * documentDiscountPercent) / 100);
+  const taxableSubtotal = roundMoney(subtotal - discountAmount);
+  const cgstAmount = roundMoney((taxableSubtotal * cgstRate) / 100);
+  const sgstAmount = roundMoney((taxableSubtotal * sgstRate) / 100);
+  const igstAmount = roundMoney((taxableSubtotal * igstRate) / 100);
+  const tcsAmount = roundMoney((taxableSubtotal * tcsRate) / 100);
+  const tdsAmount = roundMoney((taxableSubtotal * tdsRate) / 100);
+  const beforeRoundOff = roundMoney(taxableSubtotal + cgstAmount + sgstAmount + igstAmount + tcsAmount - tdsAmount);
+  const roundOff = roundMoney(cleanNumber(body.round_off, 0));
+  const totalAmount = roundMoney(beforeRoundOff + roundOff);
+
+  const customerSnapshot = {
+    to_name: customerForDocument?.display_name || customerForDocument?.name || null,
+    to_business_name: customerForDocument?.business_name || null,
+    to_email: customerForDocument?.email || null,
+    to_phone: customerForDocument?.phone || null,
+    to_gstin: customerForDocument?.gstin || null,
+    to_pan: customerForDocument?.pan || null,
+    to_billing_state: customerForDocument?.billing_state || customerForDocument?.business_state || null,
+    to_billing_district: customerForDocument?.billing_district || customerForDocument?.business_district || null,
+    to_billing_city: customerForDocument?.billing_city || customerForDocument?.business_city || null,
+    to_billing_pincode: customerForDocument?.billing_pincode || customerForDocument?.business_pincode || null,
+    to_billing_landmark: customerForDocument?.billing_landmark || customerForDocument?.business_landmark || null,
+    to_shipping_state: customerForDocument?.shipping_state || customerForDocument?.billing_state || null,
+    to_shipping_district: customerForDocument?.shipping_district || customerForDocument?.billing_district || null,
+    to_shipping_city: customerForDocument?.shipping_city || customerForDocument?.billing_city || null,
+    to_shipping_pincode: customerForDocument?.shipping_pincode || customerForDocument?.billing_pincode || null,
+    to_shipping_landmark: customerForDocument?.shipping_landmark || customerForDocument?.billing_landmark || null,
+  };
+  const bankSnapshot = buildBankSnapshot(bank);
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    if (isQuotation) {
+      const [qRows] = await conn.query("SELECT * FROM quotations WHERE id = ? FOR UPDATE", [id]);
+      if (!qRows.length) throw new ApiError(404, "Quotation not found.");
+      const quotation = qRows[0];
+      if (req.user.role !== "superadmin" && Number(quotation.created_by) !== Number(req.user.id)) {
+        throw new ApiError(403, "Not allowed to edit this quotation.");
+      }
+
+      await conn.query("DELETE FROM quotation_items WHERE quotation_id = ?", [id]);
+
+      await conn.query(
+        `UPDATE quotations SET
+          customer_id = ?, quotation_date = ?, subtotal = ?, total_amount = ?, document_status = ?,
+          valid_until = ?, discount_percent = ?, discount_amount = ?, cgst_rate = ?, cgst_amount = ?,
+          sgst_rate = ?, sgst_amount = ?, igst_rate = ?, igst_amount = ?, tcs_rate = ?, tcs_amount = ?,
+          tds_rate = ?, tds_amount = ?, round_off = ?, notes = ?, terms_conditions = ?,
+          to_name = ?, to_business_name = ?, to_email = ?, to_phone = ?, to_gstin = ?, to_pan = ?,
+          to_billing_state = ?, to_billing_district = ?, to_billing_city = ?, to_billing_pincode = ?,
+          to_shipping_state = ?, to_shipping_district = ?, to_shipping_city = ?, to_shipping_pincode = ?
+         WHERE id = ? AND created_by = ?`,
+        [
+          customer?.id || null, documentDate, subtotal, totalAmount, documentStatus,
+          body.valid_until || null, documentDiscountPercent, discountAmount, cgstRate, cgstAmount,
+          sgstRate, sgstAmount, igstRate, igstAmount, tcsRate, tcsAmount,
+          tdsRate, tdsAmount, roundOff, body.notes || null, body.terms_conditions || null,
+          customerSnapshot.to_name, customerSnapshot.to_business_name, customerSnapshot.to_email,
+          customerSnapshot.to_phone, customerSnapshot.to_gstin, customerSnapshot.to_pan,
+          customerSnapshot.to_billing_state, customerSnapshot.to_billing_district, customerSnapshot.to_billing_city, customerSnapshot.to_billing_pincode,
+          customerSnapshot.to_shipping_state, customerSnapshot.to_shipping_district, customerSnapshot.to_shipping_city, customerSnapshot.to_shipping_pincode,
+          id, req.user.id,
+        ]
+      );
+
+      for (const item of calculatedItems) {
+        const reqQty = cleanNumber(item.quantity, 1);
+        if (item.item_type !== "service") {
+          let stockRow = null;
+          if (item.product_id) {
+            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?", [item.product_id, req.user.id]);
+            if (rows.length) stockRow = rows[0];
+          }
+          if (!stockRow && item.product_name) {
+            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?", [item.product_name, req.user.id]);
+            if (rows.length) stockRow = rows[0];
+          }
+          if (!stockRow) {
+            await conn.rollback();
+            throw new ApiError(
+              400,
+              `Insufficient stock for product "${item.product_name}". Requested: ${reqQty}, Available: 0`,
+              {
+                product_name: item.product_name,
+                requested_quantity: reqQty,
+                available_stock: 0,
+              }
+            );
+          }
+          const availableStock = Number(stockRow.quantity || 0);
+          if (availableStock < reqQty) {
+            await conn.rollback();
+            throw new ApiError(
+              400,
+              `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
+              {
+                product_name: stockRow.product_name,
+                requested_quantity: reqQty,
+                available_stock: availableStock,
+              }
+            );
+          }
+        }
+
+        await conn.query(
+          `INSERT INTO quotation_items
+            (quotation_id, product_id, product_name, hsn_code, quantity, price, amount,
+             description, category, item_type, unit, discount_percent, discount_amount,
+             tax_rate, tax_amount, line_total)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            id, item.product_id, item.product_name, item.hsn_code, item.quantity, item.price, item.amount,
+            item.description, item.category, item.item_type, item.unit, item.discount_percent, item.discount_amount,
+            item.tax_rate, item.tax_amount, item.line_total,
+          ]
+        );
+      }
+
+      await conn.commit();
+    } else {
+      const [invRows] = await conn.query("SELECT * FROM invoices WHERE id = ? AND doc_type = 'invoice' FOR UPDATE", [id]);
+      if (!invRows.length) throw new ApiError(404, "Invoice not found.");
+      const invoice = invRows[0];
+      if (req.user.role !== "superadmin" && Number(invoice.created_by) !== Number(req.user.id)) {
+        throw new ApiError(403, "Not allowed to edit this invoice.");
+      }
+
+      // Reverse previous stock deductions
+      const [oldItems] = await conn.query("SELECT * FROM invoice_items WHERE invoice_id = ?", [id]);
+      for (const oldItem of oldItems) {
+        if (oldItem.item_type !== "service") {
+          const qty = Number(oldItem.quantity || 0);
+          if (qty > 0) {
+            if (oldItem.product_id) {
+              await conn.query("UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?", [qty, oldItem.product_id, invoice.created_by]);
+            } else if (oldItem.product_name) {
+              await conn.query("UPDATE stock SET quantity = quantity + ? WHERE product_name = ? AND created_by = ?", [qty, oldItem.product_name, invoice.created_by]);
+            }
+          }
+        }
+      }
+
+      await conn.query("DELETE FROM invoice_items WHERE invoice_id = ?", [id]);
+
+      // Apply new stock deductions and insert new items
+      for (const item of calculatedItems) {
+        const reqQty = cleanNumber(item.quantity, 1);
+        if (item.item_type !== "service" && item.product_id) {
+          const [stRows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE", [item.product_id, req.user.id]);
+          if (stRows.length) {
+            const avail = Number(stRows[0].quantity || 0);
+            if (reqQty > avail) {
+              throw new ApiError(400, `Insufficient stock for "${stRows[0].product_name}". Available: ${avail}.`);
+            }
+            await conn.query("UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?", [reqQty, item.product_id, req.user.id]);
+          }
+        }
+
+        await conn.query(
+          `INSERT INTO invoice_items
+            (invoice_id, product_id, product_name, hsn_code, quantity, price, amount,
+             description, category, item_type, unit, discount_percent, discount_amount,
+             tax_rate, tax_amount, line_total)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            id, item.product_id, item.product_name, item.hsn_code, item.quantity, item.price, item.amount,
+            item.description, item.category, item.item_type, item.unit, item.discount_percent, item.discount_amount,
+            item.tax_rate, item.tax_amount, item.line_total,
+          ]
+        );
+      }
+
+      await conn.query(
+        `UPDATE invoices SET
+          customer_id = ?, invoice_date = ?, subtotal = ?, total_amount = ?, document_status = ?,
+          due_date = ?, valid_until = ?, discount_percent = ?, discount_amount = ?, cgst_rate = ?, cgst_amount = ?,
+          sgst_rate = ?, sgst_amount = ?, igst_rate = ?, igst_amount = ?, tcs_rate = ?, tcs_amount = ?,
+          tds_rate = ?, tds_amount = ?, round_off = ?, notes = ?, terms_conditions = ?, bank_account_id = ?,
+          to_name = ?, to_business_name = ?, to_email = ?, to_phone = ?, to_gstin = ?, to_pan = ?,
+          to_billing_state = ?, to_billing_district = ?, to_billing_city = ?, to_billing_pincode = ?,
+          to_shipping_state = ?, to_shipping_district = ?, to_shipping_city = ?, to_shipping_pincode = ?,
+          bank_name = ?, bank_branch = ?, bank_account_holder_name = ?, bank_account_number = ?, bank_account_type = ?, bank_ifsc_code = ?
+         WHERE id = ? AND created_by = ?`,
+        [
+          customer?.id || null, documentDate, subtotal, totalAmount, documentStatus,
+          body.due_date || null, body.valid_until || null, documentDiscountPercent, discountAmount, cgstRate, cgstAmount,
+          sgstRate, sgstAmount, igstRate, igstAmount, tcsRate, tcsAmount,
+          tdsRate, tdsAmount, roundOff, body.notes || null, body.terms_conditions || null, bank?.id || null,
+          customerSnapshot.to_name, customerSnapshot.to_business_name, customerSnapshot.to_email,
+          customerSnapshot.to_phone, customerSnapshot.to_gstin, customerSnapshot.to_pan,
+          customerSnapshot.to_billing_state, customerSnapshot.to_billing_district, customerSnapshot.to_billing_city, customerSnapshot.to_billing_pincode,
+          customerSnapshot.to_shipping_state, customerSnapshot.to_shipping_district, customerSnapshot.to_shipping_city, customerSnapshot.to_shipping_pincode,
+          bankSnapshot.bank_name, bankSnapshot.bank_branch, bankSnapshot.bank_account_holder_name,
+          bankSnapshot.bank_account_number, bankSnapshot.bank_account_type, bankSnapshot.bank_ifsc_code,
+          id, req.user.id,
+        ]
+      );
+
+      await conn.commit();
+    }
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  // Fetch updated doc and regenerate PDF immediately
+  let updatedDoc;
+  let itemRows;
+  if (isQuotation) {
+    const [qRows] = await pool.query("SELECT * FROM quotations WHERE id = ?", [id]);
+    updatedDoc = qRows[0];
+    updatedDoc.doc_type = "quotation";
+    updatedDoc.invoice_number = updatedDoc.quotation_number;
+    updatedDoc.invoice_date = updatedDoc.quotation_date;
+    const [iRows] = await pool.query("SELECT * FROM quotation_items WHERE quotation_id = ? ORDER BY id ASC", [id]);
+    itemRows = iRows;
+  } else {
+    const [iRows] = await pool.query("SELECT * FROM invoices WHERE id = ?", [id]);
+    updatedDoc = iRows[0];
+    const [items] = await pool.query("SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id ASC", [id]);
+    itemRows = items;
+  }
+
+  const wm = resolveWatermarkFromContext(body, user);
+
+  const company = {
+    company_name: updatedDoc.from_business_name || updatedDoc.from_name || "",
+    business_name: updatedDoc.from_business_name || "",
+    name: updatedDoc.from_name || "",
+    email: updatedDoc.from_email || "",
+    phone: updatedDoc.from_phone || "",
+    gstin: updatedDoc.from_gstin || "",
+    pan: updatedDoc.from_pan || "",
+    website: updatedDoc.from_website || "",
+    address_line1: updatedDoc.from_address_line1 || "",
+    address_line2: updatedDoc.from_address_line2 || "",
+    city: updatedDoc.from_city || "",
+    state: updatedDoc.from_state || "",
+    pincode: updatedDoc.from_pincode || "",
+    country: updatedDoc.from_country || "India",
+    logo_path: updatedDoc.from_logo_path || null,
+    signature_path: updatedDoc.from_signature_path || null,
+    watermark_enabled: wm,
+    remove_watermark: wm === 0 ? 1 : 0,
+    show_watermark: wm === 1 ? 1 : 0,
+  };
+
+  try {
+    const pdfDoc = {
+      ...updatedDoc,
+      doc_type: isQuotation ? "quotation" : "invoice",
+      invoice_number: isQuotation ? updatedDoc.quotation_number : updatedDoc.invoice_number,
+      invoice_date: isQuotation ? updatedDoc.quotation_date : updatedDoc.invoice_date,
+      watermark_enabled: wm,
+      remove_watermark: wm === 0 ? 1 : 0,
+      show_watermark: wm === 1 ? 1 : 0,
+    };
+    const absPdfPath = await generateDocumentPdf({
+      doc: pdfDoc,
+      customer: customerForDocument,
+      items: itemRows,
+      company,
+    });
+    const pdfRelPath = relativeUploadPath(absPdfPath);
+    if (isQuotation) {
+      await pool.query("UPDATE quotations SET pdf_path = ? WHERE id = ?", [pdfRelPath, id]);
+    } else {
+      await pool.query("UPDATE invoices SET pdf_path = ? WHERE id = ?", [pdfRelPath, id]);
+    }
+    updatedDoc.pdf_path = pdfRelPath;
+  } catch (pdfErr) {
+    console.error("PDF regeneration error:", pdfErr);
+  }
+
+  res.json({
+    success: true,
+    message: isQuotation ? "Quotation updated successfully." : "Invoice updated successfully.",
+    document: {
+      ...updatedDoc,
+      items: itemRows,
+    },
+  });
+});
+
+/*
+ * ============================================================
+ * UPDATE MONEY RECEIPT
+ * ============================================================
+ */
+
+const updateMoneyReceipt = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+
+  const [existingRows] = await pool.query(
+    "SELECT * FROM money_receipts WHERE id = ? AND created_by = ?",
+    [id, req.user.id]
+  );
+  if (!existingRows.length) {
+    throw new ApiError(404, "Money receipt not found.");
+  }
+
+  const existingReceipt = existingRows[0];
+  const user = await getUserProfile(req.user.id);
+  const customer = await getCustomer(body.customer_id || existingReceipt.customer_id, req.user.id);
+  const bank = body.bank_account_id
+    ? await getBankAccount(body.bank_account_id, req.user.id)
+    : (existingReceipt.bank_account_id ? await getBankAccount(existingReceipt.bank_account_id, req.user.id) : null);
+
+  const receiptDate = body.receipt_date ? new Date(body.receipt_date) : new Date(existingReceipt.receipt_date);
+  const amountReceived = body.amount_received !== undefined ? roundMoney(body.amount_received) : Number(existingReceipt.amount_received);
+  const paymentMode = body.payment_mode || existingReceipt.payment_mode || "cash";
+  const transferType = body.transfer_type !== undefined ? (body.transfer_type ? String(body.transfer_type).trim().toUpperCase() : null) : existingReceipt.transfer_type;
+  const receiptTime = body.receipt_time !== undefined ? body.receipt_time : (body.time !== undefined ? body.time : existingReceipt.receipt_time);
+  const againstType = body.against_type || existingReceipt.against_type || "other";
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    await conn.query("DELETE FROM money_receipt_allocations WHERE money_receipt_id = ?", [id]);
+
+    const effectiveAllocations = Array.isArray(body.allocations) ? body.allocations : [];
+    for (const alloc of effectiveAllocations) {
+      const invId = Number(alloc.invoice_id);
+      const amtApplied = roundMoney(alloc.amount_applied);
+      if (invId && amtApplied > 0) {
+        await conn.query(
+          "INSERT INTO money_receipt_allocations (money_receipt_id, invoice_id, amount_applied) VALUES (?, ?, ?)",
+          [id, invId, amtApplied]
+        );
+      }
+    }
+
+    await conn.query(
+      `UPDATE money_receipts SET
+        receipt_date = ?, receipt_time = ?, customer_id = ?, received_from_name = ?, received_from_email = ?,
+        received_from_phone = ?, against_type = ?, amount_received = ?, payment_mode = ?, transfer_type = ?,
+        transaction_reference = ?, bank_account_id = ?, bank_name = ?, bank_branch = ?,
+        bank_account_holder_name = ?, bank_account_number = ?, bank_ifsc_code = ?,
+        description = ?, notes = ?
+       WHERE id = ? AND created_by = ?`,
+      [
+        receiptDate, receiptTime || null, customer?.id || null,
+        body.received_from_name || customer?.name || existingReceipt.received_from_name,
+        body.received_from_email || customer?.email || existingReceipt.received_from_email,
+        body.received_from_phone || customer?.phone || existingReceipt.received_from_phone,
+        againstType, amountReceived, paymentMode, transferType || null,
+        body.transaction_reference || existingReceipt.transaction_reference,
+        bank?.id || null, bank?.bank_name || null, bank?.branch || null,
+        bank?.account_holder_name || null, bank?.account_number || null, bank?.ifsc_code || null,
+        body.description !== undefined ? body.description : existingReceipt.description,
+        body.notes !== undefined ? body.notes : existingReceipt.notes,
+        id, req.user.id,
+      ]
+    );
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  const [updatedRows] = await pool.query("SELECT * FROM money_receipts WHERE id = ?", [id]);
+  const receipt = updatedRows[0];
+
+  const wm = resolveWatermarkFromContext(body, user);
+
+  const company = {
+    company_name: receipt.from_business_name || receipt.from_name || "",
+    business_name: receipt.from_business_name || "",
+    name: receipt.from_name || "",
+    email: receipt.from_email || "",
+    phone: receipt.from_phone || "",
+    gstin: receipt.from_gstin || "",
+    pan: receipt.from_pan || "",
+    website: receipt.from_website || "",
+    address_line1: receipt.from_address_line1 || "",
+    address_line2: receipt.from_address_line2 || "",
+    city: receipt.from_city || "",
+    state: receipt.from_state || "",
+    pincode: receipt.from_pincode || "",
+    country: receipt.from_country || "India",
+    logo_path: receipt.from_logo_path || null,
+    signature_path: receipt.from_signature_path || null,
+    watermark_enabled: wm,
+    remove_watermark: wm === 0 ? 1 : 0,
+    show_watermark: wm === 1 ? 1 : 0,
+  };
+
+  try {
+    const absPdfPath = await generateDocumentPdf({
+      doc: {
+        ...receipt,
+        doc_type: "money_receipt",
+        invoice_number: receipt.receipt_number,
+        invoice_date: receipt.receipt_date,
+        total_amount: receipt.amount_received,
+        subtotal: receipt.amount_received,
+        watermark_enabled: wm,
+        remove_watermark: wm === 0 ? 1 : 0,
+        show_watermark: wm === 1 ? 1 : 0,
+      },
+      customer,
+      items: [],
+      company,
+      receipt,
+    });
+    const pdfRelPath = relativeUploadPath(absPdfPath);
+    await pool.query("UPDATE money_receipts SET pdf_path = ? WHERE id = ?", [pdfRelPath, id]);
+    receipt.pdf_path = pdfRelPath;
+  } catch (pdfErr) {
+    console.error("Money receipt PDF regeneration error:", pdfErr);
+  }
+
+  res.json({
+    success: true,
+    message: "Money receipt updated successfully.",
+    receipt,
+  });
+});
+
+/*
+ * ============================================================
+ * DELETE MONEY RECEIPT
+ * ============================================================
+ */
+const deleteMoneyReceipt = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const [rows] = await pool.query(
+    "SELECT * FROM money_receipts WHERE id = ?",
+    [id]
+  );
+
+  if (!rows.length) {
+    throw new ApiError(404, "Money receipt not found.");
+  }
+
+  const receipt = rows[0];
+
+  if (
+    req.user.role !== "superadmin" &&
+    Number(receipt.created_by) !== Number(req.user.id)
+  ) {
+    throw new ApiError(403, "You are not allowed to delete this money receipt.");
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1. Delete linked payment if exists in payments table
+    if (receipt.payment_id || receipt.is_linked_to_payment) {
+      await conn.query(
+        "DELETE FROM payments WHERE (id = ? OR money_receipt_id = ?) AND created_by = ?",
+        [receipt.payment_id || 0, id, receipt.created_by]
+      );
+    } else {
+      await conn.query(
+        "DELETE FROM payments WHERE money_receipt_id = ? AND created_by = ?",
+        [id, receipt.created_by]
+      );
+    }
+
+    // 2. Delete invoice allocations
+    await conn.query(
+      "DELETE FROM money_receipt_allocations WHERE money_receipt_id = ?",
+      [id]
+    );
+
+    // 3. Delete the money receipt record
+    await conn.query("DELETE FROM money_receipts WHERE id = ?", [id]);
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+
+  // 4. Safely remove PDF if it exists
+  if (receipt.pdf_path) {
+    try {
+      const decodedPdfPath = decodeURIComponent(receipt.pdf_path);
+      const fullPath = path.resolve(
+        path.join(__dirname, "..", decodedPdfPath.replace(/^\//, ""))
+      );
+      if (fs.existsSync(fullPath)) {
+        await fs.promises.unlink(fullPath);
+      }
+    } catch (err) {
+      console.warn("Could not remove money receipt PDF file:", err.message);
+    }
+  }
+
+  res.json({
+    success: true,
+    message: "Money receipt deleted successfully.",
+    deleted_id: id,
+  });
+});
+
+/*
+ * ============================================================
+ * REGENERATE DOCUMENTS (Watermark preference sync & safe acknowledgment)
+ * ============================================================
+ */
+const regenerateDocuments = asyncHandler(async (req, res) => {
+  const {
+    watermark_enabled,
+    remove_watermark,
+    show_watermark,
+    watermark,
+    enable_watermark,
+  } = req.body || {};
+
+  let effectiveWatermark = null;
+  if (remove_watermark !== undefined && remove_watermark !== null) {
+    effectiveWatermark =
+      remove_watermark === 1 ||
+      remove_watermark === true ||
+      remove_watermark === "1" ||
+      remove_watermark === "true"
+        ? 0
+        : 1;
+  } else if (watermark_enabled !== undefined && watermark_enabled !== null) {
+    effectiveWatermark =
+      watermark_enabled === 1 ||
+      watermark_enabled === true ||
+      watermark_enabled === "1" ||
+      watermark_enabled === "true"
+        ? 1
+        : 0;
+  } else if (show_watermark !== undefined && show_watermark !== null) {
+    effectiveWatermark =
+      show_watermark === 1 ||
+      show_watermark === true ||
+      show_watermark === "1" ||
+      show_watermark === "true"
+        ? 1
+        : 0;
+  } else if (watermark !== undefined && watermark !== null) {
+    effectiveWatermark =
+      watermark === 1 || watermark === true || watermark === "1" || watermark === "true"
+        ? 1
+        : 0;
+  } else if (enable_watermark !== undefined && enable_watermark !== null) {
+    effectiveWatermark =
+      enable_watermark === 1 ||
+      enable_watermark === true ||
+      enable_watermark === "1" ||
+      enable_watermark === "true"
+        ? 1
+        : 0;
+  }
+
+  if (effectiveWatermark !== null) {
+    if (req.user?.id) {
+      await pool.query("UPDATE users SET watermark_enabled = ? WHERE id = ?", [
+        effectiveWatermark,
+        req.user.id,
+      ]);
+    }
+    await pool.query("UPDATE company_settings SET watermark_enabled = ? WHERE id = 1", [
+      effectiveWatermark,
+    ]);
+  } else if (req.user?.id) {
+    const [uRows] = await pool.query("SELECT watermark_enabled FROM users WHERE id = ?", [req.user.id]);
+    if (uRows.length && uRows[0].watermark_enabled !== null && uRows[0].watermark_enabled !== undefined) {
+      effectiveWatermark = Number(uRows[0].watermark_enabled) === 0 ? 0 : 1;
+    } else {
+      effectiveWatermark = 1;
+    }
+  } else {
+    effectiveWatermark = 1;
+  }
+
+  res.json({
+    success: true,
+    message: "Watermark preference saved. Newly generated documents will reflect this setting.",
+    watermark_enabled: effectiveWatermark,
+    remove_watermark: effectiveWatermark === 0 ? 1 : 0,
+    show_watermark: effectiveWatermark === 1 ? 1 : 0,
+  });
+});
+
 module.exports = {
   createDocument,
+  updateDocument,
+  regenerateDocuments,
   createMoneyReceipt,
+  updateMoneyReceipt,
+  deleteMoneyReceipt,
   listDocuments,
   listMoneyReceipts,
   getDocument,

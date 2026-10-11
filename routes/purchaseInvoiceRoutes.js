@@ -4,10 +4,14 @@ const {
   addPurchaseInvoice,
   lookupByHsn,
   listPurchaseInvoices,
+} = require("../controllers/purchaseInvoiceController");
+
+const {
   addPurchaseBill,
   listPurchaseBills,
   getPurchaseBill,
-} = require("../controllers/purchaseInvoiceController");
+  searchPurchaseItems,
+} = require("../controllers/purchaseBillController");
 
 const {
   linkPurchaseBillToPayment,
@@ -28,6 +32,8 @@ router.use(
 );
 
 router.get("/lookup", lookupByHsn);
+router.get("/items", searchPurchaseItems);
+router.get("/bills/items", searchPurchaseItems);
 
 router.get("/bills", listPurchaseBills);
 router.get("/bills/:id", getPurchaseBill);
