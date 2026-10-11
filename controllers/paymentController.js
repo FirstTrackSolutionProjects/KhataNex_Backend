@@ -4,12 +4,13 @@ const ApiError = require("../utils/ApiError");
 
 const VALID_PURPOSES = [
   "Due Received",
-  "Investor Advance",
-  "Amount Received",
+  "Advance Receivable",
+  "Advance Payable",
+  "Money Received",
   "Paid Out",
   "Purchase Bill",
-  "Advance",
   "Product Sale",
+  "Amount Received",
   "New Payment",
 ];
 
@@ -17,60 +18,85 @@ const resolveCategory = (purpose, payment_category) => {
   if (payment_category) {
     const cat = String(payment_category).trim().toLowerCase();
     if (
+      cat === "money_received" ||
+      cat === "moneyreceived" ||
       cat === "amount_received" ||
       cat === "amountreceived" ||
       cat === "normal_received" ||
       cat === "normalreceived" ||
       cat === "received"
     ) {
-      return "amount_received";
+      return "money_received";
+    }
+    if (
+      cat === "advance_receivable" ||
+      cat === "advancereceivable" ||
+      cat === "advance_from_investor" ||
+      cat === "investor_advance" ||
+      cat === "advance"
+    ) {
+      return "advance_receivable";
+    }
+    if (
+      cat === "advance_payable" ||
+      cat === "advancepayable" ||
+      cat === "advance_paid"
+    ) {
+      return "advance_payable";
+    }
+    if (cat === "purchase_bill" || cat === "purchasebill") return "paid_by_business";
+    if (
+      cat === "paid_out" ||
+      cat === "paidout" ||
+      cat === "paid_by_business"
+    ) {
+      return "paid_out";
     }
     if (cat === "due_received" || cat === "duereceived" || cat === "due") return "due_received";
-    if (cat === "paid_by_business" || cat === "paidout" || cat === "paid_out") return "paid_by_business";
-    if (cat === "purchase_bill" || cat === "purchasebill") return "paid_by_business";
-    if (cat === "advance_from_investor" || cat === "advance" || cat === "investor_advance") return "advance_from_investor";
     if (cat === "product_sale" || cat === "productsale") return "product_sale";
   }
 
   if (purpose) {
     const p = String(purpose).trim().toLowerCase();
     if (p.includes("purchase")) return "paid_by_business";
-    if (p.includes("amount received") || p === "received" || p.includes("normal received")) return "amount_received";
+    if (
+      p.includes("money received") ||
+      p.includes("amount received") ||
+      p === "received" ||
+      p.includes("normal received")
+    ) {
+      return "money_received";
+    }
+    if (p.includes("advance payable") || p.includes("advance paid")) return "advance_payable";
+    if (p.includes("advance receivable") || p.includes("investor")) return "advance_receivable";
     if (p.includes("due")) return "due_received";
-    if (p.includes("advance") || p.includes("investor")) return "advance_from_investor";
+    if (p.includes("paid out") || p.includes("paid_by_business")) return "paid_out";
     if (p.includes("product") || p.includes("sale")) return "product_sale";
-    if (p.includes("paid out") || p.includes("paid_by_business")) return "paid_by_business";
-    if (p.includes("received")) return "amount_received";
   }
 
-  // Default is Normal Received (amount_received) so that normal payments are never misclassified as due_received
-  return "amount_received";
+  // Default is Money Received (money_received). Due Received is NEVER the default.
+  return "money_received";
 };
 
 const resolvePurpose = (purpose, payment_category) => {
-  if (purpose && typeof purpose === "string" && purpose.trim()) {
-    const p = purpose.trim();
-    const match = VALID_PURPOSES.find(
-      (vp) => vp.toLowerCase() === p.toLowerCase()
-    );
-    if (match) return match;
-    return p;
-  }
-
-  const category = resolveCategory(null, payment_category);
+  const category = resolveCategory(purpose, payment_category);
   switch (category) {
     case "due_received":
       return "Due Received";
-    case "advance_from_investor":
-      return "Investor Advance";
-    case "amount_received":
-      return "Amount Received";
+    case "advance_receivable":
+      return "Advance Receivable";
+    case "advance_payable":
+      return "Advance Payable";
+    case "money_received":
+      return "Money Received";
     case "product_sale":
       return "Product Sale";
     case "paid_by_business":
+      return "Purchase Bill";
+    case "paid_out":
       return "Paid Out";
     default:
-      return "Amount Received";
+      return "Money Received";
   }
 };
 
@@ -101,13 +127,25 @@ const addPayment = asyncHandler(async (req, res) => {
     money_receipt_id,
   } = req.body;
 
-  let resolvedPurpose = resolvePurpose(purpose, payment_category);
-  let resolvedCategory = resolveCategory(resolvedPurpose, payment_category);
+  const explicitCategory = (payment_category || req.body?.category || req.body?.paymentCategory || "").trim().toLowerCase();
+  const isPurchaseCategory = explicitCategory === "purchase_bill" || explicitCategory === "purchasebill";
 
-  // If allocations or due_id are explicitly supplied, category is definitely due_received
-  if ((Array.isArray(allocations) && allocations.length > 0) || (Array.isArray(dues) && dues.length > 0) || due_id) {
+  let resolvedCategory = resolveCategory(purpose, explicitCategory);
+
+  // ONLY due_received loads/allocates customer dues.
+  // If payment_category was explicitly provided as anything other than due_received, it NEVER allocates dues.
+  if (explicitCategory && !["due_received", "duereceived", "due"].includes(explicitCategory)) {
+    // Keep resolvedCategory as resolved, do NOT override to due_received
+  } else if ((Array.isArray(allocations) && allocations.length > 0) || (Array.isArray(dues) && dues.length > 0) || due_id) {
     resolvedCategory = "due_received";
+  }
+
+  let resolvedPurpose = resolvePurpose(purpose, resolvedCategory);
+  if (resolvedCategory === "due_received") {
     resolvedPurpose = "Due Received";
+  } else if (isPurchaseCategory) {
+    resolvedCategory = "paid_by_business";
+    resolvedPurpose = "Purchase Bill";
   }
 
   const conn = await pool.getConnection();
@@ -135,12 +173,29 @@ const addPayment = asyncHandler(async (req, res) => {
     let linkedUnitPrice = null;
     let linkedPurchaseBillId = null;
     let linkedMoneyReceiptId = null;
+    let linkedMoneyReceiptCreatedAt = null;
     let resolvedPartyName = party_name || (customerObj?.name ?? null);
     const recordedAllocations = [];
 
+    const rawKhataEntryId = req.body?.khata_entry_id || req.body?.khataId || req.body?.khata_id;
+    if (rawKhataEntryId) {
+      const [existingKhataPay] = await conn.query(
+        "SELECT * FROM payments WHERE khata_entry_id = ? AND created_by = ? LIMIT 1",
+        [rawKhataEntryId, req.user.id]
+      );
+      if (existingKhataPay.length > 0) {
+        await conn.commit();
+        return res.status(200).json({
+          success: true,
+          message: "Payment for this Khata debit already exists.",
+          payment: existingKhataPay[0],
+        });
+      }
+    }
+
     // Target purchase bill resolution supporting all common frontend field variations:
-    // purchase_bill_id, bill_id, id, billId, purchaseBillId, req.params.id
-    const targetBillId =
+    // purchase_bill_id, bill_id, id, billId, purchaseBillId, bill_number, purpose regex, req.params.id
+    let targetBillId =
       purchase_bill_id ||
       req.body.purchase_bill_id ||
       req.body.purchaseBillId ||
@@ -151,10 +206,48 @@ const addPayment = asyncHandler(async (req, res) => {
       req.params?.purchase_bill_id ||
       req.params?.bill_id;
 
+    if (!targetBillId) {
+      let candidateBillNumber =
+        req.body?.bill_number ||
+        req.body?.billNumber ||
+        req.query?.bill_number ||
+        req.query?.billNumber;
+
+      if (!candidateBillNumber && purpose) {
+        const match = String(purpose).match(/Purchase Bill\s*#?\s*([A-Za-z0-9_\-\/]+)/i);
+        if (match) {
+          candidateBillNumber = match[1].trim();
+        }
+      }
+
+      if (candidateBillNumber) {
+        const [matchedBills] = await conn.query(
+          "SELECT id FROM purchase_bills WHERE (bill_number = ? OR id = ?) AND created_by = ? LIMIT 1",
+          [String(candidateBillNumber).trim(), Number(candidateBillNumber) || 0, req.user.id]
+        );
+        if (matchedBills.length) {
+          targetBillId = matchedBills[0].id;
+        }
+      }
+    }
+
+    if (!targetBillId && (isPurchaseCategory || resolvedPurpose === "Purchase Bill")) {
+      const vendorName = party_name || req.body?.vendor_name || req.body?.recipient_name;
+      if (vendorName) {
+        const [recentBills] = await conn.query(
+          "SELECT id FROM purchase_bills WHERE created_by = ? AND vendor_name = ? ORDER BY id DESC LIMIT 1",
+          [req.user.id, String(vendorName).trim()]
+        );
+        if (recentBills.length) {
+          targetBillId = recentBills[0].id;
+        }
+      }
+    }
+
     // 0a. PURCHASE BILL PAYMENT: Look up purchase bill & calculate total from purchase_bill_items
-    if (targetBillId || resolvedPurpose === "Purchase Bill" || payment_category === "purchase_bill") {
+    if (targetBillId || resolvedPurpose === "Purchase Bill" || isPurchaseCategory) {
       if (!targetBillId) {
-        throw new ApiError(400, "purchase_bill_id is required for Purchase Bill payment.");
+        throw new ApiError(400, "purchase_bill_id or valid bill_number is required for Purchase Bill payment.");
       }
 
       const [pbRows] = await conn.query(
@@ -167,9 +260,6 @@ const addPayment = asyncHandler(async (req, res) => {
       }
 
       const pb = pbRows[0];
-      if (pb.is_paid === 1 || pb.payment_id) {
-        throw new ApiError(400, "This purchase bill has already been marked as paid.");
-      }
 
       // Calculate bill total using item-level GST (item-level is authoritative, no bill-level double GST)
       const [pbItems] = await conn.query(
@@ -188,9 +278,82 @@ const addPayment = asyncHandler(async (req, res) => {
       finalAmount = Number(amount) > 0 ? Number(amount) : billTotal;
       linkedPurchaseBillId = pb.id;
       resolvedCategory = "paid_by_business";
-      resolvedPurpose = "Purchase Bill";
-      if (!resolvedPartyName && pb.vendor_name) {
-        resolvedPartyName = pb.vendor_name;
+      resolvedPurpose = pb.bill_number ? `Purchase Bill #${pb.bill_number}` : "Purchase Bill";
+      if (!resolvedPartyName && (pb.vendor_name || req.body?.vendor_name || req.body?.recipient_name)) {
+        resolvedPartyName = pb.vendor_name || req.body?.vendor_name || req.body?.recipient_name;
+      }
+
+      // Check if a payment for this purchase bill already exists
+      const [existingPbPayments] = await conn.query(
+        `SELECT * FROM payments
+         WHERE ((purchase_bill_id = ? OR id = ?)
+                OR (purpose = ? AND ? != '')
+                OR (purpose = ? AND ? != ''))
+           AND created_by = ?
+         ORDER BY id ASC`,
+        [
+          pb.id,
+          pb.payment_id || 0,
+          `Purchase Bill #${pb.bill_number}`,
+          pb.bill_number || "",
+          `Purchase Bill ${pb.bill_number}`,
+          pb.bill_number || "",
+          req.user.id,
+        ]
+      );
+
+      if (existingPbPayments.length > 0) {
+        const primaryPayment = existingPbPayments[0];
+        const resolvedMode = normalizePaymentMode(payment_mode || req.body?.mode || primaryPayment.payment_mode);
+        const resolvedDate = payment_date || primaryPayment.payment_date || pb.bill_date;
+
+        await conn.query(
+          `UPDATE payments
+           SET payment_category = 'paid_by_business',
+               party_name = ?,
+               purpose = ?,
+               amount = ?,
+               payment_mode = ?,
+               payment_date = COALESCE(?, CURRENT_DATE),
+               purchase_bill_id = ?
+           WHERE id = ? AND created_by = ?`,
+          [
+            resolvedPartyName || primaryPayment.party_name || pb.vendor_name || "Vendor",
+            primaryPayment.purpose || resolvedPurpose,
+            finalAmount,
+            resolvedMode,
+            resolvedDate,
+            pb.id,
+            primaryPayment.id,
+            req.user.id,
+          ]
+        );
+
+        if (existingPbPayments.length > 1) {
+          const extraIds = existingPbPayments.slice(1).map((p) => p.id);
+          await conn.query(
+            "UPDATE payments SET purchase_bill_id = ?, payment_category = 'paid_by_business' WHERE id IN (?) AND created_by = ?",
+            [pb.id, extraIds, req.user.id]
+          );
+        }
+
+        await conn.query(
+          "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
+          [primaryPayment.id, pb.id, req.user.id]
+        );
+
+        await conn.commit();
+
+        const [updatedRows] = await pool.query(
+          "SELECT * FROM payments WHERE id = ? AND created_by = ?",
+          [primaryPayment.id, req.user.id]
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: "Purchase bill payment updated successfully.",
+          payment: updatedRows[0],
+        });
       }
     }
 
@@ -211,11 +374,11 @@ const addPayment = asyncHandler(async (req, res) => {
       }
 
       if (mr.against_type === "advance") {
-        resolvedCategory = "advance_from_investor";
-        resolvedPurpose = "Investor Advance";
+        resolvedCategory = "advance_receivable";
+        resolvedPurpose = "Advance Receivable";
       } else {
-        resolvedCategory = "amount_received";
-        resolvedPurpose = "Amount Received";
+        resolvedCategory = "money_received";
+        resolvedPurpose = "Money Received";
       }
 
       finalAmount = Number(mr.amount_received || 0);
@@ -226,6 +389,10 @@ const addPayment = asyncHandler(async (req, res) => {
       if (!resolvedPartyName && mr.received_from_name) {
         resolvedPartyName = mr.received_from_name;
       }
+      if (!payment_date && mr.receipt_date) {
+        payment_date = String(mr.receipt_date).slice(0, 10);
+      }
+      linkedMoneyReceiptCreatedAt = mr.receipt_date || mr.created_at;
     }
 
     // 1. PRODUCT SALE: Look up from Product Master (stock) at selling price (stock.price)
@@ -371,7 +538,7 @@ const addPayment = asyncHandler(async (req, res) => {
 
     // 3. PAID OUT / PAID BY BUSINESS add_to_khata flag
     const shouldAddToKhata =
-      (resolvedCategory === "paid_by_business" && !linkedPurchaseBillId)
+      ((resolvedCategory === "paid_by_business" || resolvedCategory === "paid_out") && !linkedPurchaseBillId)
         ? Boolean(add_to_khata === true || add_to_khata === "true" || add_to_khata === 1)
         : 0;
 
@@ -379,8 +546,8 @@ const addPayment = asyncHandler(async (req, res) => {
       `INSERT INTO payments
         (payment_category, party_name, customer_id, purpose, amount,
          payment_mode, payment_date, product_id, product_name, quantity, unit_price,
-         purchase_bill_id, money_receipt_id, add_to_khata, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_DATE), ?, ?, ?, ?, ?, ?, ?, ?)`,
+         purchase_bill_id, money_receipt_id, add_to_khata, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_DATE), ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))`,
       [
         resolvedCategory,
         resolvedPartyName,
@@ -397,6 +564,7 @@ const addPayment = asyncHandler(async (req, res) => {
         linkedMoneyReceiptId,
         shouldAddToKhata ? 1 : 0,
         req.user.id,
+        linkedMoneyReceiptCreatedAt || null,
       ]
     );
 
@@ -458,10 +626,31 @@ const listPayments = asyncHandler(async (req, res) => {
     SELECT p.*,
            u.name AS added_by,
            cu.name AS customer_name,
-           cu.phone AS customer_phone
+           cu.phone AS customer_phone,
+           mr.receipt_number,
+           COALESCE(
+             mr.receipt_time,
+             TIME(mr.receipt_date),
+             ke.entry_time,
+             TIME(p.created_at)
+           ) AS time,
+           COALESCE(
+             mr.receipt_time,
+             TIME(mr.receipt_date),
+             ke.entry_time,
+             TIME(p.created_at)
+           ) AS payment_time,
+           COALESCE(
+             p.payment_date,
+             DATE(mr.receipt_date),
+             ke.entry_date,
+             DATE(p.created_at)
+           ) AS effective_date
     FROM payments p
     LEFT JOIN users u ON u.id = p.created_by
     LEFT JOIN customers cu ON cu.id = p.customer_id
+    LEFT JOIN money_receipts mr ON mr.id = p.money_receipt_id
+    LEFT JOIN khata_entries ke ON ke.id = p.khata_entry_id
     WHERE 1=1
   `;
   const params = [];
@@ -470,8 +659,17 @@ const listPayments = asyncHandler(async (req, res) => {
   params.push(req.user.id);
 
   if (category) {
-    sql += " AND p.payment_category = ?";
-    params.push(category);
+    const cat = String(category).trim().toLowerCase();
+    if (cat === "money_received" || cat === "amount_received") {
+      sql += " AND p.payment_category IN ('money_received', 'amount_received', 'due_received')";
+    } else if (cat === "advance_receivable" || cat === "advance_from_investor") {
+      sql += " AND p.payment_category IN ('advance_receivable', 'advance_from_investor')";
+    } else if (cat === "paid_out" || cat === "paid_by_business") {
+      sql += " AND p.payment_category IN ('paid_out', 'paid_by_business')";
+    } else {
+      sql += " AND p.payment_category = ?";
+      params.push(cat);
+    }
   }
 
   if (purpose) {
@@ -494,15 +692,217 @@ const listPayments = asyncHandler(async (req, res) => {
     params.push(to);
   }
 
-  sql += " ORDER BY p.payment_date DESC, p.created_at DESC";
+  sql += " ORDER BY COALESCE(p.payment_date, DATE(mr.receipt_date), ke.entry_date, DATE(p.created_at)) DESC, COALESCE(mr.receipt_time, TIME(mr.receipt_date), ke.entry_time, TIME(p.created_at), '00:00:00') DESC, p.id DESC";
 
   const [rows] = await pool.query(sql, params);
 
+  const normalizedRows = rows.map((p) => {
+    let cat = p.payment_category;
+    if (cat === "amount_received") cat = "money_received";
+    if (cat === "advance_from_investor") cat = "advance_receivable";
+    if (cat === "paid_by_business") cat = "paid_out";
+    const resolvedTime = p.time ? String(p.time).slice(0, 8) : (p.created_at ? new Date(p.created_at).toTimeString().slice(0, 8) : "00:00:00");
+    return {
+      ...p,
+      payment_category: cat,
+      category: cat,
+      time: resolvedTime,
+      payment_time: resolvedTime,
+    };
+  });
+
   res.json({
     success: true,
-    count: rows.length,
-    payments: rows,
+    count: normalizedRows.length,
+    payments: normalizedRows,
   });
+});
+
+// PUT /api/payments/:id
+const updatePayment = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const {
+    payment_category,
+    party_name,
+    customer_id,
+    purpose,
+    amount,
+    payment_mode,
+    payment_date,
+    product_id,
+    quantity,
+  } = req.body;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [existingRows] = await conn.query(
+      "SELECT * FROM payments WHERE id = ? AND created_by = ? FOR UPDATE",
+      [id, req.user.id]
+    );
+    if (!existingRows.length) {
+      throw new ApiError(404, "Payment not found.");
+    }
+
+    const payment = existingRows[0];
+    const newAmount = amount !== undefined && Number(amount) > 0 ? Number(amount) : Number(payment.amount);
+    const resolvedPurpose = purpose || payment.purpose;
+    const resolvedCategory = resolveCategory(resolvedPurpose, payment_category || payment.payment_category);
+    const resolvedMode = normalizePaymentMode(payment_mode || payment.payment_mode);
+    const finalDate = payment_date || payment.payment_date;
+
+    const amountDiff = newAmount - Number(payment.amount);
+    if (amountDiff !== 0 && payment.customer_id) {
+      const [allocRows] = await conn.query(
+        "SELECT * FROM customer_due_allocations WHERE payment_id = ?",
+        [payment.id]
+      );
+      if (allocRows.length) {
+        await conn.query(
+          "UPDATE customers SET total_due = GREATEST(0, total_due - ?) WHERE id = ? AND created_by = ?",
+          [amountDiff, payment.customer_id, req.user.id]
+        );
+      }
+    }
+
+    if (payment.khata_entry_id) {
+      await conn.query(
+        `UPDATE khata_entries
+         SET amount = ?, description = ?, entry_date = ?, payment_mode = ?
+         WHERE id = ? AND created_by = ?`,
+        [newAmount, resolvedPurpose, finalDate, resolvedMode, payment.khata_entry_id, req.user.id]
+      );
+    }
+
+    await conn.query(
+      `UPDATE payments
+       SET payment_category = ?, party_name = ?, customer_id = ?, purpose = ?,
+           amount = ?, payment_mode = ?, payment_date = ?, product_id = ?, quantity = ?
+       WHERE id = ? AND created_by = ?`,
+      [
+        resolvedCategory,
+        party_name !== undefined ? party_name : payment.party_name,
+        customer_id !== undefined ? customer_id : payment.customer_id,
+        resolvedPurpose,
+        newAmount,
+        resolvedMode,
+        finalDate,
+        product_id !== undefined ? product_id : payment.product_id,
+        quantity !== undefined ? quantity : payment.quantity,
+        id,
+        req.user.id,
+      ]
+    );
+
+    await conn.commit();
+
+    const [updatedRows] = await pool.query(
+      `SELECT p.*, cu.name AS customer_name, cu.phone AS customer_phone
+       FROM payments p
+       LEFT JOIN customers cu ON cu.id = p.customer_id
+       WHERE p.id = ? AND p.created_by = ?`,
+      [id, req.user.id]
+    );
+
+    res.json({
+      success: true,
+      message: "Payment updated successfully.",
+      payment: updatedRows[0],
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+// DELETE /api/payments/:id
+const deletePayment = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      "SELECT * FROM payments WHERE id = ? AND created_by = ? FOR UPDATE",
+      [id, req.user.id]
+    );
+    if (!rows.length) {
+      throw new ApiError(404, "Payment not found.");
+    }
+
+    const payment = rows[0];
+
+    // Revert due allocations
+    const [allocs] = await conn.query(
+      "SELECT * FROM customer_due_allocations WHERE payment_id = ?",
+      [payment.id]
+    );
+    let restoredDueAmount = 0;
+    for (const alloc of allocs) {
+      const [dueRows] = await conn.query(
+        "SELECT * FROM customer_dues WHERE id = ?",
+        [alloc.due_id]
+      );
+      if (dueRows.length) {
+        const d = dueRows[0];
+        const newRemaining = Math.min(Number(d.amount), Number(d.remaining_amount) + Number(alloc.amount));
+        const newStatus = newRemaining >= Number(d.amount) ? "pending" : "partially_paid";
+        await conn.query(
+          "UPDATE customer_dues SET remaining_amount = ?, status = ? WHERE id = ?",
+          [newRemaining, newStatus, d.id]
+        );
+      }
+      restoredDueAmount += Number(alloc.amount);
+    }
+
+    if (restoredDueAmount > 0 && payment.customer_id) {
+      await conn.query(
+        "UPDATE customers SET total_due = total_due + ? WHERE id = ? AND created_by = ?",
+        [restoredDueAmount, payment.customer_id, req.user.id]
+      );
+    }
+    await conn.query("DELETE FROM customer_due_allocations WHERE payment_id = ?", [payment.id]);
+
+    if (payment.khata_entry_id) {
+      await conn.query(
+        "DELETE FROM khata_entries WHERE id = ? AND created_by = ?",
+        [payment.khata_entry_id, req.user.id]
+      );
+    }
+
+    if (payment.purchase_bill_id) {
+      await conn.query(
+        "UPDATE purchase_bills SET is_paid = 0, payment_id = NULL WHERE id = ? AND created_by = ?",
+        [payment.purchase_bill_id, req.user.id]
+      );
+    }
+
+    if (payment.money_receipt_id) {
+      await conn.query(
+        "UPDATE money_receipts SET is_linked_to_payment = 0, payment_id = NULL WHERE id = ? AND created_by = ?",
+        [payment.money_receipt_id, req.user.id]
+      );
+    }
+
+    await conn.query("DELETE FROM payments WHERE id = ? AND created_by = ?", [id, req.user.id]);
+
+    await conn.commit();
+
+    res.json({
+      success: true,
+      message: "Payment deleted successfully.",
+      deleted_id: id,
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 });
 
 // GET /api/payments/dues?customer_id=...
@@ -618,14 +1018,15 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
       throw new ApiError(400, "Money receipt is already linked to a payment.");
     }
 
-    const category = mr.against_type === "advance" ? "advance_from_investor" : "amount_received";
-    const purpose = mr.against_type === "advance" ? "Investor Advance" : "Amount Received";
+    const category = mr.against_type === "advance" ? "advance_receivable" : "money_received";
+    const purpose = mr.against_type === "advance" ? "Advance Receivable" : "Money Received";
 
+    const receiptDateVal = mr.receipt_date ? String(mr.receipt_date).slice(0, 10) : null;
     const [result] = await conn.query(
       `INSERT INTO payments
         (payment_category, party_name, customer_id, purpose, amount,
-         payment_mode, payment_date, money_receipt_id, add_to_khata, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+         payment_mode, payment_date, money_receipt_id, add_to_khata, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_DATE), ?, 0, ?, COALESCE(?, CURRENT_TIMESTAMP))`,
       [
         category,
         mr.received_from_name || mr.customer_name || "Customer",
@@ -633,9 +1034,10 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
         purpose,
         Number(mr.amount_received || 0),
         normalizePaymentMode(payment_mode || mr.payment_mode),
-        mr.receipt_date,
+        receiptDateVal,
         mr.id,
         req.user.id,
+        mr.receipt_date || mr.created_at,
       ]
     );
 
@@ -722,11 +1124,6 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
 
     const pb = rows[0];
 
-    if (pb.is_paid === 1 || pb.payment_id) {
-      await conn.rollback();
-      throw new ApiError(400, "Purchase bill is already marked as paid.");
-    }
-
     const [items] = await conn.query(
       "SELECT * FROM purchase_bill_items WHERE purchase_bill_id = ?",
       [pb.id]
@@ -741,22 +1138,52 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
     }
     billTotal = Math.round(billTotal * 100) / 100;
 
-    const [result] = await conn.query(
-      `INSERT INTO payments
-        (payment_category, party_name, purpose, amount,
-         payment_mode, payment_date, purchase_bill_id, add_to_khata, created_by)
-       VALUES ('paid_by_business', ?, 'Purchase Bill', ?, ?, ?, ?, 0, ?)`,
-      [
-        pb.vendor_name || "Vendor",
-        billTotal,
-        normalizePaymentMode(payment_mode),
-        pb.bill_date,
-        pb.id,
-        req.user.id,
-      ]
+    const [existingPbPayments] = await conn.query(
+      "SELECT * FROM payments WHERE (purchase_bill_id = ? OR id = ?) AND created_by = ? ORDER BY id ASC",
+      [pb.id, pb.payment_id || 0, req.user.id]
     );
 
-    const paymentId = result.insertId;
+    let paymentId;
+    if (existingPbPayments.length > 0) {
+      const primaryPayment = existingPbPayments[0];
+      paymentId = primaryPayment.id;
+      await conn.query(
+        `UPDATE payments
+         SET amount = ?, payment_mode = ?, party_name = COALESCE(?, party_name),
+             payment_date = COALESCE(?, payment_date, CURRENT_DATE),
+             purchase_bill_id = ?
+         WHERE id = ? AND created_by = ?`,
+        [
+          billTotal,
+          normalizePaymentMode(payment_mode || primaryPayment.payment_mode),
+          pb.vendor_name || null,
+          pb.bill_date || null,
+          pb.id,
+          paymentId,
+          req.user.id,
+        ]
+      );
+      if (existingPbPayments.length > 1) {
+        const extraIds = existingPbPayments.slice(1).map((p) => p.id);
+        await conn.query("DELETE FROM payments WHERE id IN (?) AND created_by = ?", [extraIds, req.user.id]);
+      }
+    } else {
+      const [result] = await conn.query(
+        `INSERT INTO payments
+          (payment_category, party_name, purpose, amount,
+           payment_mode, payment_date, purchase_bill_id, add_to_khata, created_by)
+         VALUES ('paid_by_business', ?, 'Purchase Bill', ?, ?, ?, ?, 0, ?)`,
+        [
+          pb.vendor_name || "Vendor",
+          billTotal,
+          normalizePaymentMode(payment_mode),
+          pb.bill_date,
+          pb.id,
+          req.user.id,
+        ]
+      );
+      paymentId = result.insertId;
+    }
 
     await conn.query(
       "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
@@ -809,6 +1236,8 @@ const getUnlinkedKhataDebitsForPayment = asyncHandler(async (req, res) => {
 module.exports = {
   addPayment,
   listPayments,
+  updatePayment,
+  deletePayment,
   getCustomerOutstandingDues,
   addPaymentToKhata,
   getUnlinkedMoneyReceipts,

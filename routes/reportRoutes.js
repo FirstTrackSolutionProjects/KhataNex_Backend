@@ -1,15 +1,55 @@
 const router = require("express").Router();
-const { getProfitLoss, getMonthlyTrend } = require("../controllers/reportController");
+const {
+  getProfitLoss,
+  getMonthlyTrend,
+  getReportDrilldown,
+  getTotalSalesDrilldown,
+  getPurchasesDrilldown,
+  getExpensesDrilldown,
+  getTotalExpensesDrilldown,
+  getDebitEntriesDrilldown,
+  getBusinessPayOutDrilldown,
+  getOtherExpensesDrilldown,
+  getAdvanceReceivableDrilldown,
+  getAdvancePayableDrilldown,
+  getCashInHandDrilldown,
+  getCashInBankDrilldown,
+  getNetProfitDrilldown,
+} = require("../controllers/reportController");
 const { authenticate, authorize } = require("../middleware/auth");
 
-// A 'user' can see their OWN business's reports (the controller auto-scopes
-// to their own id — see reportController.js). employee/superadmin can see
-// any user's reports via ?user_id=, or all users combined if omitted.
 router.use(authenticate, authorize("user", "employee", "superadmin"));
 
+// Drill-down transaction routes for each report metric
+router.get("/drilldown/:metric", getReportDrilldown);
+router.get("/drilldown", getReportDrilldown);
+router.get("/total-sales", getTotalSalesDrilldown);
+router.get("/purchases", getPurchasesDrilldown);
+router.get("/expenses", getExpensesDrilldown);
+router.get("/total-expenses", getTotalExpensesDrilldown);
+router.get("/total-expense", getTotalExpensesDrilldown);
+router.get("/debit-entries", getDebitEntriesDrilldown);
+router.get("/debit-entry", getDebitEntriesDrilldown);
+router.get("/business-pay-out", getBusinessPayOutDrilldown);
+router.get("/business-payout", getBusinessPayOutDrilldown);
+router.get("/other-expenses", getOtherExpensesDrilldown);
+router.get("/other-expense", getOtherExpensesDrilldown);
+router.get("/advance-receivable", getAdvanceReceivableDrilldown);
+router.get("/advance-payable", getAdvancePayableDrilldown);
+router.get("/advances", (req, res, next) => {
+  req.params.metric = "advances";
+  return getReportDrilldown(req, res, next);
+});
+router.get("/cash-in-hand", getCashInHandDrilldown);
+router.get("/cash-in-bank", getCashInBankDrilldown);
+router.get("/net-profit", getNetProfitDrilldown);
+
+// Summary reports
 router.get("/profit-loss", getProfitLoss);
 router.get("/sales-vs-expenses", getProfitLoss);
 router.get("/monthly-trend", getMonthlyTrend);
+router.get("/graph", getMonthlyTrend);
+router.get("/sales-vs-expense-graph", getMonthlyTrend);
 router.get("/", getProfitLoss);
 
 module.exports = router;

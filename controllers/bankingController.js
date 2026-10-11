@@ -241,10 +241,49 @@ const deleteBanking = asyncHandler(async (req, res) => {
   });
 });
 
+// POST or PATCH /api/banking/:id/default
+const setDefaultBanking = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user?.id;
+
+  const [rows] = await pool.query(
+    "SELECT * FROM banking WHERE id = ? AND created_by = ?",
+    [id, userId]
+  );
+
+  if (!rows.length) {
+    throw new ApiError(404, "Banking record not found.");
+  }
+
+  // Clear all others
+  await pool.query(
+    "UPDATE banking SET is_default = 0 WHERE created_by = ?",
+    [userId]
+  );
+
+  // Set this account as default
+  await pool.query(
+    "UPDATE banking SET is_default = 1 WHERE id = ? AND created_by = ?",
+    [id, userId]
+  );
+
+  const [updated] = await pool.query(
+    "SELECT * FROM banking WHERE id = ? AND created_by = ?",
+    [id, userId]
+  );
+
+  res.json({
+    success: true,
+    message: "Default bank account set successfully.",
+    banking: updated[0],
+  });
+});
+
 module.exports = {
   createBanking,
   listBanking,
   getBanking,
   updateBanking,
   deleteBanking,
+  setDefaultBanking,
 };

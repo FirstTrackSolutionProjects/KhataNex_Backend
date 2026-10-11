@@ -45,13 +45,17 @@ const generateWaybillPdf = ({ trip, company }) => {
         .text(`Date: ${new Date().toLocaleString("en-IN")}`, 50, 175);
 
       const rows = [
-        ["Vehicle Number", trip.vehicle_number],
-        ["Driver Name", trip.driver_name],
-        ["Driver Phone", trip.driver_phone],
+        ["Vehicle Number", trip.vehicle_number || "-"],
+        ["Driver Name", trip.driver_name || "-"],
+        ["Driver Phone", trip.driver_phone || "-"],
         ["From", trip.from_location || "-"],
         ["To", trip.to_location || "-"],
         ["Goods Description", trip.goods_description || "-"],
       ];
+
+      if (trip.invoice_number || trip.invoice_id) {
+        rows.push(["Invoice Reference", trip.invoice_number || `#${trip.invoice_id}`]);
+      }
 
       let y = 210;
       rows.forEach(([label, value]) => {

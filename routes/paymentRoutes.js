@@ -2,6 +2,8 @@ const router = require("express").Router();
 const {
   addPayment,
   listPayments,
+  updatePayment,
+  deletePayment,
   getCustomerOutstandingDues,
   addPaymentToKhata,
   getUnlinkedMoneyReceipts,
@@ -25,6 +27,9 @@ router.post("/link-purchase-bill/:id", linkPurchaseBillToPayment);
 router.post("/link-purchase-bill", linkPurchaseBillToPayment);
 router.post("/link-khata/:id", linkKhataDebitToPayment);
 router.post("/:id/add-to-khata", addPaymentToKhata);
+router.put("/:id", updatePayment);
+router.patch("/:id", updatePayment);
+router.delete("/:id", deletePayment);
 router.post("/", addPayment);
 router.get("/", listPayments);
 
