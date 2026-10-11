@@ -140,18 +140,78 @@ const MIGRATION_SCHEMA_CHECKS = {
     return r.length > 0;
   },
   "migration_016_system_updates.sql": async (conn, db) => {
-    const [r] = await conn.query(
-      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'users' AND COLUMN_NAME = 'watermark_enabled'",
+    const required = [
+      ["users", "watermark_enabled"],
+      ["company_settings", "watermark_enabled"],
+      ["stock", "item_type"],
+      ["vehicle_trips", "invoice_id"],
+      ["khata_entries", "payment_mode"],
+      ["payments", "payment_category"],
+    ];
+
+    const conditions = required
+      .map(() => "(TABLE_NAME = ? AND COLUMN_NAME = ?)")
+      .join(" OR ");
+
+    const params = [db];
+    for (const [table, column] of required) {
+      params.push(table, column);
+    }
+
+    const [columns] = await conn.query(
+      "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS " +
+      "WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND (" +
+      conditions + ")",
+      params
+    );
+
+    if (columns.length !== required.length) return false;
+
+    const [paymentCategory] = await conn.query(
+      "SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS " +
+      "WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) " +
+      "AND TABLE_NAME = 'payments' AND COLUMN_NAME = 'payment_category'",
       [db]
     );
-    return r.length > 0;
+
+    return paymentCategory.length === 1 &&
+      paymentCategory[0].COLUMN_DEFAULT === "money_received";
   },
   "migration_017_khata_receipts_trips_updates.sql": async (conn, db) => {
-    const [r] = await conn.query(
-      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'money_receipts' AND COLUMN_NAME = 'transfer_type'",
-      [db]
+    const required = [
+      ["khata_entries", "items"],
+      ["khata_entries", "entry_time"],
+      ["customer_dues", "items"],
+      ["customer_dues", "due_time"],
+      ["customer_dues", "payment_mode"],
+      ["money_receipts", "transfer_type"],
+      ["money_receipts", "receipt_time"],
+      ["vehicle_trips", "trip_datetime"],
+      ["vehicle_trips", "departure_time"],
+      ["vehicle_trips", "reach_time"],
+      ["vehicle_trips", "eway_bill_number"],
+      ["vehicle_trips", "eway_bill_file"],
+      ["vehicle_trips", "vehicle_photo"],
+      ["vehicle_trips", "trip_photo"],
+    ];
+
+    const conditions = required
+      .map(() => "(TABLE_NAME = ? AND COLUMN_NAME = ?)")
+      .join(" OR ");
+
+    const params = [db];
+    for (const [table, column] of required) {
+      params.push(table, column);
+    }
+
+    const [columns] = await conn.query(
+      "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS " +
+      "WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND (" +
+      conditions + ")",
+      params
     );
-    return r.length > 0;
+
+    return columns.length === required.length;
   },
 };
 
