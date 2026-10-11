@@ -152,14 +152,21 @@ const listUsers = asyncHandler(async (req, res) => {
        ) AS net_credit,
 
        COALESCE((
-         SELECT SUM(sub.amount)
-         FROM (
-           SELECT MAX(p.amount) AS amount
+         SELECT SUM(p.amount)
            FROM payments p
            WHERE p.created_by = u.id
              AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
-           GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
-         ) sub
+             AND NOT EXISTS (
+               SELECT 1
+               FROM payments p2
+               WHERE p2.created_by = p.created_by
+                 AND (p2.payment_category IN ('paid_by_business', 'purchase_bill') OR p2.purpose = 'Purchase Bill' OR p2.purchase_bill_id IS NOT NULL)
+                 AND COALESCE(NULLIF(p2.purchase_bill_id, 0), p2.id) = COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+                 AND (
+                   p2.amount > p.amount
+                   OR (p2.amount = p.amount AND p2.id < p.id)
+                 )
+             )
        ), 0) AS debit,
 
        (
@@ -200,14 +207,21 @@ const listUsers = asyncHandler(async (req, res) => {
          ), 0)
          +
          COALESCE((
-           SELECT SUM(sub.amount)
-           FROM (
-             SELECT MAX(p.amount) AS amount
-             FROM payments p
-             WHERE p.created_by = u.id
-               AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
-             GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
-           ) sub
+           SELECT SUM(p.amount)
+           FROM payments p
+           WHERE p.created_by = u.id
+             AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+             AND NOT EXISTS (
+               SELECT 1
+               FROM payments p2
+               WHERE p2.created_by = p.created_by
+                 AND (p2.payment_category IN ('paid_by_business', 'purchase_bill') OR p2.purpose = 'Purchase Bill' OR p2.purchase_bill_id IS NOT NULL)
+                 AND COALESCE(NULLIF(p2.purchase_bill_id, 0), p2.id) = COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+                 AND (
+                   p2.amount > p.amount
+                   OR (p2.amount = p.amount AND p2.id < p.id)
+                 )
+             )
          ), 0)
          +
          COALESCE((
@@ -256,14 +270,21 @@ const listUsers = asyncHandler(async (req, res) => {
            ), 0)
            +
            COALESCE((
-             SELECT SUM(sub.amount)
-             FROM (
-               SELECT MAX(p.amount) AS amount
-               FROM payments p
-               WHERE p.created_by = u.id
-                 AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
-               GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
-             ) sub
+             SELECT SUM(p.amount)
+           FROM payments p
+           WHERE p.created_by = u.id
+             AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+             AND NOT EXISTS (
+               SELECT 1
+               FROM payments p2
+               WHERE p2.created_by = p.created_by
+                 AND (p2.payment_category IN ('paid_by_business', 'purchase_bill') OR p2.purpose = 'Purchase Bill' OR p2.purchase_bill_id IS NOT NULL)
+                 AND COALESCE(NULLIF(p2.purchase_bill_id, 0), p2.id) = COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+                 AND (
+                   p2.amount > p.amount
+                   OR (p2.amount = p.amount AND p2.id < p.id)
+                 )
+             )
            ), 0)
            +
            COALESCE((
@@ -300,14 +321,21 @@ const listUsers = asyncHandler(async (req, res) => {
            ), 0)
            +
            COALESCE((
-             SELECT SUM(sub.amount)
-             FROM (
-               SELECT MAX(p.amount) AS amount
-               FROM payments p
-               WHERE p.created_by = u.id
-                 AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
-               GROUP BY COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
-             ) sub
+             SELECT SUM(p.amount)
+           FROM payments p
+           WHERE p.created_by = u.id
+             AND (p.payment_category IN ('paid_by_business', 'purchase_bill') OR p.purpose = 'Purchase Bill' OR p.purchase_bill_id IS NOT NULL)
+             AND NOT EXISTS (
+               SELECT 1
+               FROM payments p2
+               WHERE p2.created_by = p.created_by
+                 AND (p2.payment_category IN ('paid_by_business', 'purchase_bill') OR p2.purpose = 'Purchase Bill' OR p2.purchase_bill_id IS NOT NULL)
+                 AND COALESCE(NULLIF(p2.purchase_bill_id, 0), p2.id) = COALESCE(NULLIF(p.purchase_bill_id, 0), p.id)
+                 AND (
+                   p2.amount > p.amount
+                   OR (p2.amount = p.amount AND p2.id < p.id)
+                 )
+             )
            ), 0)
            +
            COALESCE((
