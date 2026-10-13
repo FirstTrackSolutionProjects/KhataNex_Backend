@@ -13,6 +13,8 @@ const {
   getMySubscription,
   downloadInvoice,
   resendInvoice,
+  cancelOrder,
+  failOrder,
 } = require("../controllers/subscriptionController");
 
 // Rate limiters for financial endpoints
@@ -61,6 +63,8 @@ router.get("/plans", optionalAuthenticate, listPlans);
 router.post("/price", authenticate, priceLimiter, previewPrice);
 router.post("/orders", authenticate, orderLimiter, createOrder);
 router.post("/orders/:id/verify", authenticate, verifyOrderPayment);
+router.post("/orders/:id/cancel", authenticate, cancelOrder);
+router.post("/orders/:id/fail", authenticate, failOrder);
 router.get("/orders/:id", authenticate, getOrder);
 router.get("/me", authenticate, getMySubscription);
 router.get("/orders/:id/invoice", authenticate, downloadInvoice);

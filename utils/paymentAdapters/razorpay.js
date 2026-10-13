@@ -21,7 +21,7 @@ class RazorpayAdapter {
    */
   async createOrder({ orderId, amountPaise, currency = "INR", receipt, notes = {} }) {
     if (!this.isConfigured()) {
-      throw new ApiError(500, "Razorpay API keys (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET) are not configured.");
+      throw new ApiError(503, "Razorpay API credentials (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET) are not configured.");
     }
 
     const payload = {
@@ -74,7 +74,14 @@ class RazorpayAdapter {
       .update(payload)
       .digest("hex");
 
-    return crypto.timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(signature, "utf8"));
+    const expectedBuf = Buffer.from(expected, "utf8");
+    const sigBuf = Buffer.from(signature, "utf8");
+
+    if (expectedBuf.length !== sigBuf.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(expectedBuf, sigBuf);
   }
 
   /**
@@ -90,9 +97,15 @@ class RazorpayAdapter {
       .update(rawBody)
       .digest("hex");
 
-    return crypto.timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(signature, "utf8"));
+    const expectedBuf = Buffer.from(expected, "utf8");
+    const sigBuf = Buffer.from(signature, "utf8");
+
+    if (expectedBuf.length !== sigBuf.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(expectedBuf, sigBuf);
   }
 }
 
 module.exports = new RazorpayAdapter();
-

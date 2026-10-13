@@ -9,15 +9,66 @@ const normalizeCode = (val) =>
     .toUpperCase()
     .replace(/[^A-Z0-9_-]/g, "");
 
+// Settings cache (30 seconds TTL)
+let cachedSettings = null;
+let settingsCacheExpiry = 0;
+
+async function getSubscriptionSettings() {
+  const now = Date.now();
+  if (cachedSettings && now < settingsCacheExpiry) {
+    return cachedSettings;
+  }
+
+  try {
+    const [rows] = await pool.query("SELECT * FROM subscription_settings WHERE id = 1");
+    if (rows && rows.length > 0) {
+      cachedSettings = {
+        intro_offers_enabled: Boolean(rows[0].intro_offers_enabled),
+        tax_percent: Number(rows[0].tax_percent || 0),
+        tax_inclusive: Boolean(rows[0].tax_inclusive === 1 || rows[0].tax_inclusive === true),
+        subscription_enforcement: String(rows[0].subscription_enforcement || "off").toLowerCase(),
+        reminders_enabled: Boolean(rows[0].reminders_enabled),
+        reminder_days: String(rows[0].reminder_days || "7,3,1"),
+      };
+      settingsCacheExpiry = now + 30000;
+      return cachedSettings;
+    }
+  } catch (err) {
+    // If settings table not yet created or DB error, fall back to environment defaults
+  }
+
+  cachedSettings = {
+    intro_offers_enabled: true,
+    tax_percent: TAX_PERCENT,
+    tax_inclusive: true,
+    subscription_enforcement: process.env.SUBSCRIPTION_ENFORCEMENT === "on" ? "on" : "off",
+    reminders_enabled: true,
+    reminder_days: "7,3,1",
+  };
+  settingsCacheExpiry = now + 10000;
+  return cachedSettings;
+}
+
+function invalidateSettingsCache() {
+  cachedSettings = null;
+  settingsCacheExpiry = 0;
+}
+
 /**
  * Checks whether a user is eligible for the one-time introductory pricing.
  * Enforced strictly on backend:
- * 1. Checks users.has_used_intro_offer flag
- * 2. Checks if user has any successful order with is_introductory = 1
- * 3. Checks if user has any active/previous non-complimentary subscriptions
+ * 1. Checks global settings.intro_offers_enabled
+ * 2. Checks users.has_used_intro_offer flag
+ * 3. Checks if user has any successful order with is_introductory = 1
+ * 4. Checks if user has any active/previous non-complimentary subscriptions
  */
 async function isEligibleForIntroductoryOffer(userId) {
   if (!userId) return false;
+
+  const settings = await getSubscriptionSettings();
+  if (!settings.intro_offers_enabled) {
+    return false;
+  }
 
   const [users] = await pool.query(
     "SELECT has_used_intro_offer FROM users WHERE id = ?",
@@ -118,8 +169,14 @@ async function evaluateCoupon(couponCode, plan, basePaise, userId) {
 
 /**
  * Calculates complete pricing breakdown for an order.
+ * Ensures advertised amounts are final customer checkout totals (tax-inclusive).
+ * Taxable value and included tax reconcile exactly: taxablePaise + taxPaise === totalPaise.
  */
 async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) {
+  const settings = await getSubscriptionSettings();
+  const taxPercent = Number(settings.tax_percent !== undefined ? settings.tax_percent : TAX_PERCENT);
+  const taxInclusive = Boolean(settings.tax_inclusive !== undefined ? settings.tax_inclusive : 1);
+
   const listPricePaise = plan.price_paise;
   let isIntroductory = false;
   let basePaise = listPricePaise;
@@ -141,9 +198,29 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) 
   }
 
   const discountPaise = introductoryDiscountPaise + couponDiscountPaise;
-  const taxablePaise = Math.max(0, basePaise - couponDiscountPaise);
-  const taxPaise = Math.round((taxablePaise * TAX_PERCENT) / 100);
-  const totalPaise = taxablePaise + taxPaise;
+  const effectiveCheckoutPaise = Math.max(0, basePaise - couponDiscountPaise);
+
+  let taxablePaise = 0;
+  let taxPaise = 0;
+  let totalPaise = 0;
+
+  if (taxInclusive) {
+    // Final customer-facing checkout total equals effectiveCheckoutPaise
+    totalPaise = effectiveCheckoutPaise;
+    if (taxPercent > 0) {
+      // Reverse calculate included GST: Taxable = Total / (1 + Rate/100)
+      taxablePaise = Math.round(effectiveCheckoutPaise / (1 + taxPercent / 100));
+      taxPaise = effectiveCheckoutPaise - taxablePaise;
+    } else {
+      taxablePaise = effectiveCheckoutPaise;
+      taxPaise = 0;
+    }
+  } else {
+    // Exclusive tax calculation
+    taxablePaise = effectiveCheckoutPaise;
+    taxPaise = Math.round((taxablePaise * taxPercent) / 100);
+    totalPaise = taxablePaise + taxPaise;
+  }
 
   return {
     listPricePaise,
@@ -154,7 +231,8 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) 
     couponDiscountPaise,
     discountPaise,
     taxablePaise,
-    taxPercent: TAX_PERCENT,
+    taxPercent,
+    taxInclusive,
     taxPaise,
     totalPaise,
   };
@@ -163,6 +241,7 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) 
 /**
  * Fulfills an order idempotently inside a database transaction:
  * - Locks order row
+ * - Checks introductory offer concurrency
  * - Updates coupon redemption status to 'redeemed'
  * - Serializes user renewals
  * - Calculates calendar duration with early renewal preservation
@@ -189,8 +268,26 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
       return { alreadyPaid: true, order };
     }
 
-    // Serialise per user to prevent concurrent race condition renewals
-    await conn.query("SELECT id FROM users WHERE id = ? FOR UPDATE", [order.user_id]);
+    // Serialise per user to prevent concurrent race conditions
+    const [userRows] = await conn.query(
+      "SELECT id, has_used_intro_offer FROM users WHERE id = ? FOR UPDATE",
+      [order.user_id]
+    );
+    const currentUser = userRows[0];
+
+    // Concurrency defense: If this order claims an introductory price, verify user hasn't
+    // already consumed the offer via a parallel fulfilled checkout
+    if (order.is_introductory && currentUser?.has_used_intro_offer) {
+      // Check if this user had another paid intro order
+      const [otherPaid] = await conn.query(
+        "SELECT id FROM subscription_orders WHERE user_id = ? AND status = 'paid' AND is_introductory = 1 AND id != ?",
+        [order.user_id, order.id]
+      );
+      if (otherPaid.length > 0) {
+        await conn.rollback();
+        throw new ApiError(400, "Introductory offer has already been consumed by your account.");
+      }
+    }
 
     const [plans] = await conn.query(
       "SELECT duration_months FROM subscription_plans WHERE id = ?",
@@ -256,9 +353,10 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
 module.exports = {
   TAX_PERCENT,
   normalizeCode,
+  getSubscriptionSettings,
+  invalidateSettingsCache,
   isEligibleForIntroductoryOffer,
   evaluateCoupon,
   priceOrder,
   fulfillOrder,
 };
-

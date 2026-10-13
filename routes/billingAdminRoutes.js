@@ -13,6 +13,10 @@ const {
   listAdminOrders,
   getUserBillingDetails,
   grantSubscription,
+  getSettings,
+  updateSettings,
+  revokeUserSubscription,
+  resetIntroOffer,
 } = require("../controllers/billingAdminController");
 
 // Restrict entire route to superadmin
@@ -20,6 +24,9 @@ router.use(authenticate, authorize("superadmin"));
 
 router.get("/overview", getBillingOverview);
 router.get("/expiry-cohorts", getExpiryCohorts);
+
+router.get("/settings", getSettings);
+router.patch("/settings", updateSettings);
 
 router.get("/plans", listAdminPlans);
 router.post("/plans", createPlan);
@@ -32,6 +39,8 @@ router.put("/coupons/:id", updateCoupon);
 router.get("/orders", listAdminOrders);
 router.get("/users/:id", getUserBillingDetails);
 router.post("/grant", grantSubscription);
+router.post("/users/:id/revoke", revokeUserSubscription);
+router.post("/users/:id/reset-intro", resetIntroOffer);
 
 module.exports = router;
 

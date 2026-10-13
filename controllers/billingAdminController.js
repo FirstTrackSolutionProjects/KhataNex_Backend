@@ -1,7 +1,13 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
-const { normalizeCode, fulfillOrder } = require("../utils/subscriptionLogic");
+const gateway = require("../utils/paymentGateway");
+const {
+  normalizeCode,
+  fulfillOrder,
+  getSubscriptionSettings,
+  invalidateSettingsCache,
+} = require("../utils/subscriptionLogic");
 
 /**
  * GET /api/superadmin/billing/overview
@@ -45,11 +51,11 @@ const getBillingOverview = asyncHandler(async (req, res) => {
     }
   });
 
-  // 2. Collected revenue from paid orders (excluding zero-value and manual complimentary grants)
+  // 2. Collected revenue from paid orders (excluding zero-value, mock dev orders, and manual complimentary grants)
   const [revRows] = await pool.query(
     `SELECT COALESCE(SUM(total_paise), 0) AS total_revenue_paise, COUNT(*) AS paid_order_count
      FROM subscription_orders
-     WHERE status = 'paid' AND provider != 'manual' AND total_paise > 0`
+     WHERE status = 'paid' AND provider != 'manual' AND provider != 'mock' AND total_paise > 0`
   );
   const collectedRevenuePaise = Number(revRows[0]?.total_revenue_paise || 0);
 
@@ -153,57 +159,101 @@ const listAdminPlans = asyncHandler(async (req, res) => {
 });
 
 const createPlan = asyncHandler(async (req, res) => {
-  const { code, name, duration_months, price_paise, introductory_price_paise, is_active } = req.body;
+  const { code, name, description, duration_months, price_paise, introductory_price_paise, is_active } = req.body;
   const cleanCode = normalizeCode(code).toLowerCase();
 
   if (!cleanCode || !name || !duration_months || price_paise === undefined) {
     throw new ApiError(400, "code, name, duration_months, and price_paise are required.");
   }
 
+  const pPaise = Number(price_paise);
+  const introPaise = introductory_price_paise !== undefined ? Number(introductory_price_paise) : pPaise;
+  const dMonths = Number(duration_months);
+
+  if (pPaise < 0 || introPaise < 0 || dMonths < 1) {
+    throw new ApiError(400, "Invalid plan pricing or duration values.");
+  }
+  if (introPaise > pPaise) {
+    throw new ApiError(400, "Introductory price cannot exceed regular plan price.");
+  }
+
   const [resInsert] = await pool.query(
     `INSERT INTO subscription_plans 
-       (code, name, duration_months, price_paise, introductory_price_paise, is_active)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (code, name, description, duration_months, price_paise, introductory_price_paise, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanCode,
       name,
-      Number(duration_months),
-      Number(price_paise),
-      Number(introductory_price_paise || price_paise),
+      description || null,
+      dMonths,
+      pPaise,
+      introPaise,
       is_active !== undefined ? (is_active ? 1 : 0) : 1,
     ]
   );
 
   const [newPlan] = await pool.query("SELECT * FROM subscription_plans WHERE id = ?", [resInsert.insertId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'create_plan', NULL, ?)`,
+      [req.user.id, JSON.stringify(newPlan[0])]
+    );
+  } catch (_) {}
+
   res.status(201).json({ success: true, plan: newPlan[0] });
 });
 
 const updatePlan = asyncHandler(async (req, res) => {
   const planId = Number(req.params.id);
-  const { name, duration_months, price_paise, introductory_price_paise, is_active } = req.body;
+  const { name, description, duration_months, price_paise, introductory_price_paise, is_active } = req.body;
 
   const [existing] = await pool.query("SELECT * FROM subscription_plans WHERE id = ?", [planId]);
   if (!existing.length) throw new ApiError(404, "Plan not found.");
 
+  const current = existing[0];
+  const newPrice = price_paise !== undefined ? Number(price_paise) : current.price_paise;
+  const newIntro = introductory_price_paise !== undefined ? Number(introductory_price_paise) : current.introductory_price_paise;
+  const newMonths = duration_months !== undefined ? Number(duration_months) : current.duration_months;
+
+  if (newPrice < 0 || newIntro < 0 || newMonths < 1) {
+    throw new ApiError(400, "Invalid plan pricing or duration values.");
+  }
+  if (newIntro > newPrice) {
+    throw new ApiError(400, "Introductory price cannot exceed regular plan price.");
+  }
+
   await pool.query(
     `UPDATE subscription_plans 
      SET name = COALESCE(?, name),
-         duration_months = COALESCE(?, duration_months),
-         price_paise = COALESCE(?, price_paise),
-         introductory_price_paise = COALESCE(?, introductory_price_paise),
+         description = ?,
+         duration_months = ?,
+         price_paise = ?,
+         introductory_price_paise = ?,
          is_active = COALESCE(?, is_active)
      WHERE id = ?`,
     [
-      name,
-      duration_months ? Number(duration_months) : null,
-      price_paise !== undefined ? Number(price_paise) : null,
-      introductory_price_paise !== undefined ? Number(introductory_price_paise) : null,
+      name || null,
+      description !== undefined ? description : current.description,
+      newMonths,
+      newPrice,
+      newIntro,
       is_active !== undefined ? (is_active ? 1 : 0) : null,
       planId,
     ]
   );
 
   const [updated] = await pool.query("SELECT * FROM subscription_plans WHERE id = ?", [planId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'update_plan', ?, ?)`,
+      [req.user.id, JSON.stringify(current), JSON.stringify(updated[0])]
+    );
+  } catch (_) {}
+
   res.json({ success: true, plan: updated[0] });
 });
 
@@ -272,6 +322,15 @@ const createCoupon = asyncHandler(async (req, res) => {
   );
 
   const [created] = await pool.query("SELECT * FROM coupons WHERE id = ?", [ins.insertId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'create_coupon', NULL, ?)`,
+      [req.user.id, JSON.stringify(created[0])]
+    );
+  } catch (_) {}
+
   res.status(201).json({ success: true, coupon: created[0] });
 });
 
@@ -325,6 +384,15 @@ const updateCoupon = asyncHandler(async (req, res) => {
   );
 
   const [updated] = await pool.query("SELECT * FROM coupons WHERE id = ?", [couponId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'update_coupon', ?, ?)`,
+      [req.user.id, JSON.stringify(existing[0]), JSON.stringify(updated[0])]
+    );
+  } catch (_) {}
+
   res.json({ success: true, coupon: updated[0] });
 });
 
@@ -478,10 +546,203 @@ const grantSubscription = asyncHandler(async (req, res) => {
     [orderId]
   );
 
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'grant_subscription', NULL, ?)`,
+      [req.user.id, JSON.stringify({ user_id, plan_code, notes, orderId })]
+    );
+  } catch (_) {}
+
   res.status(201).json({
     success: true,
     message: `Complimentary subscription granted for ${users[0].name}.`,
     subscription: subs[0],
+  });
+});
+
+/**
+ * GET /api/superadmin/billing/settings
+ * Superadmin controls for global subscription configuration, tax, enforcement, and gateway status
+ */
+const getSettings = asyncHandler(async (req, res) => {
+  const settings = await getSubscriptionSettings();
+  const gatewayStatus = gateway.getStatus();
+
+  let auditHistory = [];
+  try {
+    const [rows] = await pool.query(
+      `SELECT a.*, u.name AS superadmin_name, u.email AS superadmin_email
+       FROM subscription_settings_audit a
+       LEFT JOIN users u ON a.superadmin_id = u.id
+       ORDER BY a.created_at DESC LIMIT 50`
+    );
+    auditHistory = rows;
+  } catch (_) {}
+
+  res.json({
+    success: true,
+    settings,
+    paymentGateway: gatewayStatus,
+    auditHistory,
+  });
+});
+
+/**
+ * PATCH /api/superadmin/billing/settings
+ * Updates global subscription configuration with strict validations and audit logging
+ */
+const updateSettings = asyncHandler(async (req, res) => {
+  const {
+    intro_offers_enabled,
+    tax_percent,
+    tax_inclusive,
+    subscription_enforcement,
+    reminders_enabled,
+    reminder_days,
+    confirm_enforcement,
+  } = req.body;
+
+  let existing = {};
+  try {
+    const [existingRows] = await pool.query("SELECT * FROM subscription_settings WHERE id = 1");
+    existing = existingRows[0] || {};
+  } catch (_) {}
+
+  // Validate tax_percent
+  let cleanTaxPercent = existing.tax_percent !== undefined ? existing.tax_percent : 0.00;
+  if (tax_percent !== undefined) {
+    const numTax = Number(tax_percent);
+    if (Number.isNaN(numTax) || numTax < 0 || numTax > 50) {
+      throw new ApiError(400, "tax_percent must be a valid number between 0 and 50.");
+    }
+    cleanTaxPercent = numTax;
+  }
+
+  // Validate subscription_enforcement
+  let cleanEnforcement = existing.subscription_enforcement || "off";
+  if (subscription_enforcement !== undefined) {
+    const enf = String(subscription_enforcement).toLowerCase().trim();
+    if (!["off", "on"].includes(enf)) {
+      throw new ApiError(400, "subscription_enforcement must be either 'off' or 'on'.");
+    }
+    // Safety check: Activating enforcement restricts unsubscribed users; require explicit confirmation
+    if (enf === "on" && cleanEnforcement !== "on" && !confirm_enforcement) {
+      throw new ApiError(400, "Activating subscription enforcement will restrict write access for unsubscribed users. Please confirm by providing confirm_enforcement: true.");
+    }
+    cleanEnforcement = enf;
+  }
+
+  // Validate reminder_days
+  let cleanReminderDays = existing.reminder_days || "7,3,1";
+  if (reminder_days !== undefined) {
+    const daysArr = String(reminder_days).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!daysArr.length || daysArr.some((d) => Number.isNaN(Number(d)) || Number(d) <= 0)) {
+      throw new ApiError(400, "reminder_days must be comma-separated positive integers (e.g. '7,3,1').");
+    }
+    cleanReminderDays = daysArr.join(",");
+  }
+
+  const newIntroEnabled = intro_offers_enabled !== undefined ? (intro_offers_enabled ? 1 : 0) : (existing.intro_offers_enabled !== undefined ? existing.intro_offers_enabled : 1);
+  const newTaxInclusive = tax_inclusive !== undefined ? (tax_inclusive ? 1 : 0) : (existing.tax_inclusive !== undefined ? existing.tax_inclusive : 1);
+  const newRemindersEnabled = reminders_enabled !== undefined ? (reminders_enabled ? 1 : 0) : (existing.reminders_enabled !== undefined ? existing.reminders_enabled : 1);
+
+  await pool.query(
+    `UPDATE subscription_settings
+     SET intro_offers_enabled = ?,
+         tax_percent = ?,
+         tax_inclusive = ?,
+         subscription_enforcement = ?,
+         reminders_enabled = ?,
+         reminder_days = ?,
+         updated_by = ?
+     WHERE id = 1`,
+    [
+      newIntroEnabled,
+      cleanTaxPercent,
+      newTaxInclusive,
+      cleanEnforcement,
+      newRemindersEnabled,
+      cleanReminderDays,
+      req.user.id,
+    ]
+  );
+
+  invalidateSettingsCache();
+  const updatedSettings = await getSubscriptionSettings();
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'update_settings', ?, ?)`,
+      [req.user.id, JSON.stringify(existing), JSON.stringify(updatedSettings)]
+    );
+  } catch (_) {}
+
+  res.json({
+    success: true,
+    message: "Subscription configuration updated successfully.",
+    settings: updatedSettings,
+  });
+});
+
+/**
+ * POST /api/superadmin/billing/users/:id/revoke
+ * Revokes an active subscription term for a user
+ */
+const revokeUserSubscription = asyncHandler(async (req, res) => {
+  const userId = Number(req.params.id);
+  const { reason = "Superadmin cancelled subscription" } = req.body;
+
+  const [activeSubs] = await pool.query(
+    "SELECT * FROM subscriptions WHERE user_id = ? AND ends_at > NOW()",
+    [userId]
+  );
+  if (!activeSubs.length) {
+    throw new ApiError(404, "No active subscription found for this user.");
+  }
+
+  await pool.query(
+    "UPDATE subscriptions SET ends_at = NOW(), status = 'cancelled' WHERE user_id = ? AND ends_at > NOW()",
+    [userId]
+  );
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'revoke_subscription', ?, ?)`,
+      [req.user.id, JSON.stringify(activeSubs), JSON.stringify({ userId, reason, revoked_at: new Date() })]
+    );
+  } catch (_) {}
+
+  res.json({
+    success: true,
+    message: `Active subscription revoked for user #${userId}.`,
+  });
+});
+
+/**
+ * POST /api/superadmin/billing/users/:id/reset-intro
+ * Resets a user's one-time introductory offer eligibility
+ */
+const resetIntroOffer = asyncHandler(async (req, res) => {
+  const userId = Number(req.params.id);
+  const [users] = await pool.query("SELECT id, name, has_used_intro_offer FROM users WHERE id = ?", [userId]);
+  if (!users.length) throw new ApiError(404, "User not found.");
+
+  await pool.query("UPDATE users SET has_used_intro_offer = 0 WHERE id = ?", [userId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'reset_intro_offer', ?, ?)`,
+      [req.user.id, JSON.stringify({ userId, previous_has_used: users[0].has_used_intro_offer }), JSON.stringify({ userId, has_used_intro_offer: 0 })]
+    );
+  } catch (_) {}
+
+  res.json({
+    success: true,
+    message: `One-time introductory offer eligibility reset for ${users[0].name}.`,
   });
 });
 
@@ -497,4 +758,8 @@ module.exports = {
   listAdminOrders,
   getUserBillingDetails,
   grantSubscription,
+  getSettings,
+  updateSettings,
+  revokeUserSubscription,
+  resetIntroOffer,
 };

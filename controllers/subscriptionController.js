@@ -5,6 +5,7 @@ const ApiError = require("../utils/ApiError");
 const gateway = require("../utils/paymentGateway");
 const {
   TAX_PERCENT,
+  getSubscriptionSettings,
   isEligibleForIntroductoryOffer,
   priceOrder,
   fulfillOrder,
@@ -20,12 +21,13 @@ const {
  * Returns active plans, regular & intro pricing, and current user eligibility
  */
 const listPlans = asyncHandler(async (req, res) => {
+  const settings = await getSubscriptionSettings();
   const [plans] = await pool.query(
-    "SELECT id, code, name, duration_months, price_paise, introductory_price_paise, is_active FROM subscription_plans WHERE is_active = 1 ORDER BY duration_months ASC"
+    "SELECT id, code, name, duration_months, price_paise, introductory_price_paise, description, is_active FROM subscription_plans WHERE is_active = 1 ORDER BY duration_months ASC"
   );
 
   let isIntroductoryEligible = false;
-  if (req.user) {
+  if (req.user && settings.intro_offers_enabled) {
     isIntroductoryEligible = await isEligibleForIntroductoryOffer(req.user.id);
   }
 
@@ -43,7 +45,8 @@ const listPlans = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     isIntroductoryEligible,
-    taxPercent: TAX_PERCENT,
+    taxPercent: settings.tax_percent,
+    taxInclusive: settings.tax_inclusive,
     plans: enrichedPlans,
   });
 });
@@ -403,6 +406,71 @@ const resendInvoice = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * POST /api/subscriptions/orders/:id/cancel
+ * Cancels a pending order and releases any reserved coupon.
+ * Does not consume introductory eligibility.
+ */
+const cancelOrder = asyncHandler(async (req, res) => {
+  const orderId = Number(req.params.id);
+  const [orders] = await pool.query(
+    "SELECT * FROM subscription_orders WHERE id = ? AND user_id = ?",
+    [orderId, req.user.id]
+  );
+  if (!orders.length) throw new ApiError(404, "Order not found.");
+  const order = orders[0];
+
+  if (order.status === "paid") {
+    throw new ApiError(400, "Paid orders cannot be cancelled.");
+  }
+
+  await pool.query("UPDATE subscription_orders SET status = 'cancelled' WHERE id = ?", [orderId]);
+  if (order.coupon_id) {
+    await pool.query(
+      "UPDATE coupon_redemptions SET status = 'released' WHERE order_id = ?",
+      [orderId]
+    );
+  }
+
+  res.json({
+    success: true,
+    message: "Order cancelled successfully. Introductory offer remains intact.",
+  });
+});
+
+/**
+ * POST /api/subscriptions/orders/:id/fail
+ * Marks order as failed and releases any reserved coupon.
+ * Does not consume introductory eligibility.
+ */
+const failOrder = asyncHandler(async (req, res) => {
+  const orderId = Number(req.params.id);
+  const { reason = "Payment failed" } = req.body;
+  const [orders] = await pool.query(
+    "SELECT * FROM subscription_orders WHERE id = ? AND user_id = ?",
+    [orderId, req.user.id]
+  );
+  if (!orders.length) throw new ApiError(404, "Order not found.");
+  const order = orders[0];
+
+  if (order.status === "paid") {
+    throw new ApiError(400, "Paid orders cannot be marked as failed.");
+  }
+
+  await pool.query("UPDATE subscription_orders SET status = 'failed', notes = ? WHERE id = ?", [reason, orderId]);
+  if (order.coupon_id) {
+    await pool.query(
+      "UPDATE coupon_redemptions SET status = 'released' WHERE order_id = ?",
+      [orderId]
+    );
+  }
+
+  res.json({
+    success: true,
+    message: "Order marked as failed. You can retry anytime.",
+  });
+});
+
 module.exports = {
   listPlans,
   previewPrice,
@@ -412,5 +480,7 @@ module.exports = {
   getMySubscription,
   downloadInvoice,
   resendInvoice,
+  cancelOrder,
+  failOrder,
 };
 
