@@ -20,6 +20,7 @@ const {
   getEmployee,
   updateEmployee,
   setUserStatus,
+  deleteUser,
 } = require("../controllers/superAdminController");
 const { authenticate, authorize, authorizePermission } = require("../middleware/auth");
 const { uploadEmployeePhoto } = require("../utils/upload");
@@ -47,6 +48,7 @@ router.get("/users/:id/reports/drilldown", authorize("superadmin"), getUserRepor
 router.delete("/users/:id/customers/:customerId", authorize("superadmin"), deleteUserCustomer);
 router.get("/users/:id/records/:recordId", authorize("superadmin"), getUserRecord);
 router.patch("/users/:id/status", authorize("superadmin"), setUserStatus);
+router.delete("/users/:id", authorize("superadmin"), deleteUser);
 
 router.post("/employees", authorizePermission("create_employee"), uploadEmployeePhoto.single("profile_photo"), createEmployee);
 router.get("/employees", authorize("superadmin"), listEmployees);
