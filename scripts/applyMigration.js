@@ -253,33 +253,54 @@ async function applyMigrations() {
   let connection;
 
   try {
-    // Attempt connection directly to the target database
-    try {
-      connection = await mysql.createConnection({
-        host: dbHost,
-        port: dbPort,
-        user: dbUser,
-        password: dbPassword,
-        database: dbName,
-        multipleStatements: true,
-      });
-    } catch (err) {
-      // If target database doesn't exist yet, connect to server without db specified and create it
-      if (err.code === "ER_BAD_DB_ERROR" || err.errno === 1049) {
-        console.log(`ℹ️ Database "${dbName}" does not exist. Creating database...`);
-        connection = await mysql.createConnection({
-          host: dbHost,
-          port: dbPort,
-          user: dbUser,
-          password: dbPassword,
-          multipleStatements: true,
-        });
-        await connection.query(
-          `CREATE DATABASE IF NOT EXISTS \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
+    const MAX_CONNECT_ATTEMPTS = 5;
+    const RETRY_DELAY_MS = 2000;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    for (let attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS; attempt++) {
+      try {
+        // Attempt connection directly to the target database
+        try {
+          connection = await mysql.createConnection({
+            host: dbHost,
+            port: dbPort,
+            user: dbUser,
+            password: dbPassword,
+            database: dbName,
+            multipleStatements: true,
+          });
+        } catch (err) {
+          // If target database doesn't exist yet, connect to server without db specified and create it
+          if (err.code === "ER_BAD_DB_ERROR" || err.errno === 1049) {
+            console.log(`ℹ️ Database "${dbName}" does not exist. Creating database...`);
+            connection = await mysql.createConnection({
+              host: dbHost,
+              port: dbPort,
+              user: dbUser,
+              password: dbPassword,
+              multipleStatements: true,
+            });
+            await connection.query(
+              `CREATE DATABASE IF NOT EXISTS \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
+            );
+            await connection.query(`USE \`${dbName}\`;`);
+          } else {
+            throw err;
+          }
+        }
+        break;
+      } catch (err) {
+        if (connection) {
+          await connection.end().catch(() => {});
+          connection = undefined;
+        }
+        if (attempt === MAX_CONNECT_ATTEMPTS) {
+          throw err;
+        }
+        console.warn(
+          `⚠️ Database connection attempt ${attempt}/${MAX_CONNECT_ATTEMPTS} failed: ${err.message || err}. Retrying in ${RETRY_DELAY_MS / 1000}s...`
         );
-        await connection.query(`USE \`${dbName}\`;`);
-      } else {
-        throw err;
+        await sleep(RETRY_DELAY_MS);
       }
     }
 
