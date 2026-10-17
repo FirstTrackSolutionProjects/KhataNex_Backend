@@ -718,6 +718,139 @@ const setUserStatus = asyncHandler(async (req, res) => {
   res.json({ success: true, message: `Account status set to ${status}.` });
 });
 
+// DELETE /api/superadmin/users/:id
+// Superadmin user deletion/safe deactivation with foreign key check & audit trail
+const deleteUser = asyncHandler(async (req, res) => {
+  const targetId = Number(req.params.id);
+  const { reason = "Superadmin initiated account deletion" } = req.body;
+
+  if (!targetId || Number.isNaN(targetId)) {
+    throw new ApiError(400, "Invalid user ID provided.");
+  }
+
+  // 1. Self-protection
+  if (targetId === req.user.id) {
+    throw new ApiError(400, "You cannot delete your own superadmin account.");
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [targets] = await conn.query("SELECT * FROM users WHERE id = ? FOR UPDATE", [targetId]);
+    if (!targets.length) {
+      await conn.rollback();
+      throw new ApiError(404, "User not found.");
+    }
+
+    const targetUser = targets[0];
+
+    // 2. Protect superadmin accounts
+    if (targetUser.role === "superadmin") {
+      await conn.rollback();
+      throw new ApiError(403, "System superadmin accounts cannot be deleted.");
+    }
+
+    // 3. Count referential dependencies across financial and business ledger tables
+    const [[{ count: custCount }]] = await conn.query("SELECT COUNT(*) AS count FROM customers WHERE created_by = ?", [targetId]);
+    const [[{ count: invCount }]] = await conn.query("SELECT COUNT(*) AS count FROM invoices WHERE created_by = ?", [targetId]);
+    const [[{ count: quoCount }]] = await conn.query("SELECT COUNT(*) AS count FROM quotations WHERE created_by = ?", [targetId]);
+    const [[{ count: payCount }]] = await conn.query("SELECT COUNT(*) AS count FROM payments WHERE created_by = ?", [targetId]);
+    const [[{ count: colCount }]] = await conn.query("SELECT COUNT(*) AS count FROM collections WHERE created_by = ?", [targetId]);
+    const [[{ count: expCount }]] = await conn.query("SELECT COUNT(*) AS count FROM expenses WHERE created_by = ?", [targetId]);
+    const [[{ count: stockCount }]] = await conn.query("SELECT COUNT(*) AS count FROM stock WHERE created_by = ?", [targetId]);
+    const [[{ count: purCount }]] = await conn.query("SELECT COUNT(*) AS count FROM purchase_bills WHERE created_by = ?", [targetId]);
+    const [[{ count: subOrderCount }]] = await conn.query("SELECT COUNT(*) AS count FROM subscription_orders WHERE user_id = ?", [targetId]);
+    const [[{ count: subCount }]] = await conn.query("SELECT COUNT(*) AS count FROM subscriptions WHERE user_id = ?", [targetId]);
+
+    const totalRecords =
+      custCount + invCount + quoCount + payCount + colCount + expCount + stockCount + purCount + subOrderCount + subCount;
+
+    // 4. Record audit trail in user_audit_logs
+    await conn.query(
+      `INSERT INTO user_audit_logs (superadmin_id, target_user_id, action, reason, details)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        targetId,
+        totalRecords > 0 ? "deactivate_soft_delete" : "permanent_delete",
+        reason,
+        JSON.stringify({
+          target_email: targetUser.email,
+          target_name: targetUser.name,
+          target_role: targetUser.role,
+          total_records_preserved: totalRecords,
+          breakdown: {
+            customers: custCount,
+            invoices: invCount,
+            quotations: quoCount,
+            payments: payCount,
+            collections: colCount,
+            expenses: expCount,
+            stock: stockCount,
+            purchase_bills: purCount,
+            subscriptions: subCount,
+            subscription_orders: subOrderCount,
+          },
+        }),
+      ]
+    );
+
+    let resultType = "deactivated";
+    let message = "";
+
+    if (totalRecords > 0) {
+      // Safe deactivation / soft-delete: preserve referential integrity and audit records
+      const crypto = require("crypto");
+      const scrambledPassword = `DEACTIVATED_${Date.now()}_${crypto.randomBytes(16).toString("hex")}`;
+      await conn.query(
+        `UPDATE users
+         SET status = 'inactive',
+             password = ?,
+             deleted_at = NOW(),
+             deleted_by = ?,
+             deletion_reason = ?,
+             last_active_at = NULL
+         WHERE id = ?`,
+        [scrambledPassword, req.user.id, reason, targetId]
+      );
+
+      // Also deactivate any employees created by this business owner
+      await conn.query(
+        "UPDATE users SET status = 'inactive', last_active_at = NULL WHERE created_by_admin = ?",
+        [targetId]
+      );
+
+      resultType = "deactivated";
+      message = `User "${targetUser.name || targetUser.email}" was deactivated and access revoked. ${totalRecords} historical business and financial ledger record(s) were preserved for legal/accounting compliance.`;
+    } else {
+      // Hard delete: zero linked records
+      await conn.query("DELETE FROM users WHERE id = ?", [targetId]);
+      resultType = "deleted";
+      message = `User "${targetUser.name || targetUser.email}" had no linked business records and was completely removed.`;
+    }
+
+    await conn.commit();
+
+    res.json({
+      success: true,
+      type: resultType,
+      message,
+      user: {
+        id: targetUser.id,
+        name: targetUser.name,
+        email: targetUser.email,
+        status: "inactive",
+      },
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
 
 /*
  * ============================================================
@@ -2261,4 +2394,5 @@ module.exports = {
   getEmployee,
   updateEmployee,
   setUserStatus,
+  deleteUser,
 };

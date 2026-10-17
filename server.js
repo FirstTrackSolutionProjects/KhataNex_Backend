@@ -24,6 +24,10 @@ const settingsRoutes = require("./routes/settingsRoutes");
 const khataRoutes = require("./routes/khataRoutes");
 const bankingRoutes = require("./routes/bankingRoutes");
 const fileRoutes = require("./routes/fileRoutes");
+const subscriptionRoutes = require("./routes/subscriptionRoutes");
+const paymentWebhookRoutes = require("./routes/paymentWebhookRoutes");
+const billingAdminRoutes = require("./routes/billingAdminRoutes");
+const { requireActiveSubscription } = require("./middleware/requireSubscription");
 
 const app = express();
 
@@ -67,7 +71,13 @@ app.use(
   })
 );
 
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
 
@@ -78,21 +88,27 @@ app.get("/api/health", (req, res) => res.json({ success: true, status: "ok" }));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/contacts", contactRoutes);
+app.use("/api/superadmin/billing", billingAdminRoutes);
+app.use("/api/super-admin/billing", billingAdminRoutes);
 app.use("/api/superadmin", superAdminRoutes);
 app.use("/api/super-admin", superAdminRoutes);
-app.use("/api/customers", customerRoutes);
-app.use("/api/collections", collectionRoutes);
-app.use("/api/payments", paymentRoutes);
-app.use("/api/stock", stockRoutes);
-app.use("/api/expenses", expenseRoutes);
+app.use("/api/subscriptions", subscriptionRoutes);
+app.use("/api/webhooks/payment", paymentWebhookRoutes);
+
+// Protected business write routes (guarded by requireActiveSubscription when enabled)
+app.use("/api/customers", requireActiveSubscription, customerRoutes);
+app.use("/api/collections", requireActiveSubscription, collectionRoutes);
+app.use("/api/payments", requireActiveSubscription, paymentRoutes);
+app.use("/api/stock", requireActiveSubscription, stockRoutes);
+app.use("/api/expenses", requireActiveSubscription, expenseRoutes);
 app.use("/api/reports", reportRoutes);
-app.use("/api/purchase-invoices", purchaseInvoiceRoutes);
-app.use("/api/purchase-bills", purchaseBillRoutes);
-app.use("/api/documents", documentRoutes);
-app.use("/api/vehicles", vehicleRoutes);
+app.use("/api/purchase-invoices", requireActiveSubscription, purchaseInvoiceRoutes);
+app.use("/api/purchase-bills", requireActiveSubscription, purchaseBillRoutes);
+app.use("/api/documents", requireActiveSubscription, documentRoutes);
+app.use("/api/vehicles", requireActiveSubscription, vehicleRoutes);
 app.use("/api/settings", settingsRoutes);
-app.use("/api/khata", khataRoutes);
-app.use("/api/banking", bankingRoutes);
+app.use("/api/khata", requireActiveSubscription, khataRoutes);
+app.use("/api/banking", requireActiveSubscription, bankingRoutes);
 app.use("/api/files", fileRoutes);
 
 app.use(notFound);

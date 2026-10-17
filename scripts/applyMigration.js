@@ -23,6 +23,9 @@ const MIGRATION_HISTORY = [
   "migration_015_khata_debits_and_payment_links.sql",
   "migration_016_system_updates.sql",
   "migration_017_khata_receipts_trips_updates.sql",
+  "migration_018_subscription_billing.sql",
+  "migration_019_user_audit_and_soft_delete.sql",
+  "migration_020_subscription_pricing_and_settings.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -212,6 +215,27 @@ const MIGRATION_SCHEMA_CHECKS = {
     );
 
     return columns.length === required.length;
+  },
+  "migration_018_subscription_billing.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'subscription_plans'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_019_user_audit_and_soft_delete.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'user_audit_logs'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_020_subscription_pricing_and_settings.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'subscription_settings'",
+      [db]
+    );
+    return r.length > 0;
   },
 };
 
