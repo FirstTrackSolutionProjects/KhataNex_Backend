@@ -14,13 +14,20 @@ const ApiError = require("../utils/ApiError");
  * 4. Only mutating operations (POST, PUT, PATCH, DELETE) require an active subscription.
  * 5. Employees inherit subscription status from their business owner account.
  */
+const { getSubscriptionSettings } = require("../utils/subscriptionLogic");
+
 const requireActiveSubscription = async (req, res, next) => {
-  // Check enforcement switch: completely inert by default
-  if (process.env.SUBSCRIPTION_ENFORCEMENT !== "on") {
+  // Check enforcement switch: active if env is "on" or DB settings is "on" (unless env is explicitly "off")
+  const settings = await getSubscriptionSettings();
+  const isEnforced =
+    process.env.SUBSCRIPTION_ENFORCEMENT === "on" ||
+    (process.env.SUBSCRIPTION_ENFORCEMENT !== "off" && settings.subscription_enforcement === "on");
+
+  if (!isEnforced) {
     return next();
   }
 
-  // Permitted read operations (read-only mode for expired accounts)
+  // Permitted read operations (read-only mode for unsubscribed/expired accounts)
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
     return next();
   }
@@ -47,7 +54,11 @@ const requireActiveSubscription = async (req, res, next) => {
 
   // Not authenticated
   if (!req.user) {
-    return next(new ApiError(401, "Authentication required."));
+    return res.status(401).json({
+      success: false,
+      code: "AUTHENTICATION_REQUIRED",
+      message: "Authentication required.",
+    });
   }
 
   // Superadmins bypass gating
@@ -56,16 +67,18 @@ const requireActiveSubscription = async (req, res, next) => {
   }
 
   try {
-    // Determine the billing owner account
+    // Determine the billing owner account (employees inherit from owner)
     let ownerId = req.user.id;
     if (req.user.role === "employee" && req.user.created_by_admin) {
       ownerId = req.user.created_by_admin;
     }
 
     const [rows] = await pool.query(
-      `SELECT id, ends_at, is_complimentary 
+      `SELECT id, user_id, plan_id, order_id, starts_at, ends_at, status, is_complimentary 
        FROM subscriptions 
-       WHERE user_id = ? AND ends_at > NOW() 
+       WHERE user_id = ? 
+         AND status = 'active'
+         AND ends_at > NOW() 
        ORDER BY ends_at DESC LIMIT 1`,
       [ownerId]
     );

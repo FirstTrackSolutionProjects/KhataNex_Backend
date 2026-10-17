@@ -22,11 +22,16 @@ async function getSubscriptionSettings() {
   try {
     const [rows] = await pool.query("SELECT * FROM subscription_settings WHERE id = 1");
     if (rows && rows.length > 0) {
+      const dbEnforcement = String(rows[0].subscription_enforcement || "off").toLowerCase();
+      const isEnforced =
+        process.env.SUBSCRIPTION_ENFORCEMENT === "on" ||
+        (process.env.SUBSCRIPTION_ENFORCEMENT !== "off" && dbEnforcement === "on");
+
       cachedSettings = {
         intro_offers_enabled: Boolean(rows[0].intro_offers_enabled),
         tax_percent: Number(rows[0].tax_percent || 0),
         tax_inclusive: Boolean(rows[0].tax_inclusive === 1 || rows[0].tax_inclusive === true),
-        subscription_enforcement: String(rows[0].subscription_enforcement || "off").toLowerCase(),
+        subscription_enforcement: isEnforced ? "on" : "off",
         reminders_enabled: Boolean(rows[0].reminders_enabled),
         reminder_days: String(rows[0].reminder_days || "7,3,1"),
       };
@@ -106,28 +111,36 @@ async function evaluateCoupon(couponCode, plan, basePaise, userId) {
   if (!code) throw new ApiError(400, "Coupon code is required.");
 
   const [coupons] = await pool.query(
-    "SELECT * FROM coupons WHERE code = ? AND is_active = 1",
+    "SELECT * FROM coupons WHERE code = ? AND is_active = 1 AND deleted_at IS NULL",
     [code]
   );
   if (!coupons.length) {
-    throw new ApiError(400, `Coupon "${code}" is invalid or inactive.`);
+    throw new ApiError(400, `Coupon "${code}" is invalid, inactive, or expired.`);
   }
 
   const coupon = coupons[0];
   const now = new Date();
 
   if (coupon.valid_from && new Date(coupon.valid_from) > now) {
-    throw new ApiError(400, `Coupon "${code}" is not yet active.`);
+    throw new ApiError(400, `Coupon "${code}" is not active yet (starts ${new Date(coupon.valid_from).toLocaleDateString()}).`);
   }
   if (coupon.valid_until && new Date(coupon.valid_until) < now) {
     throw new ApiError(400, `Coupon "${code}" has expired.`);
   }
   if (coupon.plan_code && coupon.plan_code.toLowerCase() !== plan.code.toLowerCase()) {
-    throw new ApiError(400, `Coupon "${code}" is not valid for plan ${plan.name}.`);
+    throw new ApiError(400, `Coupon "${code}" is only valid for the ${coupon.plan_code.toUpperCase()} plan.`);
   }
   if (basePaise < coupon.min_order_paise) {
     const minRs = (coupon.min_order_paise / 100).toFixed(2);
     throw new ApiError(400, `Minimum purchase of Rs. ${minRs} required for coupon "${code}".`);
+  }
+
+  // Cohort validation (e.g. new_users cohort)
+  if (coupon.target_cohort === "new_users" && userId) {
+    const isNew = await isEligibleForIntroductoryOffer(userId);
+    if (!isNew) {
+      throw new ApiError(400, `Coupon "${code}" is exclusively for new KhataNex users.`);
+    }
   }
 
   // Global redemptions check: redeemed + active reservations within 30 min
@@ -168,11 +181,86 @@ async function evaluateCoupon(couponCode, plan, basePaise, userId) {
 }
 
 /**
- * Calculates complete pricing breakdown for an order.
- * Ensures advertised amounts are final customer checkout totals (tax-inclusive).
- * Taxable value and included tax reconcile exactly: taxablePaise + taxPaise === totalPaise.
+ * Evaluates active seasonal promotions and flash sales.
+ * Enforces:
+ * - Active flag, deleted_at IS NULL, time bounding (starts_at <= NOW <= ends_at)
+ * - Optional plan targeting (plan_code IS NULL or matches plan.code)
+ * - User eligibility ('all', 'new_users_only', 'existing_users_only')
+ * - Max redemptions
+ * - Non-stacking rules with coupons
  */
-async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) {
+async function evaluatePromotions({ plan, basePaise, userId, promoCode = null }) {
+  try {
+    let query = `
+      SELECT * FROM promotions
+      WHERE is_active = 1
+        AND deleted_at IS NULL
+        AND starts_at <= NOW()
+        AND ends_at >= NOW()
+    `;
+    const params = [];
+
+    if (promoCode) {
+      query += " AND code = ?";
+      params.push(normalizeCode(promoCode));
+    }
+
+    query += " ORDER BY discount_value DESC";
+
+    const [promos] = await pool.query(query, params);
+    if (!promos || !promos.length) return null;
+
+    for (const promo of promos) {
+      // Check plan match if targeted
+      if (promo.plan_code && promo.plan_code.toLowerCase() !== plan.code.toLowerCase()) {
+        continue;
+      }
+
+      // Check user eligibility
+      if (userId && promo.user_eligibility === "new_users_only") {
+        const isEligible = await isEligibleForIntroductoryOffer(userId);
+        if (!isEligible) continue;
+      } else if (userId && promo.user_eligibility === "existing_users_only") {
+        const isEligible = await isEligibleForIntroductoryOffer(userId);
+        if (isEligible) continue;
+      }
+
+      // Check max redemptions limit
+      if (promo.max_redemptions !== null && promo.redemptions_count >= promo.max_redemptions) {
+        continue;
+      }
+
+      let discountPaise = 0;
+      if (promo.discount_type === "percent") {
+        discountPaise = Math.floor((basePaise * promo.discount_value) / 100);
+        if (promo.max_discount_paise) {
+          discountPaise = Math.min(discountPaise, promo.max_discount_paise);
+        }
+      } else if (promo.discount_type === "flat") {
+        discountPaise = Math.min(promo.discount_value, basePaise);
+      }
+
+      return {
+        promotion: promo,
+        discountPaise,
+        canStackWithCoupon: Boolean(promo.can_stack_with_coupon),
+      };
+    }
+  } catch (err) {
+    // If promotions table missing or error occurs, log and safely continue
+    console.warn("[evaluatePromotions] Error evaluating promotions:", err.message);
+  }
+
+  return null;
+}
+
+/**
+ * Calculates complete pricing breakdown for an order.
+ * Incorporates introductory pricing, active promotional campaigns, and coupons.
+ * Ensures non-stacking precedence when promotions are not stackable.
+ * Reconciles tax exactly: taxablePaise + taxPaise === totalPaise.
+ */
+async function priceOrder({ plan, isIntroductoryEligible, couponCode, promoCode, userId }) {
   const settings = await getSubscriptionSettings();
   const taxPercent = Number(settings.tax_percent !== undefined ? settings.tax_percent : TAX_PERCENT);
   const taxInclusive = Boolean(settings.tax_inclusive !== undefined ? settings.tax_inclusive : 1);
@@ -188,6 +276,17 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) 
     isIntroductory = true;
   }
 
+  // 1. Evaluate promotional flash sales / seasonal campaigns
+  const promoResult = await evaluatePromotions({ plan, basePaise, userId, promoCode });
+  let promotion = null;
+  let promotionDiscountPaise = 0;
+
+  if (promoResult && promoResult.discountPaise > 0) {
+    promotion = promoResult.promotion;
+    promotionDiscountPaise = promoResult.discountPaise;
+  }
+
+  // 2. Evaluate coupon if provided
   let coupon = null;
   let couponDiscountPaise = 0;
 
@@ -197,8 +296,21 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) 
     couponDiscountPaise = evalResult.discountPaise;
   }
 
-  const discountPaise = introductoryDiscountPaise + couponDiscountPaise;
-  const effectiveCheckoutPaise = Math.max(0, basePaise - couponDiscountPaise);
+  // 3. Enforce non-stacking precedence between promotion and coupon
+  if (promotion && coupon && !promoResult.canStackWithCoupon) {
+    // Customer gets whichever discount is greater
+    if (couponDiscountPaise > promotionDiscountPaise) {
+      promotion = null;
+      promotionDiscountPaise = 0;
+    } else {
+      coupon = null;
+      couponDiscountPaise = 0;
+    }
+  }
+
+  const combinedExtraDiscount = Math.min(basePaise, promotionDiscountPaise + couponDiscountPaise);
+  const discountPaise = introductoryDiscountPaise + combinedExtraDiscount;
+  const effectiveCheckoutPaise = Math.max(0, basePaise - combinedExtraDiscount);
 
   let taxablePaise = 0;
   let taxPaise = 0;
@@ -226,6 +338,9 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, userId }) 
     listPricePaise,
     isIntroductory,
     introductoryDiscountPaise,
+    promotionId: promotion ? promotion.id : null,
+    promotionName: promotion ? promotion.name : null,
+    promotionDiscountPaise,
     couponId: coupon ? coupon.id : null,
     couponCode: coupon ? coupon.code : null,
     couponDiscountPaise,
@@ -329,6 +444,16 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
       );
     }
 
+    // Mark promotion redemption count if promotion applied
+    if (order.promotion_id) {
+      try {
+        await conn.query(
+          "UPDATE promotions SET redemptions_count = redemptions_count + 1 WHERE id = ?",
+          [order.promotion_id]
+        );
+      } catch (_) {}
+    }
+
     await conn.commit();
   } catch (err) {
     await conn.rollback();
@@ -357,6 +482,7 @@ module.exports = {
   invalidateSettingsCache,
   isEligibleForIntroductoryOffer,
   evaluateCoupon,
+  evaluatePromotions,
   priceOrder,
   fulfillOrder,
 };

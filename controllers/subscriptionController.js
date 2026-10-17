@@ -18,12 +18,12 @@ const {
 
 /**
  * GET /api/subscriptions/plans
- * Returns active plans, regular & intro pricing, and current user eligibility
+ * Returns active plans, regular & intro pricing, summary, description, and current user eligibility
  */
 const listPlans = asyncHandler(async (req, res) => {
   const settings = await getSubscriptionSettings();
   const [plans] = await pool.query(
-    "SELECT id, code, name, duration_months, price_paise, introductory_price_paise, description, is_active FROM subscription_plans WHERE is_active = 1 ORDER BY duration_months ASC"
+    "SELECT id, code, name, duration_months, billing_interval, price_paise, introductory_price_paise, description, summary, features, promotional_badge, display_order, is_highlighted, is_active FROM subscription_plans WHERE is_active = 1 ORDER BY display_order ASC, duration_months ASC"
   );
 
   let isIntroductoryEligible = false;
@@ -32,10 +32,22 @@ const listPlans = asyncHandler(async (req, res) => {
   }
 
   const enrichedPlans = plans.map((plan) => {
+    let parsedFeatures = [];
+    if (Array.isArray(plan.features)) {
+      parsedFeatures = plan.features;
+    } else if (typeof plan.features === "string") {
+      try {
+        parsedFeatures = JSON.parse(plan.features);
+      } catch (_) {
+        parsedFeatures = [];
+      }
+    }
+
     const effectivePricePaise = isIntroductoryEligible ? plan.introductory_price_paise : plan.price_paise;
     const savingsPaise = Math.max(0, plan.price_paise - effectivePricePaise);
     return {
       ...plan,
+      features: parsedFeatures,
       is_eligible_for_introductory: isIntroductoryEligible,
       effective_price_paise: effectivePricePaise,
       savings_paise: savingsPaise,
@@ -53,10 +65,11 @@ const listPlans = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/subscriptions/price
- * Computes server-authoritative price breakdown with intro & coupon logic
+ * Computes server-authoritative price breakdown with intro, promo & coupon logic.
+ * Gracefully handles invalid/inactive coupons so checkout breakdown is preserved.
  */
 const previewPrice = asyncHandler(async (req, res) => {
-  const { plan_code, coupon_code } = req.body;
+  const { plan_code, coupon_code, promo_code } = req.body;
   if (!plan_code) throw new ApiError(400, "plan_code is required.");
 
   const [plans] = await pool.query(
@@ -67,12 +80,41 @@ const previewPrice = asyncHandler(async (req, res) => {
   const plan = plans[0];
 
   const isEligible = await isEligibleForIntroductoryOffer(req.user.id);
-  const pricing = await priceOrder({
-    plan,
-    isIntroductoryEligible: isEligible,
-    couponCode: coupon_code,
-    userId: req.user.id,
-  });
+
+  let pricing;
+  let couponError = null;
+  let couponApplied = false;
+
+  if (coupon_code) {
+    try {
+      pricing = await priceOrder({
+        plan,
+        isIntroductoryEligible: isEligible,
+        couponCode: coupon_code,
+        promoCode: promo_code,
+        userId: req.user.id,
+      });
+      couponApplied = Boolean(pricing.couponId);
+    } catch (err) {
+      couponError = err.message || "Invalid or inactive coupon.";
+      // Compute base pricing without coupon
+      pricing = await priceOrder({
+        plan,
+        isIntroductoryEligible: isEligible,
+        couponCode: null,
+        promoCode: promo_code,
+        userId: req.user.id,
+      });
+    }
+  } else {
+    pricing = await priceOrder({
+      plan,
+      isIntroductoryEligible: isEligible,
+      couponCode: null,
+      promoCode: promo_code,
+      userId: req.user.id,
+    });
+  }
 
   res.json({
     success: true,
@@ -81,8 +123,12 @@ const previewPrice = asyncHandler(async (req, res) => {
       code: plan.code,
       name: plan.name,
       duration_months: plan.duration_months,
+      summary: plan.summary,
+      description: plan.description,
     },
     pricing,
+    couponApplied,
+    couponError,
   });
 });
 
@@ -91,7 +137,7 @@ const previewPrice = asyncHandler(async (req, res) => {
  * Creates a durable order, reserves coupon, and initializes provider checkout
  */
 const createOrder = asyncHandler(async (req, res) => {
-  const { plan_code, coupon_code } = req.body;
+  const { plan_code, coupon_code, promo_code } = req.body;
   if (!plan_code) throw new ApiError(400, "plan_code is required.");
 
   const [plans] = await pool.query(
@@ -106,6 +152,7 @@ const createOrder = asyncHandler(async (req, res) => {
     plan,
     isIntroductoryEligible: isEligible,
     couponCode: coupon_code,
+    promoCode: promo_code,
     userId: req.user.id,
   });
 
@@ -114,9 +161,9 @@ const createOrder = asyncHandler(async (req, res) => {
   const [ins] = await pool.query(
     `INSERT INTO subscription_orders 
        (order_number, user_id, plan_id, is_introductory, list_price_paise, introductory_discount_paise,
-        coupon_id, coupon_code, coupon_discount_paise, discount_paise, taxable_paise, tax_percent,
+        promotion_id, coupon_id, coupon_code, coupon_discount_paise, discount_paise, taxable_paise, tax_percent,
         tax_paise, total_paise, currency, status, provider)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INR', 'created', 'razorpay')`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INR', 'created', 'razorpay')`,
     [
       orderNumber,
       req.user.id,
@@ -124,6 +171,7 @@ const createOrder = asyncHandler(async (req, res) => {
       pricing.isIntroductory ? 1 : 0,
       pricing.listPricePaise,
       pricing.introductoryDiscountPaise,
+      pricing.promotionId,
       pricing.couponId,
       pricing.couponCode,
       pricing.couponDiscountPaise,
@@ -281,7 +329,7 @@ const getMySubscription = asyncHandler(async (req, res) => {
     `SELECT s.*, p.name AS plan_name, p.code AS plan_code, p.duration_months
      FROM subscriptions s
      JOIN subscription_plans p ON s.plan_id = p.id
-     WHERE s.user_id = ? AND s.ends_at > NOW()
+     WHERE s.user_id = ? AND s.status = 'active' AND s.ends_at > NOW()
      ORDER BY s.ends_at DESC LIMIT 1`,
     [userId]
   );
@@ -307,12 +355,14 @@ const getMySubscription = asyncHandler(async (req, res) => {
   );
 
   const isIntroductoryEligible = await isEligibleForIntroductoryOffer(userId);
+  const settings = await getSubscriptionSettings();
 
   res.json({
     success: true,
     activeSubscription,
     remainingDays,
     isIntroductoryEligible,
+    enforcement: settings.subscription_enforcement,
     billingHistory: orders,
   });
 });

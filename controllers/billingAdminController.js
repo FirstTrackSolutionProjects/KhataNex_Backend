@@ -154,12 +154,44 @@ const getExpiryCohorts = asyncHandler(async (req, res) => {
  * Plans Management
  */
 const listAdminPlans = asyncHandler(async (req, res) => {
-  const [plans] = await pool.query("SELECT * FROM subscription_plans ORDER BY duration_months ASC");
-  res.json({ success: true, plans });
+  const [plans] = await pool.query(
+    "SELECT * FROM subscription_plans ORDER BY display_order ASC, duration_months ASC"
+  );
+  const formattedPlans = plans.map((p) => {
+    let parsedFeatures = [];
+    if (Array.isArray(p.features)) {
+      parsedFeatures = p.features;
+    } else if (typeof p.features === "string") {
+      try {
+        parsedFeatures = JSON.parse(p.features);
+      } catch (_) {
+        parsedFeatures = [];
+      }
+    }
+    return {
+      ...p,
+      features: parsedFeatures,
+    };
+  });
+  res.json({ success: true, plans: formattedPlans });
 });
 
 const createPlan = asyncHandler(async (req, res) => {
-  const { code, name, description, duration_months, price_paise, introductory_price_paise, is_active } = req.body;
+  const {
+    code,
+    name,
+    description,
+    summary,
+    duration_months,
+    billing_interval,
+    price_paise,
+    introductory_price_paise,
+    features,
+    promotional_badge,
+    display_order,
+    is_highlighted,
+    is_active,
+  } = req.body;
   const cleanCode = normalizeCode(code).toLowerCase();
 
   if (!cleanCode || !name || !duration_months || price_paise === undefined) {
@@ -177,17 +209,25 @@ const createPlan = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Introductory price cannot exceed regular plan price.");
   }
 
+  const featuresJson = Array.isArray(features) ? JSON.stringify(features) : (features ? JSON.stringify([features]) : null);
+
   const [resInsert] = await pool.query(
     `INSERT INTO subscription_plans 
-       (code, name, description, duration_months, price_paise, introductory_price_paise, is_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (code, name, description, summary, duration_months, billing_interval, price_paise, introductory_price_paise, features, promotional_badge, display_order, is_highlighted, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanCode,
       name,
       description || null,
+      summary || null,
       dMonths,
+      billing_interval || "monthly",
       pPaise,
       introPaise,
+      featuresJson,
+      promotional_badge || null,
+      display_order !== undefined ? Number(display_order) : 0,
+      is_highlighted ? 1 : 0,
       is_active !== undefined ? (is_active ? 1 : 0) : 1,
     ]
   );
@@ -200,6 +240,18 @@ const createPlan = asyncHandler(async (req, res) => {
        VALUES (?, 'create_plan', NULL, ?)`,
       [req.user.id, JSON.stringify(newPlan[0])]
     );
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, 'CREATE_PLAN', 'subscription_plan', ?, NULL, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        String(resInsert.insertId),
+        JSON.stringify(newPlan[0]),
+        JSON.stringify({ plan_code: cleanCode, plan_name: name }),
+        req.ip || null,
+      ]
+    );
   } catch (_) {}
 
   res.status(201).json({ success: true, plan: newPlan[0] });
@@ -207,7 +259,20 @@ const createPlan = asyncHandler(async (req, res) => {
 
 const updatePlan = asyncHandler(async (req, res) => {
   const planId = Number(req.params.id);
-  const { name, description, duration_months, price_paise, introductory_price_paise, is_active } = req.body;
+  const {
+    name,
+    description,
+    summary,
+    duration_months,
+    billing_interval,
+    price_paise,
+    introductory_price_paise,
+    features,
+    promotional_badge,
+    display_order,
+    is_highlighted,
+    is_active,
+  } = req.body;
 
   const [existing] = await pool.query("SELECT * FROM subscription_plans WHERE id = ?", [planId]);
   if (!existing.length) throw new ApiError(404, "Plan not found.");
@@ -224,21 +289,38 @@ const updatePlan = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Introductory price cannot exceed regular plan price.");
   }
 
+  let featuresJson = current.features;
+  if (features !== undefined) {
+    featuresJson = Array.isArray(features) ? JSON.stringify(features) : (features ? JSON.stringify([features]) : null);
+  }
+
   await pool.query(
     `UPDATE subscription_plans 
      SET name = COALESCE(?, name),
          description = ?,
+         summary = ?,
          duration_months = ?,
+         billing_interval = COALESCE(?, billing_interval),
          price_paise = ?,
          introductory_price_paise = ?,
+         features = ?,
+         promotional_badge = ?,
+         display_order = COALESCE(?, display_order),
+         is_highlighted = COALESCE(?, is_highlighted),
          is_active = COALESCE(?, is_active)
      WHERE id = ?`,
     [
       name || null,
       description !== undefined ? description : current.description,
+      summary !== undefined ? summary : current.summary,
       newMonths,
+      billing_interval !== undefined ? billing_interval : null,
       newPrice,
       newIntro,
+      featuresJson,
+      promotional_badge !== undefined ? promotional_badge : current.promotional_badge,
+      display_order !== undefined ? Number(display_order) : null,
+      is_highlighted !== undefined ? (is_highlighted ? 1 : 0) : null,
       is_active !== undefined ? (is_active ? 1 : 0) : null,
       planId,
     ]
@@ -252,6 +334,19 @@ const updatePlan = asyncHandler(async (req, res) => {
        VALUES (?, 'update_plan', ?, ?)`,
       [req.user.id, JSON.stringify(current), JSON.stringify(updated[0])]
     );
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, 'UPDATE_PLAN', 'subscription_plan', ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        String(planId),
+        JSON.stringify(current),
+        JSON.stringify(updated[0]),
+        JSON.stringify({ plan_code: updated[0].code, plan_name: updated[0].name }),
+        req.ip || null,
+      ]
+    );
   } catch (_) {}
 
   res.json({ success: true, plan: updated[0] });
@@ -261,18 +356,38 @@ const updatePlan = asyncHandler(async (req, res) => {
  * Coupons Management
  */
 const listAdminCoupons = asyncHandler(async (req, res) => {
-  const [coupons] = await pool.query(
-    `SELECT c.*, u.name AS creator_name
-     FROM coupons c
-     LEFT JOIN users u ON c.created_by = u.id
-     ORDER BY c.created_at DESC`
-  );
+  const { search, status } = req.query;
+  let query = `
+    SELECT c.*, u.name AS creator_name
+    FROM coupons c
+    LEFT JOIN users u ON c.created_by = u.id
+    WHERE c.deleted_at IS NULL
+  `;
+  const params = [];
+
+  if (status === "active") {
+    query += " AND c.is_active = 1";
+  } else if (status === "disabled") {
+    query += " AND c.is_active = 0";
+  }
+
+  if (search) {
+    query += " AND (c.code LIKE ? OR c.name LIKE ? OR c.description LIKE ?)";
+    const term = `%${search}%`;
+    params.push(term, term, term);
+  }
+
+  query += " ORDER BY c.created_at DESC";
+
+  const [coupons] = await pool.query(query, params);
   res.json({ success: true, coupons });
 });
 
 const createCoupon = asyncHandler(async (req, res) => {
   const {
     code,
+    name,
+    description,
     discount_type,
     discount_value,
     max_discount_paise,
@@ -300,12 +415,14 @@ const createCoupon = asyncHandler(async (req, res) => {
 
   const [ins] = await pool.query(
     `INSERT INTO coupons 
-       (code, discount_type, discount_value, max_discount_paise, min_order_paise,
+       (code, name, description, discount_type, discount_value, max_discount_paise, min_order_paise,
         max_redemptions, per_user_limit, plan_code, valid_from, valid_until,
         is_active, target_cohort, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       cleanCode,
+      name || null,
+      description || null,
       discount_type,
       Number(discount_value),
       max_discount_paise ? Number(max_discount_paise) : null,
@@ -337,6 +454,8 @@ const createCoupon = asyncHandler(async (req, res) => {
 const updateCoupon = asyncHandler(async (req, res) => {
   const couponId = Number(req.params.id);
   const {
+    name,
+    description,
     discount_type,
     discount_value,
     max_discount_paise,
@@ -350,12 +469,14 @@ const updateCoupon = asyncHandler(async (req, res) => {
     target_cohort,
   } = req.body;
 
-  const [existing] = await pool.query("SELECT * FROM coupons WHERE id = ?", [couponId]);
+  const [existing] = await pool.query("SELECT * FROM coupons WHERE id = ? AND deleted_at IS NULL", [couponId]);
   if (!existing.length) throw new ApiError(404, "Coupon not found.");
 
   await pool.query(
     `UPDATE coupons
-     SET discount_type = COALESCE(?, discount_type),
+     SET name = COALESCE(?, name),
+         description = COALESCE(?, description),
+         discount_type = COALESCE(?, discount_type),
          discount_value = COALESCE(?, discount_value),
          max_discount_paise = ?,
          min_order_paise = COALESCE(?, min_order_paise),
@@ -368,6 +489,8 @@ const updateCoupon = asyncHandler(async (req, res) => {
          target_cohort = ?
      WHERE id = ?`,
     [
+      name !== undefined ? name : existing[0].name,
+      description !== undefined ? description : existing[0].description,
       discount_type || null,
       discount_value ? Number(discount_value) : null,
       max_discount_paise !== undefined ? (max_discount_paise ? Number(max_discount_paise) : null) : existing[0].max_discount_paise,
@@ -394,6 +517,292 @@ const updateCoupon = asyncHandler(async (req, res) => {
   } catch (_) {}
 
   res.json({ success: true, coupon: updated[0] });
+});
+
+/**
+ * DELETE /api/superadmin/billing/coupons/:id
+ * Soft deletes a coupon preserving historical transaction links
+ */
+const deleteCoupon = asyncHandler(async (req, res) => {
+  const couponId = Number(req.params.id);
+  const [existing] = await pool.query("SELECT * FROM coupons WHERE id = ? AND deleted_at IS NULL", [couponId]);
+  if (!existing.length) throw new ApiError(404, "Coupon not found or already deleted.");
+
+  await pool.query("UPDATE coupons SET deleted_at = NOW(), is_active = 0 WHERE id = ?", [couponId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
+       VALUES (?, 'delete_coupon', ?, ?)`,
+      [req.user.id, JSON.stringify(existing[0]), JSON.stringify({ deleted_at: new Date() })]
+    );
+  } catch (_) {}
+
+  res.json({ success: true, message: `Coupon ${existing[0].code} deleted successfully.` });
+});
+
+/**
+ * Promotions & Seasonal Flash Sales
+ */
+const listAdminPromotions = asyncHandler(async (req, res) => {
+  const [promotions] = await pool.query(
+    `SELECT p.*, u.name AS creator_name
+     FROM promotions p
+     LEFT JOIN users u ON p.created_by = u.id
+     WHERE p.deleted_at IS NULL
+     ORDER BY p.starts_at DESC`
+  );
+  res.json({ success: true, promotions });
+});
+
+const createPromotion = asyncHandler(async (req, res) => {
+  const {
+    name,
+    code,
+    discount_type,
+    discount_value,
+    max_discount_paise,
+    plan_code,
+    starts_at,
+    ends_at,
+    target_cohort,
+    user_eligibility,
+    max_redemptions,
+    per_user_limit,
+    can_stack_with_coupon,
+    is_active,
+  } = req.body;
+
+  if (!name) throw new ApiError(400, "Promotion campaign name is required.");
+  if (!starts_at || !ends_at) throw new ApiError(400, "starts_at and ends_at are required.");
+  if (new Date(ends_at) <= new Date(starts_at)) {
+    throw new ApiError(400, "ends_at must be after starts_at.");
+  }
+  if (!["percent", "flat"].includes(discount_type)) {
+    throw new ApiError(400, "discount_type must be 'percent' or 'flat'.");
+  }
+  if (!discount_value || Number(discount_value) <= 0) {
+    throw new ApiError(400, "discount_value must be greater than 0.");
+  }
+
+  const [ins] = await pool.query(
+    `INSERT INTO promotions
+       (name, code, discount_type, discount_value, max_discount_paise,
+        plan_code, starts_at, ends_at, target_cohort, user_eligibility,
+        max_redemptions, per_user_limit, can_stack_with_coupon, is_active, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(name).trim(),
+      code ? normalizeCode(code) : null,
+      discount_type,
+      Number(discount_value),
+      max_discount_paise ? Number(max_discount_paise) : null,
+      plan_code ? String(plan_code).trim().toLowerCase() : null,
+      new Date(starts_at),
+      new Date(ends_at),
+      target_cohort || null,
+      user_eligibility || "all",
+      max_redemptions ? Number(max_redemptions) : null,
+      per_user_limit ? Number(per_user_limit) : 1,
+      can_stack_with_coupon ? 1 : 0,
+      is_active !== undefined ? (is_active ? 1 : 0) : 1,
+      req.user.id,
+    ]
+  );
+
+  const [created] = await pool.query("SELECT * FROM promotions WHERE id = ?", [ins.insertId]);
+  res.status(201).json({ success: true, promotion: created[0] });
+});
+
+const updatePromotion = asyncHandler(async (req, res) => {
+  const promoId = Number(req.params.id);
+  const [existing] = await pool.query("SELECT * FROM promotions WHERE id = ? AND deleted_at IS NULL", [promoId]);
+  if (!existing.length) throw new ApiError(404, "Promotion not found.");
+
+  const current = existing[0];
+  const {
+    name,
+    code,
+    discount_type,
+    discount_value,
+    max_discount_paise,
+    plan_code,
+    starts_at,
+    ends_at,
+    target_cohort,
+    user_eligibility,
+    max_redemptions,
+    per_user_limit,
+    can_stack_with_coupon,
+    is_active,
+  } = req.body;
+
+  await pool.query(
+    `UPDATE promotions
+     SET name = COALESCE(?, name),
+         code = ?,
+         discount_type = COALESCE(?, discount_type),
+         discount_value = COALESCE(?, discount_value),
+         max_discount_paise = ?,
+         plan_code = ?,
+         starts_at = COALESCE(?, starts_at),
+         ends_at = COALESCE(?, ends_at),
+         target_cohort = ?,
+         user_eligibility = COALESCE(?, user_eligibility),
+         max_redemptions = ?,
+         per_user_limit = COALESCE(?, per_user_limit),
+         can_stack_with_coupon = COALESCE(?, can_stack_with_coupon),
+         is_active = COALESCE(?, is_active)
+     WHERE id = ?`,
+    [
+      name ? String(name).trim() : null,
+      code !== undefined ? (code ? normalizeCode(code) : null) : current.code,
+      discount_type || null,
+      discount_value !== undefined ? Number(discount_value) : null,
+      max_discount_paise !== undefined ? (max_discount_paise ? Number(max_discount_paise) : null) : current.max_discount_paise,
+      plan_code !== undefined ? (plan_code ? String(plan_code).trim().toLowerCase() : null) : current.plan_code,
+      starts_at ? new Date(starts_at) : null,
+      ends_at ? new Date(ends_at) : null,
+      target_cohort !== undefined ? target_cohort : current.target_cohort,
+      user_eligibility || null,
+      max_redemptions !== undefined ? (max_redemptions ? Number(max_redemptions) : null) : current.max_redemptions,
+      per_user_limit !== undefined ? Number(per_user_limit) : null,
+      can_stack_with_coupon !== undefined ? (can_stack_with_coupon ? 1 : 0) : null,
+      is_active !== undefined ? (is_active ? 1 : 0) : null,
+      promoId,
+    ]
+  );
+
+  const [updated] = await pool.query("SELECT * FROM promotions WHERE id = ?", [promoId]);
+  res.json({ success: true, promotion: updated[0] });
+});
+
+const deletePromotion = asyncHandler(async (req, res) => {
+  const promoId = Number(req.params.id);
+  const [existing] = await pool.query("SELECT * FROM promotions WHERE id = ? AND deleted_at IS NULL", [promoId]);
+  if (!existing.length) throw new ApiError(404, "Promotion not found.");
+
+  await pool.query("UPDATE promotions SET deleted_at = NOW(), is_active = 0 WHERE id = ?", [promoId]);
+  res.json({ success: true, message: `Promotion ${existing[0].name} deleted successfully.` });
+});
+
+/**
+ * GET /api/superadmin/billing/users-search
+ * Multi-field lookup searching ID, Name, Business Name, Phone, and Email
+ */
+const searchUsersBilling = asyncHandler(async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  if (!q) {
+    return res.json({ success: true, users: [] });
+  }
+
+  const isNumeric = /^\d+$/.test(q);
+  const term = `%${q}%`;
+
+  let sql = `
+    SELECT u.id, u.name, u.email, u.phone, u.business_name, u.status, u.role, u.has_used_intro_offer,
+           s.ends_at AS subscription_ends_at,
+           s.status AS subscription_status,
+           s.is_complimentary AS subscription_is_complimentary,
+           p.name AS subscription_plan_name,
+           p.code AS subscription_plan_code,
+           CASE
+             WHEN s.ends_at IS NULL THEN 'none'
+             WHEN s.ends_at > NOW() THEN 'active'
+             ELSE 'expired'
+           END AS subscription_display_status
+    FROM users u
+    LEFT JOIN (
+      SELECT s1.user_id, s1.plan_id, s1.ends_at, s1.is_complimentary, s1.status
+      FROM subscriptions s1
+      JOIN (
+        SELECT user_id, MAX(ends_at) AS max_end
+        FROM subscriptions
+        GROUP BY user_id
+      ) s2 ON s1.user_id = s2.user_id AND s1.ends_at = s2.max_end
+    ) s ON s.user_id = u.id
+    LEFT JOIN subscription_plans p ON s.plan_id = p.id
+    WHERE u.role = 'user' AND (
+      u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR u.business_name LIKE ?
+  `;
+  const params = [term, term, term, term];
+
+  if (isNumeric) {
+    sql += " OR u.id = ?";
+    params.push(Number(q));
+  }
+
+  sql += ") ORDER BY u.id DESC LIMIT 20";
+
+  const [users] = await pool.query(sql, params);
+  res.json({ success: true, users });
+});
+
+/**
+ * GET /api/superadmin/billing/alerts
+ * Subscription alerts panel: Expiring Today, Expiring Soon (1-7 days), Expired in last 14 days
+ */
+const getSubscriptionAlerts = asyncHandler(async (req, res) => {
+  // 1. Expiring Today
+  const [expiringToday] = await pool.query(
+    `SELECT u.id, u.name, u.email, u.phone, u.business_name, s.ends_at, p.name AS plan_name, p.code AS plan_code
+     FROM subscriptions s
+     JOIN (
+       SELECT user_id, MAX(ends_at) AS max_end
+       FROM subscriptions
+       GROUP BY user_id
+     ) latest ON s.user_id = latest.user_id AND s.ends_at = latest.max_end
+     JOIN users u ON s.user_id = u.id
+     JOIN subscription_plans p ON s.plan_id = p.id
+     WHERE s.ends_at > NOW() AND DATE(s.ends_at) = CURDATE()
+     ORDER BY s.ends_at ASC`
+  );
+
+  // 2. Expiring Soon (Next 7 days, excluding today)
+  const [expiringSoon] = await pool.query(
+    `SELECT u.id, u.name, u.email, u.phone, u.business_name, s.ends_at, p.name AS plan_name, p.code AS plan_code,
+            DATEDIFF(s.ends_at, NOW()) AS days_left
+     FROM subscriptions s
+     JOIN (
+       SELECT user_id, MAX(ends_at) AS max_end
+       FROM subscriptions
+       GROUP BY user_id
+     ) latest ON s.user_id = latest.user_id AND s.ends_at = latest.max_end
+     JOIN users u ON s.user_id = u.id
+     JOIN subscription_plans p ON s.plan_id = p.id
+     WHERE s.ends_at > NOW() AND DATE(s.ends_at) > CURDATE() AND s.ends_at <= NOW() + INTERVAL 7 DAY
+     ORDER BY s.ends_at ASC`
+  );
+
+  // 3. Expired in last 14 days
+  const [expiredRecently] = await pool.query(
+    `SELECT u.id, u.name, u.email, u.phone, u.business_name, s.ends_at, p.name AS plan_name, p.code AS plan_code,
+            DATEDIFF(NOW(), s.ends_at) AS days_ago
+     FROM subscriptions s
+     JOIN (
+       SELECT user_id, MAX(ends_at) AS max_end
+       FROM subscriptions
+       GROUP BY user_id
+     ) latest ON s.user_id = latest.user_id AND s.ends_at = latest.max_end
+     JOIN users u ON s.user_id = u.id
+     JOIN subscription_plans p ON s.plan_id = p.id
+     WHERE s.ends_at <= NOW() AND s.ends_at >= NOW() - INTERVAL 14 DAY
+     ORDER BY s.ends_at DESC`
+  );
+
+  res.json({
+    success: true,
+    alerts: {
+      expiringToday,
+      expiringSoon,
+      expiredRecently,
+      summary: {
+        todayCount: expiringToday.length,
+        soonCount: expiringSoon.length,
+        expiredCount: expiredRecently.length,
+      },
+    },
+  });
 });
 
 /**
@@ -755,6 +1164,13 @@ module.exports = {
   listAdminCoupons,
   createCoupon,
   updateCoupon,
+  deleteCoupon,
+  listAdminPromotions,
+  createPromotion,
+  updatePromotion,
+  deletePromotion,
+  searchUsersBilling,
+  getSubscriptionAlerts,
   listAdminOrders,
   getUserBillingDetails,
   grantSubscription,
