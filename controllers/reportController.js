@@ -1,6 +1,7 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission } = require("../utils/tenantContext");
 
 const formatLocalDate = (d) => {
   const year = d.getFullYear();
@@ -21,7 +22,13 @@ const resolveEffectiveUserId = (req) => {
       return Number(rawId);
     }
   }
-  return req?.user?.id;
+  if (req && req.user && req.user.role === "employee") {
+    if (!hasPermission(req.user, "reports", "view")) {
+      throw new ApiError(403, "You do not have permission to view reports.");
+    }
+  }
+  const tenant = getTenantContext(req);
+  return tenant.businessOwnerId;
 };
 
 const resolvePeriodRange = (periodOrQuery, fromParam, toParam) => {

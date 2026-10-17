@@ -1,12 +1,18 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 // POST /api/customers
 // Nothing is required — a blank submission still creates a row (name
 // falls back to "Unnamed Customer" via the DB default).
 
-  const createCustomer = asyncHandler(async (req, res) => {
+const createCustomer = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "create")) {
+    throw new ApiError(403, "You do not have permission to create customers.");
+  }
+
   const {
     title,
     name,
@@ -99,14 +105,21 @@ const ApiError = require("../utils/ApiError");
       shippingAddress?.city || null,
       shippingAddress?.landmark || null,
 
-      req.user?.id || null,
+      tenant.businessOwnerId,
     ]
   );
 
   const [rows] = await pool.query(
     "SELECT * FROM customers WHERE id = ? AND created_by = ?",
-    [result.insertId, req.user.id]
+    [result.insertId, tenant.businessOwnerId]
   );
+
+  await logAuditEvent(req, {
+    action: "CREATE_CUSTOMER",
+    targetType: "customer",
+    targetId: result.insertId,
+    details: `Created customer "${name || displayName || businessName || "Unnamed Customer"}" (ID: ${result.insertId})`,
+  });
 
   res.status(201).json({
     success: true,
@@ -118,13 +131,18 @@ const ApiError = require("../utils/ApiError");
 // GET /api/customers
 // Every customer with how much they currently owe. Supports keyword autocomplete/search.
 const listCustomers = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "view")) {
+    throw new ApiError(403, "You do not have permission to view customers.");
+  }
+
   const keyword = String(req.query.search || req.query.query || req.query.q || "").trim();
 
   let sql = `SELECT c.*, u.name AS created_by_name
              FROM customers c
              LEFT JOIN users u ON u.id = c.created_by
              WHERE c.created_by = ?`;
-  const params = [req.user.id];
+  const params = [tenant.businessOwnerId];
 
   if (keyword) {
     sql += ` AND (
@@ -147,32 +165,37 @@ const listCustomers = asyncHandler(async (req, res) => {
 // GET /api/customers/:id
 // Full profile: due amount + sale history + payment (due-clearing) history.
 const getCustomerProfile = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "view")) {
+    throw new ApiError(403, "You do not have permission to view customers.");
+  }
+
   const { id } = req.params;
   const [custRows] = await pool.query("SELECT * FROM customers WHERE id = ?", [id]);
   if (!custRows.length) throw new ApiError(404, "Customer not found.");
 
-  if (custRows[0].created_by !== req.user.id) {
+  if (custRows[0].created_by !== tenant.businessOwnerId) {
     throw new ApiError(404, "Customer not found.");
   }
 
   const [sales] = await pool.query(
     `SELECT id, item_name, amount, payment_type, sale_date, created_at
      FROM collections WHERE customer_id = ? AND created_by = ? ORDER BY sale_date DESC, created_at DESC`,
-    [id, req.user.id]
+    [id, tenant.businessOwnerId]
   );
 
   const [duePayments] = await pool.query(
     `SELECT id, amount, payment_mode, purpose, payment_date, created_at
      FROM payments WHERE customer_id = ? AND created_by = ? AND payment_category = 'due_received'
      ORDER BY payment_date DESC, created_at DESC`,
-    [id, req.user.id]
+    [id, tenant.businessOwnerId]
   );
 
   const [dues] = await pool.query(
     `SELECT * FROM customer_dues
      WHERE customer_id = ? AND created_by = ? AND status != 'settled'
      ORDER BY created_at ASC, id ASC`,
-    [id, req.user.id]
+    [id, tenant.businessOwnerId]
   );
 
   res.json({
@@ -186,18 +209,28 @@ const getCustomerProfile = asyncHandler(async (req, res) => {
 });
 
 const getCustomerDues = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "view")) {
+    throw new ApiError(403, "You do not have permission to view customers.");
+  }
+
   const { id } = req.params;
   const [rows] = await pool.query(
     `SELECT * FROM customer_dues
      WHERE customer_id = ? AND created_by = ? AND status != 'settled'
      ORDER BY created_at ASC, id ASC`,
-    [id, req.user.id]
+    [id, tenant.businessOwnerId]
   );
   res.json({ success: true, count: rows.length, dues: rows });
 });
 
 // PATCH /api/customers/:id
 const updateCustomer = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit customers.");
+  }
+
   const {
     title,
     name,
@@ -220,7 +253,7 @@ const updateCustomer = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
   const [rows] = await pool.query(
-    "SELECT id, created_by FROM customers WHERE id = ?",
+    "SELECT id, name, created_by FROM customers WHERE id = ?",
     [id]
   );
 
@@ -228,7 +261,7 @@ const updateCustomer = asyncHandler(async (req, res) => {
     throw new ApiError(404, "Customer not found.");
   }
 
-  if (rows[0].created_by !== req.user.id) {
+  if (rows[0].created_by !== tenant.businessOwnerId) {
     throw new ApiError(404, "Customer not found.");
   }
 
@@ -298,9 +331,16 @@ const updateCustomer = asyncHandler(async (req, res) => {
       shippingAddress?.landmark || null,
 
       id,
-      req.user.id,
+      tenant.businessOwnerId,
     ]
   );
+
+  await logAuditEvent(req, {
+    action: "UPDATE_CUSTOMER",
+    targetType: "customer",
+    targetId: id,
+    details: `Updated customer "${rows[0].name || id}" (ID: ${id})`,
+  });
 
   res.json({
     success: true,
@@ -309,11 +349,16 @@ const updateCustomer = asyncHandler(async (req, res) => {
 });
 
 const deleteCustomer = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete customers.");
+  }
+
   const customerId = req.params.id;
   const targetUserId =
     req.query.user_id && req.user.role === "superadmin"
       ? Number(req.query.user_id)
-      : req.user.id;
+      : tenant.businessOwnerId;
 
   const conn = await pool.getConnection();
   try {
@@ -324,7 +369,7 @@ const deleteCustomer = asyncHandler(async (req, res) => {
 
     if (req.user.role !== "superadmin") {
       checkSql += " AND created_by = ?";
-      checkParams.push(req.user.id);
+      checkParams.push(tenant.businessOwnerId);
     } else if (req.query.user_id) {
       checkSql += " AND created_by = ?";
       checkParams.push(targetUserId);
@@ -372,6 +417,13 @@ const deleteCustomer = asyncHandler(async (req, res) => {
     await conn.query("DELETE FROM customers WHERE id = ?", [customerId]);
 
     await conn.commit();
+
+    await logAuditEvent(req, {
+      action: "DELETE_CUSTOMER",
+      targetType: "customer",
+      targetId: customerId,
+      details: `Deleted customer "${customer.name || customerId}" (ID: ${customerId})`,
+    });
 
     res.json({
       success: true,

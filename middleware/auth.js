@@ -20,7 +20,7 @@ const authenticate = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     const [rows] = await pool.query(
-      "SELECT id, name, email, role, employee_role_type, permissions, status FROM users WHERE id = ?",
+      "SELECT id, name, email, role, employee_role_type, permissions, assigned_modules, status, created_by_admin FROM users WHERE id = ?",
       [decoded.id]
     );
 
@@ -28,6 +28,17 @@ const authenticate = async (req, res, next) => {
     if (!user) throw new ApiError(401, "User no longer exists.");
     if (user.status !== "active") {
       throw new ApiError(403, "Your account has been deactivated. Contact the super admin.");
+    }
+
+    if (typeof user.assigned_modules === "string") {
+      try {
+        user.assigned_modules = JSON.parse(user.assigned_modules);
+      } catch (_) {
+        user.assigned_modules = [];
+      }
+    }
+    if (!Array.isArray(user.assigned_modules)) {
+      user.assigned_modules = [];
     }
 
     await pool.query("UPDATE users SET last_active_at = NOW() WHERE id = ?", [user.id]);
@@ -103,4 +114,53 @@ const authorizePermission = (...requiredPermissions) => (req, res, next) => {
   next(new ApiError(403, "You do not have the required permission for this action."));
 };
 
-module.exports = { authenticate, authorize, authorizeEmployeeRoleType, authorizePermission };
+/**
+ * authorizeModule(...modules) — restricts access to employees assigned to specific modules.
+ * Superadmin always passes automatically. Regular users pass for their own business operations.
+ * Employees must have at least one of the specified modules in their assigned_modules array (or 'all').
+ */
+const authorizeModule = (...requiredModules) => (req, res, next) => {
+  if (!req.user) return next(new ApiError(401, "Not authenticated."));
+  if (req.user.role === "superadmin") return next();
+  if (req.user.role === "user") return next();
+
+  if (req.user.role === "employee") {
+    const assigned = Array.isArray(req.user.assigned_modules) ? req.user.assigned_modules : [];
+    if (assigned.includes("all") || assigned.includes("manage_all")) {
+      return next();
+    }
+    const hasModule = requiredModules.some((mod) => assigned.includes(mod));
+    if (hasModule) return next();
+    return next(new ApiError(403, `Access denied: you are not assigned to the [${requiredModules.join(", ")}] module.`));
+  }
+
+  next(new ApiError(403, "You do not have permission to access this resource."));
+};
+
+/**
+ * requirePermission(moduleName, operation) — restricts access based on granular employee permissions.
+ * Superadmin and regular users pass automatically.
+ * Employees are checked via hasPermission(req.user, moduleName, operation).
+ */
+const { hasPermission } = require("../utils/tenantContext");
+
+const requirePermission = (moduleName, operation = "view") => (req, res, next) => {
+  if (!req.user) return next(new ApiError(401, "Not authenticated."));
+  if (req.user.role === "superadmin" || req.user.role === "user") return next();
+
+  if (hasPermission(req.user, moduleName, operation)) {
+    return next();
+  }
+
+  return next(new ApiError(403, `Access denied: you do not have permission to ${operation} ${moduleName}.`));
+};
+
+
+module.exports = {
+  authenticate,
+  authorize,
+  authorizeEmployeeRoleType,
+  authorizePermission,
+  authorizeModule,
+  requirePermission,
+};

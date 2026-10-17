@@ -11,6 +11,11 @@ const { sendMail } = require("../utils/mailer");
 const {
   relativeUploadPath,
 } = require("../utils/upload");
+const {
+  getTenantContext,
+  hasPermission,
+  logAuditEvent,
+} = require("../utils/tenantContext");
 
 const DOC_TYPES = [
   "invoice",
@@ -300,12 +305,26 @@ const createDocument =
     const body =
       req.body || {};
 
+    const tenant = getTenantContext(req);
+
     const docType =
       DOC_TYPES.includes(
         body.doc_type
       )
         ? body.doc_type
         : "invoice";
+
+    const moduleName = docType === "quotation" ? "quotations" : "invoices";
+
+    if (tenant.isEmployee && !hasPermission(req.user, moduleName, "create")) {
+      throw new ApiError(403, `Access denied: you do not have permission to create ${moduleName}.`);
+    }
+
+    if (body.customer_id && tenant.isEmployee) {
+      if (!hasPermission(req.user, "customers", "view")) {
+        throw new ApiError(403, "Access denied: you do not have permission to access the customer directory. Please enter recipient details manually.");
+      }
+    }
 
     const safeItems =
       Array.isArray(body.items)
@@ -314,14 +333,15 @@ const createDocument =
 
     const user =
       await getUserProfile(
-        req.user.id
+        tenant.businessOwnerId
       );
 
-    const customer =
-      await getCustomer(
-        body.customer_id,
-        req.user.id
-      );
+    const customer = body.customer_id
+      ? await getCustomer(
+          body.customer_id,
+          tenant.businessOwnerId
+        )
+      : null;
 
     const manualCustomer =
       body.manual_customer || {};
@@ -406,10 +426,10 @@ const createDocument =
       body.bank_account_id
         ? await getBankAccount(
             body.bank_account_id,
-            req.user.id
+            tenant.businessOwnerId
           )
         : await getDefaultBankAccount(
-            req.user.id
+            tenant.businessOwnerId
           );
 
     const documentDate =
@@ -919,7 +939,7 @@ const createDocument =
           bankSnapshot.bank_account_type,
           bankSnapshot.bank_ifsc_code,
 
-          req.user.id,
+          tenant.businessOwnerId,
         ];
 
         const invoicePlaceholders =
@@ -1017,7 +1037,7 @@ const createDocument =
             if (resolvedProductId) {
               const [rows] = await conn.query(
                 "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
-                [resolvedProductId, req.user.id]
+                [resolvedProductId, tenant.businessOwnerId]
               );
               if (rows.length) stockRow = rows[0];
             }
@@ -1025,7 +1045,7 @@ const createDocument =
             if (!stockRow && item.product_name) {
               const [rows] = await conn.query(
                 "SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ? FOR UPDATE",
-                [item.product_name, req.user.id]
+                [item.product_name, tenant.businessOwnerId]
               );
               if (rows.length) stockRow = rows[0];
             }
@@ -1059,7 +1079,7 @@ const createDocument =
 
             await conn.query(
               "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-              [reqQty, stockRow.id, req.user.id]
+              [reqQty, stockRow.id, tenant.businessOwnerId]
             );
 
             resolvedProductId = stockRow.id;
@@ -1190,7 +1210,7 @@ const createDocument =
           bankSnapshot.bank_account_type,
           bankSnapshot.bank_ifsc_code,
 
-          req.user.id,
+          tenant.businessOwnerId,
         ];
 
         const quotationPlaceholders =
@@ -1284,7 +1304,7 @@ const createDocument =
             if (resolvedProductId) {
               const [rows] = await conn.query(
                 "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?",
-                [resolvedProductId, req.user.id]
+                [resolvedProductId, tenant.businessOwnerId]
               );
               if (rows.length) stockRow = rows[0];
             }
@@ -1292,7 +1312,7 @@ const createDocument =
             if (!stockRow && item.product_name) {
               const [rows] = await conn.query(
                 "SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?",
-                [item.product_name, req.user.id]
+                [item.product_name, tenant.businessOwnerId]
               );
               if (rows.length) stockRow = rows[0];
             }
@@ -1745,6 +1765,32 @@ const createDocument =
         finalRows[0];
     }
 
+    try {
+      await logAuditEvent({
+        actorId: tenant.actorId,
+        actorRole: tenant.actorRole,
+        action: docType === "quotation" ? "CREATE_QUOTATION" : "CREATE_INVOICE",
+        targetType: docType,
+        targetId: docId,
+        details: {
+          document_number: docNumber,
+          recipient: customerSnapshot.to_name,
+          total_amount: totals.totalAmount,
+          items_count: totals.calculatedItems.length,
+          pdf_path: pdfRelPath,
+          items: totals.calculatedItems.map((i) => ({
+            name: i.product_name,
+            qty: i.quantity,
+            price: i.price,
+            total: i.line_total,
+          })),
+        },
+        ipAddress: req.ip || null,
+      });
+    } catch (auditErr) {
+      console.warn("Failed to record document creation audit:", auditErr.message);
+    }
+
     res.status(201).json({
       success: true,
 
@@ -1777,6 +1823,28 @@ const createMoneyReceipt =
   asyncHandler(async (req, res) => {
     const body =
       req.body || {};
+
+    const tenant = getTenantContext(req);
+
+    if (
+      tenant.isEmployee &&
+      !hasPermission(req.user, "money_receipts", "create") &&
+      !hasPermission(req.user, "receipts", "create")
+    ) {
+      throw new ApiError(
+        403,
+        "Access denied: you do not have permission to create money receipts."
+      );
+    }
+
+    if (body.customer_id && tenant.isEmployee) {
+      if (!hasPermission(req.user, "customers", "view")) {
+        throw new ApiError(
+          403,
+          "Access denied: you do not have permission to access the customer directory. Please enter recipient details manually."
+        );
+      }
+    }
 
     const againstType =
       RECEIPT_TYPES.includes(
@@ -1821,14 +1889,16 @@ const createMoneyReceipt =
 
     const user =
       await getUserProfile(
-        req.user.id
+        tenant.businessOwnerId
       );
 
     const customer =
-      await getCustomer(
-        body.customer_id,
-        req.user.id
-      );
+      body.customer_id
+        ? await getCustomer(
+            body.customer_id,
+            tenant.businessOwnerId
+          )
+        : null;
 
     /*
      * Bank information ALWAYS comes
@@ -1838,10 +1908,10 @@ const createMoneyReceipt =
       body.bank_account_id
         ? await getBankAccount(
             body.bank_account_id,
-            req.user.id
+            tenant.businessOwnerId
           )
         : await getDefaultBankAccount(
-            req.user.id
+            tenant.businessOwnerId
           );
 
     const receiptDate =
@@ -2031,7 +2101,7 @@ const createMoneyReceipt =
         user.currency ||
           "INR",
 
-        req.user.id,
+        tenant.businessOwnerId,
 
         fromSnapshot.from_name,
         fromSnapshot.from_business_name,
@@ -2202,7 +2272,7 @@ const createMoneyReceipt =
              AND doc_type = 'invoice'
              AND created_by = ?
            FOR UPDATE`,
-          [invoiceId, req.user.id]
+          [invoiceId, tenant.businessOwnerId]
         );
 
         if (
@@ -2385,7 +2455,7 @@ const createMoneyReceipt =
       `SELECT *
        FROM money_receipts
        WHERE id = ? AND created_by = ?`,
-      [receiptId, req.user.id]
+      [receiptId, tenant.businessOwnerId]
     );
 
     const receipt =
@@ -2546,7 +2616,7 @@ const createMoneyReceipt =
         [
           pdfRelPath,
           receiptId,
-          req.user.id,
+          tenant.businessOwnerId,
         ]
       );
     } catch (err) {
@@ -2559,8 +2629,28 @@ const createMoneyReceipt =
       `SELECT *
        FROM money_receipts
        WHERE id = ? AND created_by = ?`,
-      [receiptId, req.user.id]
+      [receiptId, tenant.businessOwnerId]
     );
+
+    try {
+      await logAuditEvent({
+        actorId: tenant.actorId,
+        actorRole: tenant.actorRole,
+        action: "CREATE_RECEIPT",
+        targetType: "receipt",
+        targetId: receiptId,
+        details: {
+          receipt_number: receiptNumber,
+          recipient: customer?.name || body.received_from_name,
+          amount_received: amountReceived,
+          payment_mode: paymentMode,
+          pdf_path: pdfRelPath,
+        },
+        ipAddress: req.ip || null,
+      });
+    } catch (auditErr) {
+      console.warn("Failed to record money receipt creation audit:", auditErr.message);
+    }
 
     res.status(201).json({
       success: true,
@@ -2598,6 +2688,10 @@ const listDocuments =
       item_type,
     } = req.query;
 
+    const tenant = getTenantContext(req);
+    const canViewInvoices = !tenant.isEmployee || hasPermission(req.user, "invoices", "view");
+    const canViewQuotations = !tenant.isEmployee || hasPermission(req.user, "quotations", "view");
+
     const rows = [];
 
     /*
@@ -2607,8 +2701,8 @@ const listDocuments =
      */
 
     if (
-      !doc_type ||
-      doc_type === "invoice"
+      (!doc_type || doc_type === "invoice") &&
+      canViewInvoices
     ) {
       let invoiceSql = `
         SELECT
@@ -2640,7 +2734,7 @@ const listDocuments =
         " AND i.created_by = ?";
 
       invoiceParams.push(
-        req.user.id
+        tenant.businessOwnerId
       );
 
       if (customer_id) {
@@ -2707,8 +2801,8 @@ const listDocuments =
      */
 
     if (
-      !doc_type ||
-      doc_type === "quotation"
+      (!doc_type || doc_type === "quotation") &&
+      canViewQuotations
     ) {
       let quotationSql = `
         SELECT
@@ -2743,7 +2837,7 @@ const listDocuments =
         " AND q.created_by = ?";
 
       quotationParams.push(
-        req.user.id
+        tenant.businessOwnerId
       );
 
       if (customer_id) {
@@ -2868,6 +2962,16 @@ const listMoneyReceipts =
       q,
     } = req.query;
 
+    const tenant = getTenantContext(req);
+
+    if (
+      tenant.isEmployee &&
+      !hasPermission(req.user, "money_receipts", "view") &&
+      !hasPermission(req.user, "receipts", "view")
+    ) {
+      return res.json({ success: true, count: 0, receipts: [] });
+    }
+
     let sql = `
       SELECT
         mr.*,
@@ -2892,7 +2996,7 @@ const listMoneyReceipts =
       " AND mr.created_by = ?";
 
     params.push(
-      req.user.id
+      tenant.businessOwnerId
     );
 
     if (customer_id) {
@@ -2983,6 +3087,8 @@ const getDocument =
     const requestedType =
       req.query.doc_type;
 
+    const tenant = getTenantContext(req);
+
     let document;
     let items;
 
@@ -2996,6 +3102,13 @@ const getDocument =
       requestedType ===
       "quotation"
     ) {
+      if (tenant.isEmployee && !hasPermission(req.user, "quotations", "view")) {
+        throw new ApiError(
+          403,
+          "Access denied: you do not have permission to view quotations."
+        );
+      }
+
       const [rows] =
         await pool.query(
           `SELECT
@@ -3022,11 +3135,12 @@ const getDocument =
       }
 
       if (
+        req.user.role !== "superadmin" &&
         Number(
           rows[0].created_by
         ) !==
           Number(
-            req.user.id
+            tenant.businessOwnerId
           )
       ) {
         throw new ApiError(
@@ -3059,6 +3173,13 @@ const getDocument =
      */
 
     else {
+      if (tenant.isEmployee && !hasPermission(req.user, "invoices", "view")) {
+        throw new ApiError(
+          403,
+          "Access denied: you do not have permission to view invoices."
+        );
+      }
+
       const [rows] =
         await pool.query(
           `SELECT
@@ -3083,11 +3204,12 @@ const getDocument =
       }
 
       if (
+        req.user.role !== "superadmin" &&
         Number(
           rows[0].created_by
         ) !==
           Number(
-            req.user.id
+            tenant.businessOwnerId
           )
       ) {
         throw new ApiError(
@@ -3145,6 +3267,19 @@ const getDocument =
 
 const getMoneyReceipt =
   asyncHandler(async (req, res) => {
+    const tenant = getTenantContext(req);
+
+    if (
+      tenant.isEmployee &&
+      !hasPermission(req.user, "money_receipts", "view") &&
+      !hasPermission(req.user, "receipts", "view")
+    ) {
+      throw new ApiError(
+        403,
+        "Access denied: you do not have permission to view money receipts."
+      );
+    }
+
     const [rows] =
       await pool.query(
         `SELECT
@@ -3168,11 +3303,12 @@ const getMoneyReceipt =
     }
 
     if (
+      req.user.role !== "superadmin" &&
       Number(
         rows[0].created_by
       ) !==
         Number(
-          req.user.id
+          tenant.businessOwnerId
         )
     ) {
       throw new ApiError(
@@ -3405,6 +3541,11 @@ const resendDocumentEmail =
 
 const deleteInvoice = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const tenant = getTenantContext(req);
+
+  if (tenant.isEmployee && !hasPermission(req.user, "invoices", "delete")) {
+    throw new ApiError(403, "Access denied: you do not have permission to delete invoices.");
+  }
 
   const [rows] = await pool.query(
     "SELECT * FROM invoices WHERE id = ? AND doc_type = 'invoice'",
@@ -3419,7 +3560,7 @@ const deleteInvoice = asyncHandler(async (req, res) => {
 
   if (
     req.user.role !== "superadmin" &&
-    Number(invoice.created_by) !== Number(req.user.id)
+    Number(invoice.created_by) !== Number(tenant.businessOwnerId)
   ) {
     throw new ApiError(403, "You are not allowed to delete this invoice.");
   }
@@ -3474,6 +3615,24 @@ const deleteInvoice = asyncHandler(async (req, res) => {
     }
   }
 
+  try {
+    await logAuditEvent({
+      actorId: tenant.actorId,
+      actorRole: tenant.actorRole,
+      action: "DELETE_INVOICE",
+      targetType: "invoice",
+      targetId: id,
+      details: {
+        invoice_number: invoice.invoice_number,
+        total_amount: invoice.total_amount,
+        recipient: invoice.to_name,
+      },
+      ipAddress: req.ip || null,
+    });
+  } catch (auditErr) {
+    console.warn("Failed to record delete invoice audit:", auditErr.message);
+  }
+
   res.json({
     success: true,
     message: "Invoice deleted successfully.",
@@ -3488,6 +3647,11 @@ const deleteInvoice = asyncHandler(async (req, res) => {
 
 const deleteQuotation = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const tenant = getTenantContext(req);
+
+  if (tenant.isEmployee && !hasPermission(req.user, "quotations", "delete")) {
+    throw new ApiError(403, "Access denied: you do not have permission to delete quotations.");
+  }
 
   const [rows] = await pool.query(
     "SELECT * FROM quotations WHERE id = ?",
@@ -3502,7 +3666,7 @@ const deleteQuotation = asyncHandler(async (req, res) => {
 
   if (
     req.user.role !== "superadmin" &&
-    Number(quotation.created_by) !== Number(req.user.id)
+    Number(quotation.created_by) !== Number(tenant.businessOwnerId)
   ) {
     throw new ApiError(403, "You are not allowed to delete this quotation.");
   }
@@ -3520,6 +3684,24 @@ const deleteQuotation = asyncHandler(async (req, res) => {
     } catch (err) {
       console.warn("Could not remove quotation PDF file:", err.message);
     }
+  }
+
+  try {
+    await logAuditEvent({
+      actorId: tenant.actorId,
+      actorRole: tenant.actorRole,
+      action: "DELETE_QUOTATION",
+      targetType: "quotation",
+      targetId: id,
+      details: {
+        quotation_number: quotation.quotation_number,
+        total_amount: quotation.total_amount,
+        recipient: quotation.to_name,
+      },
+      ipAddress: req.ip || null,
+    });
+  } catch (auditErr) {
+    console.warn("Failed to record delete quotation audit:", auditErr.message);
   }
 
   res.json({
@@ -3573,6 +3755,7 @@ const deleteDocument = asyncHandler(async (req, res) => {
 const updateDocument = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const body = req.body || {};
+  const tenant = getTenantContext(req);
 
   // Check if target is invoice or quotation
   let isQuotation = body.doc_type === "quotation" || req.query.doc_type === "quotation";
@@ -3586,8 +3769,19 @@ const updateDocument = asyncHandler(async (req, res) => {
     }
   }
 
-  const user = await getUserProfile(req.user.id);
-  const customer = await getCustomer(body.customer_id, req.user.id);
+  const targetModule = isQuotation ? "quotations" : "invoices";
+  if (tenant.isEmployee && !hasPermission(req.user, targetModule, "edit")) {
+    throw new ApiError(403, `Access denied: you do not have permission to edit ${targetModule}.`);
+  }
+
+  if (body.customer_id && tenant.isEmployee) {
+    if (!hasPermission(req.user, "customers", "view")) {
+      throw new ApiError(403, "Access denied: you do not have permission to access the customer directory. Please enter recipient details manually.");
+    }
+  }
+
+  const user = await getUserProfile(tenant.businessOwnerId);
+  const customer = body.customer_id ? await getCustomer(body.customer_id, tenant.businessOwnerId) : null;
   const manualCustomer = body.manual_customer || {};
 
   const customerForDocument = customer || {
@@ -3611,8 +3805,8 @@ const updateDocument = asyncHandler(async (req, res) => {
   };
 
   const bank = body.bank_account_id
-    ? await getBankAccount(body.bank_account_id, req.user.id)
-    : await getDefaultBankAccount(req.user.id);
+    ? await getBankAccount(body.bank_account_id, tenant.businessOwnerId)
+    : await getDefaultBankAccount(tenant.businessOwnerId);
 
   const documentDate = body.invoice_date ? new Date(body.invoice_date) : new Date();
   if (Number.isNaN(documentDate.getTime())) {
@@ -3702,7 +3896,7 @@ const updateDocument = asyncHandler(async (req, res) => {
       const [qRows] = await conn.query("SELECT * FROM quotations WHERE id = ? FOR UPDATE", [id]);
       if (!qRows.length) throw new ApiError(404, "Quotation not found.");
       const quotation = qRows[0];
-      if (req.user.role !== "superadmin" && Number(quotation.created_by) !== Number(req.user.id)) {
+      if (req.user.role !== "superadmin" && Number(quotation.created_by) !== Number(tenant.businessOwnerId)) {
         throw new ApiError(403, "Not allowed to edit this quotation.");
       }
 
@@ -3727,7 +3921,7 @@ const updateDocument = asyncHandler(async (req, res) => {
           customerSnapshot.to_phone, customerSnapshot.to_gstin, customerSnapshot.to_pan,
           customerSnapshot.to_billing_state, customerSnapshot.to_billing_district, customerSnapshot.to_billing_city, customerSnapshot.to_billing_pincode,
           customerSnapshot.to_shipping_state, customerSnapshot.to_shipping_district, customerSnapshot.to_shipping_city, customerSnapshot.to_shipping_pincode,
-          id, req.user.id,
+          id, tenant.businessOwnerId,
         ]
       );
 
@@ -3736,11 +3930,11 @@ const updateDocument = asyncHandler(async (req, res) => {
         if (item.item_type !== "service") {
           let stockRow = null;
           if (item.product_id) {
-            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?", [item.product_id, req.user.id]);
+            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?", [item.product_id, tenant.businessOwnerId]);
             if (rows.length) stockRow = rows[0];
           }
           if (!stockRow && item.product_name) {
-            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?", [item.product_name, req.user.id]);
+            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?", [item.product_name, tenant.businessOwnerId]);
             if (rows.length) stockRow = rows[0];
           }
           if (!stockRow) {
@@ -3789,7 +3983,7 @@ const updateDocument = asyncHandler(async (req, res) => {
       const [invRows] = await conn.query("SELECT * FROM invoices WHERE id = ? AND doc_type = 'invoice' FOR UPDATE", [id]);
       if (!invRows.length) throw new ApiError(404, "Invoice not found.");
       const invoice = invRows[0];
-      if (req.user.role !== "superadmin" && Number(invoice.created_by) !== Number(req.user.id)) {
+      if (req.user.role !== "superadmin" && Number(invoice.created_by) !== Number(tenant.businessOwnerId)) {
         throw new ApiError(403, "Not allowed to edit this invoice.");
       }
 
@@ -3814,13 +4008,13 @@ const updateDocument = asyncHandler(async (req, res) => {
       for (const item of calculatedItems) {
         const reqQty = cleanNumber(item.quantity, 1);
         if (item.item_type !== "service" && item.product_id) {
-          const [stRows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE", [item.product_id, req.user.id]);
+          const [stRows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE", [item.product_id, tenant.businessOwnerId]);
           if (stRows.length) {
             const avail = Number(stRows[0].quantity || 0);
             if (reqQty > avail) {
               throw new ApiError(400, `Insufficient stock for "${stRows[0].product_name}". Available: ${avail}.`);
             }
-            await conn.query("UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?", [reqQty, item.product_id, req.user.id]);
+            await conn.query("UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?", [reqQty, item.product_id, tenant.businessOwnerId]);
           }
         }
 
@@ -3860,7 +4054,7 @@ const updateDocument = asyncHandler(async (req, res) => {
           customerSnapshot.to_shipping_state, customerSnapshot.to_shipping_district, customerSnapshot.to_shipping_city, customerSnapshot.to_shipping_pincode,
           bankSnapshot.bank_name, bankSnapshot.bank_branch, bankSnapshot.bank_account_holder_name,
           bankSnapshot.bank_account_number, bankSnapshot.bank_account_type, bankSnapshot.bank_ifsc_code,
-          id, req.user.id,
+          id, tenant.businessOwnerId,
         ]
       );
 
@@ -3942,6 +4136,25 @@ const updateDocument = asyncHandler(async (req, res) => {
     console.error("PDF regeneration error:", pdfErr);
   }
 
+  try {
+    await logAuditEvent({
+      actorId: tenant.actorId,
+      actorRole: tenant.actorRole,
+      action: isQuotation ? "UPDATE_QUOTATION" : "UPDATE_INVOICE",
+      targetType: isQuotation ? "quotation" : "invoice",
+      targetId: id,
+      details: {
+        document_number: isQuotation ? updatedDoc.quotation_number : updatedDoc.invoice_number,
+        recipient: customerSnapshot.to_name,
+        total_amount: totalAmount,
+        pdf_path: updatedDoc.pdf_path,
+      },
+      ipAddress: req.ip || null,
+    });
+  } catch (auditErr) {
+    console.warn("Failed to record document update audit:", auditErr.message);
+  }
+
   res.json({
     success: true,
     message: isQuotation ? "Quotation updated successfully." : "Invoice updated successfully.",
@@ -3961,21 +4174,32 @@ const updateDocument = asyncHandler(async (req, res) => {
 const updateMoneyReceipt = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const body = req.body || {};
+  const tenant = getTenantContext(req);
+
+  if (
+    tenant.isEmployee &&
+    !hasPermission(req.user, "money_receipts", "edit") &&
+    !hasPermission(req.user, "receipts", "edit")
+  ) {
+    throw new ApiError(403, "Access denied: you do not have permission to edit money receipts.");
+  }
 
   const [existingRows] = await pool.query(
     "SELECT * FROM money_receipts WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, tenant.businessOwnerId]
   );
   if (!existingRows.length) {
     throw new ApiError(404, "Money receipt not found.");
   }
 
   const existingReceipt = existingRows[0];
-  const user = await getUserProfile(req.user.id);
-  const customer = await getCustomer(body.customer_id || existingReceipt.customer_id, req.user.id);
+  const user = await getUserProfile(tenant.businessOwnerId);
+  const customer = (body.customer_id || existingReceipt.customer_id)
+    ? await getCustomer(body.customer_id || existingReceipt.customer_id, tenant.businessOwnerId)
+    : null;
   const bank = body.bank_account_id
-    ? await getBankAccount(body.bank_account_id, req.user.id)
-    : (existingReceipt.bank_account_id ? await getBankAccount(existingReceipt.bank_account_id, req.user.id) : null);
+    ? await getBankAccount(body.bank_account_id, tenant.businessOwnerId)
+    : (existingReceipt.bank_account_id ? await getBankAccount(existingReceipt.bank_account_id, tenant.businessOwnerId) : null);
 
   const receiptDate = body.receipt_date ? new Date(body.receipt_date) : new Date(existingReceipt.receipt_date);
   const amountReceived = body.amount_received !== undefined ? roundMoney(body.amount_received) : Number(existingReceipt.amount_received);
@@ -4021,7 +4245,7 @@ const updateMoneyReceipt = asyncHandler(async (req, res) => {
         bank?.account_holder_name || null, bank?.account_number || null, bank?.ifsc_code || null,
         body.description !== undefined ? body.description : existingReceipt.description,
         body.notes !== undefined ? body.notes : existingReceipt.notes,
-        id, req.user.id,
+        id, tenant.businessOwnerId,
       ]
     );
 
@@ -4085,6 +4309,25 @@ const updateMoneyReceipt = asyncHandler(async (req, res) => {
     console.error("Money receipt PDF regeneration error:", pdfErr);
   }
 
+  try {
+    await logAuditEvent({
+      actorId: tenant.actorId,
+      actorRole: tenant.actorRole,
+      action: "UPDATE_RECEIPT",
+      targetType: "receipt",
+      targetId: id,
+      details: {
+        receipt_number: receipt.receipt_number,
+        amount_received: receipt.amount_received,
+        recipient: receipt.received_from_name,
+        pdf_path: receipt.pdf_path,
+      },
+      ipAddress: req.ip || null,
+    });
+  } catch (auditErr) {
+    console.warn("Failed to record money receipt update audit:", auditErr.message);
+  }
+
   res.json({
     success: true,
     message: "Money receipt updated successfully.",
@@ -4099,6 +4342,15 @@ const updateMoneyReceipt = asyncHandler(async (req, res) => {
  */
 const deleteMoneyReceipt = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const tenant = getTenantContext(req);
+
+  if (
+    tenant.isEmployee &&
+    !hasPermission(req.user, "money_receipts", "delete") &&
+    !hasPermission(req.user, "receipts", "delete")
+  ) {
+    throw new ApiError(403, "Access denied: you do not have permission to delete money receipts.");
+  }
 
   const [rows] = await pool.query(
     "SELECT * FROM money_receipts WHERE id = ?",
@@ -4113,7 +4365,7 @@ const deleteMoneyReceipt = asyncHandler(async (req, res) => {
 
   if (
     req.user.role !== "superadmin" &&
-    Number(receipt.created_by) !== Number(req.user.id)
+    Number(receipt.created_by) !== Number(tenant.businessOwnerId)
   ) {
     throw new ApiError(403, "You are not allowed to delete this money receipt.");
   }
@@ -4165,6 +4417,24 @@ const deleteMoneyReceipt = asyncHandler(async (req, res) => {
     } catch (err) {
       console.warn("Could not remove money receipt PDF file:", err.message);
     }
+  }
+
+  try {
+    await logAuditEvent({
+      actorId: tenant.actorId,
+      actorRole: tenant.actorRole,
+      action: "DELETE_RECEIPT",
+      targetType: "receipt",
+      targetId: id,
+      details: {
+        receipt_number: receipt.receipt_number,
+        amount_received: receipt.amount_received,
+        recipient: receipt.received_from_name,
+      },
+      ipAddress: req.ip || null,
+    });
+  } catch (auditErr) {
+    console.warn("Failed to record delete money receipt audit:", auditErr.message);
   }
 
   res.json({

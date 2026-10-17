@@ -1,6 +1,7 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 const getDateBoundaries = (period) => {
   const now = new Date();
@@ -34,6 +35,12 @@ const getDateBoundaries = (period) => {
 //   - khata_entries (debits, product sale credits, manual credits) -> type: 'debit' or 'credit'
 //   - customer_dues -> type: 'due'
 const getKhata = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "view")) {
+    throw new ApiError(403, "You do not have permission to view Khata.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   let { customer_id, from, to, start_date, startDate, end_date, endDate, type, period, timeframe, range } = req.query;
 
   from = from || start_date || startDate;
@@ -71,7 +78,7 @@ const getKhata = asyncHandler(async (req, res) => {
     LEFT JOIN customers cu ON cu.id = c.customer_id
     WHERE c.created_by = ?
   `;
-  const salesParams = [req.user.id];
+  const salesParams = [businessOwnerId];
   if (customer_id) {
     salesSql += " AND c.customer_id = ?";
     salesParams.push(customer_id);
@@ -111,7 +118,7 @@ const getKhata = asyncHandler(async (req, res) => {
     LEFT JOIN stock s ON s.id = ke.product_id
     WHERE ke.created_by = ?
   `;
-  const khataParams = [req.user.id];
+  const khataParams = [businessOwnerId];
   if (customer_id) {
     khataSql += " AND ke.customer_id = ?";
     khataParams.push(customer_id);
@@ -152,7 +159,7 @@ const getKhata = asyncHandler(async (req, res) => {
     LEFT JOIN stock s ON s.id = cd.product_id
     WHERE cd.created_by = ?
   `;
-  const duesParams = [req.user.id];
+  const duesParams = [businessOwnerId];
   if (customer_id) {
     duesSql += " AND cd.customer_id = ?";
     duesParams.push(customer_id);
@@ -325,7 +332,11 @@ const getKhata = asyncHandler(async (req, res) => {
 // GET /api/khata/dashboard & GET /api/khata/summary
 // Dedicated dashboard totals for Today, This Week, This Month, This Year, All Time
 const getKhataDashboard = asyncHandler(async (req, res) => {
-  const userId = req.user.id;
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "view")) {
+    throw new ApiError(403, "You do not have permission to view Khata dashboard.");
+  }
+  const userId = tenant.businessOwnerId;
 
   const calculateForRange = async (fromDate, toDate) => {
     let salesQuery = "SELECT COALESCE(SUM(amount), 0) AS total FROM collections WHERE created_by = ?";
@@ -602,6 +613,12 @@ const resolveKhataProduct = async (conn, itemOrBody, userId) => {
 // Creates a normal Debit entry in Khata (Normal Debit only, NO Sale of Product, NO stock deduction)
 // Auto-creates a Paid Out payment (Khata ↔ Payments synchronization)
 const addKhataDebit = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "create")) {
+    throw new ApiError(403, "You do not have permission to create Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const {
     amount,
     customer_id,
@@ -640,7 +657,7 @@ const addKhataDebit = asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    const linkedCustomerId = await resolveKhataCustomer(conn, req.body, req.user.id);
+    const linkedCustomerId = await resolveKhataCustomer(conn, req.body, businessOwnerId);
     if (!linkedCustomerId && (!rawManualParty || !String(rawManualParty).trim() || String(rawManualParty).trim().toLowerCase() === "walk-in")) {
       throw new ApiError(400, "Customer / Party name is required for a debit entry.");
     }
@@ -668,7 +685,7 @@ const addKhataDebit = asyncHandler(async (req, res) => {
         finalDate,
         finalTime,
         mode,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
@@ -693,7 +710,7 @@ const addKhataDebit = asyncHandler(async (req, res) => {
         paymentModeEnum,
         finalDate,
         khataId,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
@@ -711,7 +728,7 @@ const addKhataDebit = asyncHandler(async (req, res) => {
        FROM khata_entries ke
        LEFT JOIN customers cu ON cu.id = ke.customer_id
        WHERE ke.id = ? AND ke.created_by = ?`,
-      [khataId, req.user.id]
+      [khataId, businessOwnerId]
     );
 
     const savedEntry = {
@@ -725,6 +742,13 @@ const addKhataDebit = asyncHandler(async (req, res) => {
       is_due: false,
       signed_amount: -Number(rows[0].amount || 0),
     };
+
+    await logAuditEvent(req, {
+      action: "CREATE_KHATA_ENTRY",
+      targetType: "khata_entry",
+      targetId: khataId,
+      details: `Created Khata debit entry of ₹${finalAmount} for ${customerName || rawManualParty || "party"} (ID: ${khataId})`,
+    });
 
     res.status(201).json({
       success: true,
@@ -745,6 +769,12 @@ const addKhataDebit = asyncHandler(async (req, res) => {
 // Creates a Credit entry in Khata (Sale of Product on Credit with multiple items, FOR UPDATE lock & instant stock deduction)
 // Auto-creates Money Received payment for Credit Product Sale (Khata ↔ Payments synchronization)
 const addKhataCredit = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "create")) {
+    throw new ApiError(403, "You do not have permission to create Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const {
     amount,
     customer_id,
@@ -790,7 +820,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
 
     // Process items stock validation and deduction
     for (const it of rawItems) {
-      const stockItem = await resolveKhataProduct(conn, it, req.user.id);
+      const stockItem = await resolveKhataProduct(conn, it, businessOwnerId);
       if (!stockItem) {
         if (it.product_id || it.product) {
           throw new ApiError(404, "Product not found in inventory.");
@@ -816,7 +846,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
       // Deduct inventory quantity immediately inside transaction
       await conn.query(
         "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-        [reqQty, stockItem.id, req.user.id]
+        [reqQty, stockItem.id, businessOwnerId]
       );
 
       processedItems.push({
@@ -843,7 +873,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
     }
 
     // Credit sale without customer_id is allowed → treat as Walk-in
-    const linkedCustomerId = await resolveKhataCustomer(conn, req.body, req.user.id);
+    const linkedCustomerId = await resolveKhataCustomer(conn, req.body, businessOwnerId);
 
     const rawDate = entry_date || date || new Date().toISOString().split("T")[0];
     const finalDate = String(rawDate).slice(0, 10);
@@ -873,7 +903,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
         linkedUnitPrice,
         itemsJson,
         processedItems.length > 0 ? 1 : 0,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
@@ -904,7 +934,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
           linkedQuantity,
           linkedUnitPrice,
           khataId,
-          req.user.id,
+          businessOwnerId,
         ]
       );
 
@@ -924,7 +954,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
        LEFT JOIN customers cu ON cu.id = ke.customer_id
        LEFT JOIN stock s ON s.id = ke.product_id
        WHERE ke.id = ? AND ke.created_by = ?`,
-      [khataId, req.user.id]
+      [khataId, businessOwnerId]
     );
 
     const savedEntry = {
@@ -939,6 +969,13 @@ const addKhataCredit = asyncHandler(async (req, res) => {
       is_due: false,
       signed_amount: Number(rows[0].amount || 0),
     };
+
+    await logAuditEvent(req, {
+      action: "CREATE_KHATA_ENTRY",
+      targetType: "khata_entry",
+      targetId: khataId,
+      details: `Created Khata credit entry of ₹${finalAmount} (ID: ${khataId})`,
+    });
 
     res.status(201).json({
       success: true,
@@ -958,6 +995,12 @@ const addKhataCredit = asyncHandler(async (req, res) => {
 // POST /api/khata/due
 // Creates a Due entry in Khata (Due sale MUST require a customer_id; supports multiple items & stock deduction)
 const addKhataDue = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "create")) {
+    throw new ApiError(403, "You do not have permission to create Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const {
     customer_id,
     amount,
@@ -994,7 +1037,7 @@ const addKhataDue = asyncHandler(async (req, res) => {
 
     const [custRows] = await conn.query(
       "SELECT id, name FROM customers WHERE id = ? AND created_by = ?",
-      [rawCustomerId, req.user.id]
+      [rawCustomerId, businessOwnerId]
     );
     if (!custRows.length) {
       throw new ApiError(404, "Selected customer not found.");
@@ -1025,7 +1068,7 @@ const addKhataDue = asyncHandler(async (req, res) => {
     let itemsTotal = 0;
 
     for (const it of rawItems) {
-      const stockItem = await resolveKhataProduct(conn, it, req.user.id);
+      const stockItem = await resolveKhataProduct(conn, it, businessOwnerId);
       if (!stockItem) {
         if (it.product_id || it.product) {
           throw new ApiError(404, "Product not found in inventory.");
@@ -1050,7 +1093,7 @@ const addKhataDue = asyncHandler(async (req, res) => {
       // Deduct inventory quantity immediately inside transaction
       await conn.query(
         "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-        [reqQty, stockItem.id, req.user.id]
+        [reqQty, stockItem.id, businessOwnerId]
       );
 
       processedItems.push({
@@ -1106,13 +1149,13 @@ const addKhataDue = asyncHandler(async (req, res) => {
         linkedQuantity,
         linkedUnitPrice,
         itemsJson,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
     await conn.query(
       "UPDATE customers SET total_due = total_due + ? WHERE id = ? AND created_by = ?",
-      [finalAmount, linkedCustomerId, req.user.id]
+      [finalAmount, linkedCustomerId, businessOwnerId]
     );
 
     await conn.commit();
@@ -1123,7 +1166,7 @@ const addKhataDue = asyncHandler(async (req, res) => {
        LEFT JOIN customers cu ON cu.id = cd.customer_id
        LEFT JOIN stock s ON s.id = cd.product_id
        WHERE cd.id = ? AND cd.created_by = ?`,
-      [result.insertId, req.user.id]
+      [result.insertId, businessOwnerId]
     );
 
     const savedEntry = {
@@ -1138,6 +1181,13 @@ const addKhataDue = asyncHandler(async (req, res) => {
       is_credit: false,
       signed_amount: Number(rows[0].amount || 0),
     };
+
+    await logAuditEvent(req, {
+      action: "CREATE_KHATA_ENTRY",
+      targetType: "customer_due",
+      targetId: result.insertId,
+      details: `Created Khata due entry of ₹${finalAmount} for ${custRows[0].name || "customer"} (ID: ${result.insertId})`,
+    });
 
     res.status(201).json({
       success: true,
@@ -1172,6 +1222,12 @@ const addKhataEntry = asyncHandler(async (req, res, next) => {
 
 // GET /api/khata/dues
 const getKhataDues = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "view")) {
+    throw new ApiError(403, "You do not have permission to view Khata dues.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { customer_id, status } = req.query;
 
   let sql = `
@@ -1181,7 +1237,7 @@ const getKhataDues = asyncHandler(async (req, res) => {
     LEFT JOIN stock s ON s.id = cd.product_id
     WHERE cd.created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
 
   if (customer_id) {
     sql += " AND cd.customer_id = ?";
@@ -1207,6 +1263,12 @@ const getKhataDues = asyncHandler(async (req, res) => {
 // GET /api/khata/unlinked-debits
 // Lists Khata debit entries available to add to Payments
 const getUnlinkedKhataDebits = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "view")) {
+    throw new ApiError(403, "You do not have permission to view Khata debits.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const [rows] = await pool.query(
     `SELECT ke.*,
             cu.name AS customer_name,
@@ -1220,7 +1282,7 @@ const getUnlinkedKhataDebits = asyncHandler(async (req, res) => {
        AND ke.is_linked_to_payment = 0
        AND ke.is_skipped = 0
      ORDER BY ke.entry_date DESC, ke.id DESC`,
-    [req.user.id]
+    [businessOwnerId]
   );
 
   res.json({
@@ -1233,6 +1295,12 @@ const getUnlinkedKhataDebits = asyncHandler(async (req, res) => {
 // POST /api/khata/:id/link-payment
 // Explicitly links a selected Khata debit to a Payment and marks it as linked
 const linkKhataDebitToPayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "edit")) {
+    throw new ApiError(403, "You do not have permission to link Khata debit.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const { payment_mode } = req.body || {};
 
@@ -1245,7 +1313,7 @@ const linkKhataDebitToPayment = asyncHandler(async (req, res) => {
        FROM khata_entries ke
        LEFT JOIN customers cu ON cu.id = ke.customer_id
        WHERE ke.id = ? AND ke.created_by = ? FOR UPDATE`,
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (!rows.length) {
@@ -1278,7 +1346,7 @@ const linkKhataDebitToPayment = asyncHandler(async (req, res) => {
         debit.quantity || null,
         debit.unit_price || null,
         debit.id,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
@@ -1287,14 +1355,14 @@ const linkKhataDebitToPayment = asyncHandler(async (req, res) => {
     // Mark Khata debit as linked
     await conn.query(
       "UPDATE khata_entries SET is_linked_to_payment = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-      [paymentId, debit.id, req.user.id]
+      [paymentId, debit.id, businessOwnerId]
     );
 
     await conn.commit();
 
     const [paymentRows] = await pool.query(
       "SELECT * FROM payments WHERE id = ? AND created_by = ?",
-      [paymentId, req.user.id]
+      [paymentId, businessOwnerId]
     );
 
     res.status(201).json({
@@ -1313,10 +1381,16 @@ const linkKhataDebitToPayment = asyncHandler(async (req, res) => {
 
 // PATCH /api/khata/:id/skip
 const skipKhataDebit = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const [result] = await pool.query(
     "UPDATE khata_entries SET is_skipped = 1 WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   if (!result.affectedRows) {
     throw new ApiError(404, "Khata entry not found.");
@@ -1326,10 +1400,16 @@ const skipKhataDebit = asyncHandler(async (req, res) => {
 
 // PATCH /api/khata/:id/unskip
 const unskipKhataDebit = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const [result] = await pool.query(
     "UPDATE khata_entries SET is_skipped = 0 WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   if (!result.affectedRows) {
     throw new ApiError(404, "Khata entry not found.");
@@ -1340,6 +1420,12 @@ const unskipKhataDebit = asyncHandler(async (req, res) => {
 // PUT /api/khata/:id and PATCH /api/khata/:id
 // Edits a Khata entry (khata_entries or customer_dues) with stock restoration and linked payment sync
 const updateKhataEntry = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const {
     amount,
@@ -1375,14 +1461,14 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
           if (pId && q > 0) {
             await conn.query(
               "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
-              [q, pId, req.user.id]
+              [q, pId, businessOwnerId]
             );
           }
         }
       } else if (fallbackProdId && Number(fallbackQty || 0) > 0) {
         await conn.query(
           "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
-          [Number(fallbackQty), fallbackProdId, req.user.id]
+          [Number(fallbackQty), fallbackProdId, businessOwnerId]
         );
       }
     };
@@ -1390,7 +1476,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
     // 1. Check khata_entries
     const [keRows] = await conn.query(
       "SELECT * FROM khata_entries WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (keRows.length) {
@@ -1413,7 +1499,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
 
       let resolvedCustId = entry.customer_id;
       if (customer_id !== undefined || customer_name !== undefined) {
-        resolvedCustId = await resolveKhataCustomer(conn, req.body, req.user.id);
+        resolvedCustId = await resolveKhataCustomer(conn, req.body, businessOwnerId);
       }
 
       let updatedItemsJson = entry.items;
@@ -1437,7 +1523,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
             if (!pId) continue;
             const [stockRows] = await conn.query(
               "SELECT id, product_name, price, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
-              [pId, req.user.id]
+              [pId, businessOwnerId]
             );
             if (!stockRows.length) {
               throw new ApiError(404, `Product #${pId} not found in inventory.`);
@@ -1453,7 +1539,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
             }
             await conn.query(
               "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-              [newQty, pId, req.user.id]
+              [newQty, pId, businessOwnerId]
             );
             const unitPrice = Number(stockItem.price || 0);
             const lineTotal = unitPrice * newQty;
@@ -1499,7 +1585,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
           updatedItemsJson,
           mode,
           id,
-          req.user.id,
+          businessOwnerId,
         ]
       );
 
@@ -1522,7 +1608,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
             linkedUnitPrice,
             paymentId || 0,
             id,
-            req.user.id,
+            businessOwnerId,
           ]
         );
       }
@@ -1535,8 +1621,15 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
          LEFT JOIN customers cu ON cu.id = ke.customer_id
          LEFT JOIN stock s ON s.id = ke.product_id
          WHERE ke.id = ? AND ke.created_by = ?`,
-        [id, req.user.id]
+        [id, businessOwnerId]
       );
+
+      await logAuditEvent(req, {
+        action: "UPDATE_KHATA_ENTRY",
+        targetType: "khata_entry",
+        targetId: id,
+        details: `Updated Khata entry (ID: ${id})`,
+      });
 
       return res.json({
         success: true,
@@ -1548,7 +1641,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
     // 2. Check customer_dues
     const [dueRows] = await conn.query(
       "SELECT * FROM customer_dues WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (dueRows.length) {
@@ -1581,7 +1674,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
           if (!pId) continue;
           const [stockRows] = await conn.query(
             "SELECT id, product_name, price, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
-            [pId, req.user.id]
+            [pId, businessOwnerId]
           );
           if (!stockRows.length) {
             throw new ApiError(404, `Product #${pId} not found in inventory.`);
@@ -1597,7 +1690,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
           }
           await conn.query(
             "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-            [newQty, pId, req.user.id]
+            [newQty, pId, businessOwnerId]
           );
           const unitPrice = Number(stockItem.price || 0);
           const lineTotal = unitPrice * newQty;
@@ -1641,14 +1734,14 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
           linkedUnitPrice,
           updatedItemsJson,
           id,
-          req.user.id,
+          businessOwnerId,
         ]
       );
 
       if (amountDiff !== 0 && due.customer_id) {
         await conn.query(
           "UPDATE customers SET total_due = GREATEST(0, total_due + ?) WHERE id = ? AND created_by = ?",
-          [amountDiff, due.customer_id, req.user.id]
+          [amountDiff, due.customer_id, businessOwnerId]
         );
       }
 
@@ -1660,8 +1753,15 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
          LEFT JOIN customers cu ON cu.id = cd.customer_id
          LEFT JOIN stock s ON s.id = cd.product_id
          WHERE cd.id = ? AND cd.created_by = ?`,
-        [id, req.user.id]
+        [id, businessOwnerId]
       );
+
+      await logAuditEvent(req, {
+        action: "UPDATE_KHATA_ENTRY",
+        targetType: "customer_due",
+        targetId: id,
+        details: `Updated Customer due (ID: ${id})`,
+      });
 
       return res.json({
         success: true,
@@ -1682,6 +1782,11 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
 // DELETE /api/khata/:id
 // Deletes a Khata entry with stock restoration and linked payment sync
 const deleteKhataEntry = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "khata", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete Khata entries.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
   const { id } = req.params;
 
   const conn = await pool.getConnection();
@@ -1704,14 +1809,14 @@ const deleteKhataEntry = asyncHandler(async (req, res) => {
           if (pId && q > 0) {
             await conn.query(
               "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
-              [q, pId, req.user.id]
+              [q, pId, businessOwnerId]
             );
           }
         }
       } else if (fallbackProdId && Number(fallbackQty || 0) > 0) {
         await conn.query(
           "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
-          [Number(fallbackQty), fallbackProdId, req.user.id]
+          [Number(fallbackQty), fallbackProdId, businessOwnerId]
         );
       }
     };
@@ -1719,7 +1824,7 @@ const deleteKhataEntry = asyncHandler(async (req, res) => {
     // 1. Check khata_entries
     const [keRows] = await conn.query(
       "SELECT * FROM khata_entries WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (keRows.length) {
@@ -1732,13 +1837,25 @@ const deleteKhataEntry = asyncHandler(async (req, res) => {
       if (entry.payment_id || entry.is_linked_to_payment) {
         await conn.query(
           "DELETE FROM payments WHERE (id = ? OR khata_entry_id = ?) AND created_by = ?",
-          [entry.payment_id || 0, id, req.user.id]
+          [entry.payment_id || 0, id, businessOwnerId]
         );
       }
 
-      await conn.query("DELETE FROM khata_entries WHERE id = ? AND created_by = ?", [id, req.user.id]);
+      await conn.query("DELETE FROM khata_entries WHERE id = ? AND created_by = ?", [id, businessOwnerId]);
 
       await conn.commit();
+
+      await logAuditEvent(req, {
+        action: "DELETE_KHATA_ENTRY",
+        targetType: "khata_entry",
+        targetId: id,
+        details: {
+          deleted_type: "khata_entry",
+          entry_id: id,
+          customer_name: entry.customer_name || entry.party_name,
+          amount: entry.amount,
+        },
+      });
 
       return res.json({
         success: true,
@@ -1750,7 +1867,7 @@ const deleteKhataEntry = asyncHandler(async (req, res) => {
     // 2. Check customer_dues
     const [dueRows] = await conn.query(
       "SELECT * FROM customer_dues WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (dueRows.length) {
@@ -1763,14 +1880,26 @@ const deleteKhataEntry = asyncHandler(async (req, res) => {
       if (due.customer_id && Number(due.remaining_amount) > 0) {
         await conn.query(
           "UPDATE customers SET total_due = GREATEST(0, total_due - ?) WHERE id = ? AND created_by = ?",
-          [Number(due.remaining_amount), due.customer_id, req.user.id]
+          [Number(due.remaining_amount), due.customer_id, businessOwnerId]
         );
       }
 
       await conn.query("DELETE FROM customer_due_allocations WHERE due_id = ?", [id]);
-      await conn.query("DELETE FROM customer_dues WHERE id = ? AND created_by = ?", [id, req.user.id]);
+      await conn.query("DELETE FROM customer_dues WHERE id = ? AND created_by = ?", [id, businessOwnerId]);
 
       await conn.commit();
+
+      await logAuditEvent(req, {
+        action: "DELETE_CUSTOMER_DUE",
+        targetType: "customer_due",
+        targetId: id,
+        details: {
+          deleted_type: "customer_due",
+          due_id: id,
+          customer_name: due.customer_name,
+          total_amount: due.total_amount,
+        },
+      });
 
       return res.json({
         success: true,
@@ -1790,13 +1919,23 @@ const deleteKhataEntry = asyncHandler(async (req, res) => {
 
 // GET /api/khata/search-customers
 const searchKhataCustomers = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "view")) {
+    return res.status(403).json({
+      success: false,
+      message: "You do not have permission to view customer list or customer details.",
+      customers: [],
+      restricted: true,
+    });
+  }
+  const businessOwnerId = tenant.businessOwnerId;
   const keyword = String(req.query.search || req.query.query || req.query.q || "").trim();
   let sql = `
     SELECT id, name, display_name, phone, email, business_name, total_due
     FROM customers
     WHERE created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
   if (keyword) {
     sql += " AND (name LIKE ? OR display_name LIKE ? OR phone LIKE ? OR business_name LIKE ? OR email LIKE ?)";
     params.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`);
@@ -1819,6 +1958,8 @@ const searchKhataCustomers = asyncHandler(async (req, res) => {
 
 // GET /api/khata/search-products
 const searchKhataProducts = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
   const keyword = String(req.query.search || req.query.query || req.query.q || "").trim();
   const type = String(req.query.type || req.query.item_type || "").trim().toLowerCase();
   let sql = `
@@ -1826,7 +1967,7 @@ const searchKhataProducts = asyncHandler(async (req, res) => {
     FROM stock
     WHERE created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
   if (type && type !== "all") {
     if (type === "goods") {
       sql += " AND (item_type = 'goods' OR type = 'goods' OR (type IS NULL AND item_type IS NULL))";
