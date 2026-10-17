@@ -2,6 +2,7 @@ const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { relativeUploadPath } = require("../utils/upload");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 const extractUploadedFile = (req, aliases) => {
   if (!req) return null;
@@ -66,6 +67,12 @@ const enrichTrip = (trip) => {
 // multipart/form-data. Supports outgoing and incoming trips.
 // Supports uploaded e-way bill file, vehicle photo, trip photo, loading and unloading photos.
 const createTrip = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "create")) {
+    throw new ApiError(403, "You do not have permission to create vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const {
     trip_type,
     vehicle_number,
@@ -187,7 +194,7 @@ const createTrip = asyncHandler(async (req, res) => {
       departure_time || null,
       reach_time || null,
       finalInvoiceId,
-      req.user.id,
+      businessOwnerId,
     ]
   );
   const tripId = result.insertId;
@@ -196,7 +203,7 @@ const createTrip = asyncHandler(async (req, res) => {
   if (finalEwayBillNumber || waybill_number) {
     await pool.query(
       "UPDATE vehicle_trips SET waybill_number = COALESCE(waybill_number, ?) WHERE id = ? AND created_by = ?",
-      [finalEwayBillNumber || waybill_number, tripId, req.user.id]
+      [finalEwayBillNumber || waybill_number, tripId, businessOwnerId]
     );
   }
 
@@ -205,17 +212,31 @@ const createTrip = asyncHandler(async (req, res) => {
      FROM vehicle_trips v
      LEFT JOIN invoices i ON i.id = v.invoice_id
      WHERE v.id = ? AND v.created_by = ?`,
-    [tripId, req.user.id]
+    [tripId, businessOwnerId]
   );
+
+  await logAuditEvent(req, {
+    action: "CREATE_TRIP",
+    targetType: "vehicle_trip",
+    targetId: tripId,
+    details: `Created ${finalTripType} vehicle trip for ${vehicle_number || "Vehicle"} (ID: ${tripId})`,
+  });
+
   res.status(201).json({ success: true, trip: enrichTrip(finalRows[0]) });
 });
 
 // PUT /api/vehicles/:id or PATCH /api/vehicles/:id
 const updateTrip = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const [existing] = await pool.query(
     "SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   if (!existing.length) throw new ApiError(404, "Trip not found.");
 
@@ -381,7 +402,7 @@ const updateTrip = asyncHandler(async (req, res) => {
       vehiclePhotoPath,
       tripPhotoPath,
       id,
-      req.user.id,
+      businessOwnerId,
     ]
   );
 
@@ -390,52 +411,85 @@ const updateTrip = asyncHandler(async (req, res) => {
      FROM vehicle_trips v
      LEFT JOIN invoices i ON i.id = v.invoice_id
      WHERE v.id = ? AND v.created_by = ?`,
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
+
+  await logAuditEvent(req, {
+    action: "UPDATE_TRIP",
+    targetType: "vehicle_trip",
+    targetId: id,
+    details: `Updated vehicle trip for ${updated[0]?.vehicle_number || "Vehicle"} (ID: ${id})`,
+  });
+
   res.json({ success: true, message: "Vehicle trip updated successfully.", trip: enrichTrip(updated[0]) });
 });
 
 // DELETE /api/vehicles/:id
 const deleteTrip = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const [existing] = await pool.query(
     "SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   if (!existing.length) throw new ApiError(404, "Trip not found.");
 
   await pool.query(
     "DELETE FROM vehicle_trips WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
+
+  await logAuditEvent(req, {
+    action: "DELETE_TRIP",
+    targetType: "vehicle_trip",
+    targetId: id,
+    details: `Deleted vehicle trip for ${existing[0]?.vehicle_number || "Vehicle"} (ID: ${id})`,
+  });
 
   res.json({ success: true, message: "Vehicle trip deleted successfully." });
 });
 
 // PATCH /api/vehicles/:id/start-trip
 const startTrip = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
-  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, req.user.id]);
+  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, businessOwnerId]);
   if (!rows.length) throw new ApiError(404, "Trip not found.");
 
   await pool.query(
     "UPDATE vehicle_trips SET journey_start_time = NOW(), departure_time = COALESCE(departure_time, NOW()), status = 'in_transit' WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   const [updated] = await pool.query(
     `SELECT v.*, i.invoice_number, i.total_amount AS invoice_total, i.invoice_date, i.to_name AS invoice_customer_name
      FROM vehicle_trips v
      LEFT JOIN invoices i ON i.id = v.invoice_id
      WHERE v.id = ? AND v.created_by = ?`,
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   res.json({ success: true, trip: enrichTrip(updated[0]) });
 });
 
 // PATCH /api/vehicles/:id/reached
 const markReached = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
-  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, req.user.id]);
+  const [rows] = await pool.query("SELECT * FROM vehicle_trips WHERE id = ? AND created_by = ?", [id, businessOwnerId]);
   if (!rows.length) throw new ApiError(404, "Trip not found.");
 
   const unloadingPhotoFile = extractUploadedFile(req, [
@@ -457,20 +511,26 @@ const markReached = asyncHandler(async (req, res) => {
 
   await pool.query(
     "UPDATE vehicle_trips SET journey_end_time = NOW(), reach_time = COALESCE(reach_time, NOW()), status = 'completed', unloading_photo = COALESCE(?, unloading_photo) WHERE id = ? AND created_by = ?",
-    [unloadingPhotoPath, id, req.user.id]
+    [unloadingPhotoPath, id, businessOwnerId]
   );
   const [updated] = await pool.query(
     `SELECT v.*, i.invoice_number, i.total_amount AS invoice_total, i.invoice_date, i.to_name AS invoice_customer_name
      FROM vehicle_trips v
      LEFT JOIN invoices i ON i.id = v.invoice_id
      WHERE v.id = ? AND v.created_by = ?`,
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
   res.json({ success: true, trip: enrichTrip(updated[0]) });
 });
 
 // GET /api/vehicles?trip_type=&status=&vehicle_number=
 const listTrips = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "view")) {
+    throw new ApiError(403, "You do not have permission to view vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { trip_type, status, vehicle_number } = req.query;
   let sql = `
     SELECT v.*, i.invoice_number, i.total_amount AS invoice_total, i.invoice_date, i.to_name AS invoice_customer_name, u.name AS added_by
@@ -479,7 +539,7 @@ const listTrips = asyncHandler(async (req, res) => {
     LEFT JOIN users u ON u.id = v.created_by
     WHERE v.created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
   if (trip_type) {
     sql += " AND v.trip_type = ?";
     params.push(trip_type);
@@ -507,12 +567,18 @@ const listTrips = asyncHandler(async (req, res) => {
 
 // GET /api/vehicles/invoices
 const getAvailableInvoices = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "view") && !hasPermission(req.user, "invoices", "view")) {
+    throw new ApiError(403, "You do not have permission to view invoices.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const [rows] = await pool.query(
     `SELECT id, invoice_number, total_amount, invoice_date, to_name, to_phone, created_at
      FROM invoices
      WHERE created_by = ?
      ORDER BY invoice_date DESC, id DESC`,
-    [req.user.id]
+    [businessOwnerId]
   );
   res.json({
     success: true,
@@ -524,12 +590,18 @@ const getAvailableInvoices = asyncHandler(async (req, res) => {
 
 // GET /api/vehicles/:id
 const getTrip = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "vehicles", "view")) {
+    throw new ApiError(403, "You do not have permission to view vehicle trips.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const [rows] = await pool.query(
     `SELECT v.*, i.invoice_number, i.total_amount AS invoice_total, i.invoice_date, i.to_name AS invoice_customer_name
      FROM vehicle_trips v
      LEFT JOIN invoices i ON i.id = v.invoice_id
      WHERE v.id = ? AND v.created_by = ?`,
-    [req.params.id, req.user.id]
+    [req.params.id, businessOwnerId]
   );
   if (!rows.length) throw new ApiError(404, "Trip not found.");
   res.json({ success: true, trip: enrichTrip(rows[0]) });

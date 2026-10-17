@@ -1,6 +1,7 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 const VALID_PURPOSES = [
   "Due Received",
@@ -109,6 +110,12 @@ const normalizePaymentMode = (mode) => {
 
 // POST /api/payments
 const addPayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "create")) {
+    throw new ApiError(403, "You do not have permission to create payments.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const {
     payment_category,
     party_name,
@@ -158,7 +165,7 @@ const addPayment = asyncHandler(async (req, res) => {
     if (customer_id) {
       const [custRows] = await conn.query(
         "SELECT id, name, phone, email, total_due FROM customers WHERE id = ? AND created_by = ?",
-        [customer_id, req.user.id]
+        [customer_id, businessOwnerId]
       );
       if (custRows.length) {
         linkedCustomerId = customer_id;
@@ -181,7 +188,7 @@ const addPayment = asyncHandler(async (req, res) => {
     if (rawKhataEntryId) {
       const [existingKhataPay] = await conn.query(
         "SELECT * FROM payments WHERE khata_entry_id = ? AND created_by = ? LIMIT 1",
-        [rawKhataEntryId, req.user.id]
+        [rawKhataEntryId, businessOwnerId]
       );
       if (existingKhataPay.length > 0) {
         await conn.commit();
@@ -223,7 +230,7 @@ const addPayment = asyncHandler(async (req, res) => {
       if (candidateBillNumber) {
         const [matchedBills] = await conn.query(
           "SELECT id FROM purchase_bills WHERE (bill_number = ? OR id = ?) AND created_by = ? LIMIT 1",
-          [String(candidateBillNumber).trim(), Number(candidateBillNumber) || 0, req.user.id]
+          [String(candidateBillNumber).trim(), Number(candidateBillNumber) || 0, businessOwnerId]
         );
         if (matchedBills.length) {
           targetBillId = matchedBills[0].id;
@@ -236,7 +243,7 @@ const addPayment = asyncHandler(async (req, res) => {
       if (vendorName) {
         const [recentBills] = await conn.query(
           "SELECT id FROM purchase_bills WHERE created_by = ? AND vendor_name = ? ORDER BY id DESC LIMIT 1",
-          [req.user.id, String(vendorName).trim()]
+          [businessOwnerId, String(vendorName).trim()]
         );
         if (recentBills.length) {
           targetBillId = recentBills[0].id;
@@ -252,7 +259,7 @@ const addPayment = asyncHandler(async (req, res) => {
 
       const [pbRows] = await conn.query(
         "SELECT * FROM purchase_bills WHERE id = ? AND created_by = ? FOR UPDATE",
-        [targetBillId, req.user.id]
+        [targetBillId, businessOwnerId]
       );
 
       if (!pbRows.length) {
@@ -298,7 +305,7 @@ const addPayment = asyncHandler(async (req, res) => {
           pb.bill_number || "",
           `Purchase Bill ${pb.bill_number}`,
           pb.bill_number || "",
-          req.user.id,
+          businessOwnerId,
         ]
       );
 
@@ -325,7 +332,7 @@ const addPayment = asyncHandler(async (req, res) => {
             resolvedDate,
             pb.id,
             primaryPayment.id,
-            req.user.id,
+            businessOwnerId,
           ]
         );
 
@@ -333,20 +340,20 @@ const addPayment = asyncHandler(async (req, res) => {
           const extraIds = existingPbPayments.slice(1).map((p) => p.id);
           await conn.query(
             "UPDATE payments SET purchase_bill_id = ?, payment_category = 'paid_by_business' WHERE id IN (?) AND created_by = ?",
-            [pb.id, extraIds, req.user.id]
+            [pb.id, extraIds, businessOwnerId]
           );
         }
 
         await conn.query(
           "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-          [primaryPayment.id, pb.id, req.user.id]
+          [primaryPayment.id, pb.id, businessOwnerId]
         );
 
         await conn.commit();
 
         const [updatedRows] = await pool.query(
           "SELECT * FROM payments WHERE id = ? AND created_by = ?",
-          [primaryPayment.id, req.user.id]
+          [primaryPayment.id, businessOwnerId]
         );
 
         return res.status(200).json({
@@ -361,7 +368,7 @@ const addPayment = asyncHandler(async (req, res) => {
     else if (money_receipt_id) {
       const [mrRows] = await conn.query(
         "SELECT * FROM money_receipts WHERE id = ? AND created_by = ? FOR UPDATE",
-        [money_receipt_id, req.user.id]
+        [money_receipt_id, businessOwnerId]
       );
 
       if (!mrRows.length) {
@@ -403,7 +410,7 @@ const addPayment = asyncHandler(async (req, res) => {
 
       const [stockRows] = await conn.query(
         "SELECT id, product_name, price FROM stock WHERE id = ? AND created_by = ?",
-        [product_id, req.user.id]
+        [product_id, businessOwnerId]
       );
 
       if (!stockRows.length) {
@@ -445,7 +452,7 @@ const addPayment = asyncHandler(async (req, res) => {
           }
 
           let dueQuery = "SELECT * FROM customer_dues WHERE id = ? AND created_by = ?";
-          const dueParams = [targetDueId, req.user.id];
+          const dueParams = [targetDueId, businessOwnerId];
           if (linkedCustomerId) {
             dueQuery += " AND customer_id = ?";
             dueParams.push(linkedCustomerId);
@@ -493,14 +500,14 @@ const addPayment = asyncHandler(async (req, res) => {
         if (linkedCustomerId) {
           await conn.query(
             "UPDATE customers SET total_due = GREATEST(0, total_due - ?) WHERE id = ? AND created_by = ?",
-            [finalAmount, linkedCustomerId, req.user.id]
+            [finalAmount, linkedCustomerId, businessOwnerId]
           );
         }
       } else if (linkedCustomerId && finalAmount > 0) {
         // Fallback: auto-allocate in FIFO order across customer's pending dues
         const [pendingDues] = await conn.query(
           "SELECT * FROM customer_dues WHERE customer_id = ? AND created_by = ? AND status != 'settled' ORDER BY created_at ASC, id ASC",
-          [linkedCustomerId, req.user.id]
+          [linkedCustomerId, businessOwnerId]
         );
 
         let remainingToAllocate = finalAmount;
@@ -529,7 +536,7 @@ const addPayment = asyncHandler(async (req, res) => {
 
         await conn.query(
           "UPDATE customers SET total_due = GREATEST(0, total_due - ?) WHERE id = ? AND created_by = ?",
-          [finalAmount, linkedCustomerId, req.user.id]
+          [finalAmount, linkedCustomerId, businessOwnerId]
         );
       }
     }
@@ -563,7 +570,7 @@ const addPayment = asyncHandler(async (req, res) => {
         linkedPurchaseBillId,
         linkedMoneyReceiptId,
         shouldAddToKhata ? 1 : 0,
-        req.user.id,
+        businessOwnerId,
         linkedMoneyReceiptCreatedAt || null,
       ]
     );
@@ -573,14 +580,14 @@ const addPayment = asyncHandler(async (req, res) => {
     if (linkedPurchaseBillId) {
       await conn.query(
         "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-        [paymentId, linkedPurchaseBillId, req.user.id]
+        [paymentId, linkedPurchaseBillId, businessOwnerId]
       );
     }
 
     if (linkedMoneyReceiptId) {
       await conn.query(
         "UPDATE money_receipts SET is_linked_to_payment = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-        [paymentId, linkedMoneyReceiptId, req.user.id]
+        [paymentId, linkedMoneyReceiptId, businessOwnerId]
       );
     }
 
@@ -594,6 +601,22 @@ const addPayment = asyncHandler(async (req, res) => {
 
     await conn.commit();
 
+    await logAuditEvent(req, {
+      action: "CREATE_PAYMENT",
+      targetType: "payment",
+      targetId: paymentId,
+      details: {
+        category: resolvedCategory,
+        purpose: resolvedPurpose,
+        amount: finalAmount,
+        party_name: resolvedPartyName,
+        payment_mode: normalizePaymentMode(payment_mode),
+        customer_id: linkedCustomerId,
+        purchase_bill_id: linkedPurchaseBillId,
+        money_receipt_id: linkedMoneyReceiptId,
+      },
+    });
+
     const [rows] = await pool.query(
       `SELECT p.*,
               cu.name AS customer_name,
@@ -602,7 +625,7 @@ const addPayment = asyncHandler(async (req, res) => {
        FROM payments p
        LEFT JOIN customers cu ON cu.id = p.customer_id
        WHERE p.id = ? AND p.created_by = ?`,
-      [paymentId, req.user.id]
+      [paymentId, businessOwnerId]
     );
 
     res.status(201).json({
@@ -620,6 +643,12 @@ const addPayment = asyncHandler(async (req, res) => {
 
 // GET /api/payments
 const listPayments = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "view")) {
+    throw new ApiError(403, "You do not have permission to view payments.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { category, purpose, customer_id, from, to } = req.query;
 
   let sql = `
@@ -656,7 +685,7 @@ const listPayments = asyncHandler(async (req, res) => {
   const params = [];
 
   sql += " AND p.created_by = ?";
-  params.push(req.user.id);
+  params.push(businessOwnerId);
 
   if (category) {
     const cat = String(category).trim().toLowerCase();
@@ -720,6 +749,12 @@ const listPayments = asyncHandler(async (req, res) => {
 
 // PUT /api/payments/:id
 const updatePayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit payments.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
   const {
     payment_category,
@@ -739,7 +774,7 @@ const updatePayment = asyncHandler(async (req, res) => {
 
     const [existingRows] = await conn.query(
       "SELECT * FROM payments WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
     if (!existingRows.length) {
       throw new ApiError(404, "Payment not found.");
@@ -761,7 +796,7 @@ const updatePayment = asyncHandler(async (req, res) => {
       if (allocRows.length) {
         await conn.query(
           "UPDATE customers SET total_due = GREATEST(0, total_due - ?) WHERE id = ? AND created_by = ?",
-          [amountDiff, payment.customer_id, req.user.id]
+          [amountDiff, payment.customer_id, businessOwnerId]
         );
       }
     }
@@ -771,7 +806,7 @@ const updatePayment = asyncHandler(async (req, res) => {
         `UPDATE khata_entries
          SET amount = ?, description = ?, entry_date = ?, payment_mode = ?
          WHERE id = ? AND created_by = ?`,
-        [newAmount, resolvedPurpose, finalDate, resolvedMode, payment.khata_entry_id, req.user.id]
+        [newAmount, resolvedPurpose, finalDate, resolvedMode, payment.khata_entry_id, businessOwnerId]
       );
     }
 
@@ -791,18 +826,30 @@ const updatePayment = asyncHandler(async (req, res) => {
         product_id !== undefined ? product_id : payment.product_id,
         quantity !== undefined ? quantity : payment.quantity,
         id,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
     await conn.commit();
+
+    await logAuditEvent(req, {
+      action: "UPDATE_PAYMENT",
+      targetType: "payment",
+      targetId: id,
+      details: {
+        amount: newAmount,
+        purpose: resolvedPurpose,
+        payment_category: resolvedCategory,
+        party_name: party_name !== undefined ? party_name : payment.party_name,
+      },
+    });
 
     const [updatedRows] = await pool.query(
       `SELECT p.*, cu.name AS customer_name, cu.phone AS customer_phone
        FROM payments p
        LEFT JOIN customers cu ON cu.id = p.customer_id
        WHERE p.id = ? AND p.created_by = ?`,
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     res.json({
@@ -820,6 +867,12 @@ const updatePayment = asyncHandler(async (req, res) => {
 
 // DELETE /api/payments/:id
 const deletePayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete payments.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
 
   const conn = await pool.getConnection();
@@ -828,7 +881,7 @@ const deletePayment = asyncHandler(async (req, res) => {
 
     const [rows] = await conn.query(
       "SELECT * FROM payments WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
     if (!rows.length) {
       throw new ApiError(404, "Payment not found.");
@@ -862,7 +915,7 @@ const deletePayment = asyncHandler(async (req, res) => {
     if (restoredDueAmount > 0 && payment.customer_id) {
       await conn.query(
         "UPDATE customers SET total_due = total_due + ? WHERE id = ? AND created_by = ?",
-        [restoredDueAmount, payment.customer_id, req.user.id]
+        [restoredDueAmount, payment.customer_id, businessOwnerId]
       );
     }
     await conn.query("DELETE FROM customer_due_allocations WHERE payment_id = ?", [payment.id]);
@@ -870,27 +923,39 @@ const deletePayment = asyncHandler(async (req, res) => {
     if (payment.khata_entry_id) {
       await conn.query(
         "DELETE FROM khata_entries WHERE id = ? AND created_by = ?",
-        [payment.khata_entry_id, req.user.id]
+        [payment.khata_entry_id, businessOwnerId]
       );
     }
 
     if (payment.purchase_bill_id) {
       await conn.query(
         "UPDATE purchase_bills SET is_paid = 0, payment_id = NULL WHERE id = ? AND created_by = ?",
-        [payment.purchase_bill_id, req.user.id]
+        [payment.purchase_bill_id, businessOwnerId]
       );
     }
 
     if (payment.money_receipt_id) {
       await conn.query(
         "UPDATE money_receipts SET is_linked_to_payment = 0, payment_id = NULL WHERE id = ? AND created_by = ?",
-        [payment.money_receipt_id, req.user.id]
+        [payment.money_receipt_id, businessOwnerId]
       );
     }
 
-    await conn.query("DELETE FROM payments WHERE id = ? AND created_by = ?", [id, req.user.id]);
+    await conn.query("DELETE FROM payments WHERE id = ? AND created_by = ?", [id, businessOwnerId]);
 
     await conn.commit();
+
+    await logAuditEvent(req, {
+      action: "DELETE_PAYMENT",
+      targetType: "payment",
+      targetId: id,
+      details: {
+        amount: payment.amount,
+        purpose: payment.purpose,
+        payment_category: payment.payment_category,
+        party_name: payment.party_name,
+      },
+    });
 
     res.json({
       success: true,
@@ -908,6 +973,12 @@ const deletePayment = asyncHandler(async (req, res) => {
 // GET /api/payments/dues?customer_id=...
 // Returns outstanding dues for a customer
 const getCustomerOutstandingDues = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "customers", "view") && !hasPermission(req.user, "payments", "view")) {
+    throw new ApiError(403, "You do not have permission to view customer dues.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const customerId = req.query.customer_id;
 
   if (!customerId) {
@@ -918,7 +989,7 @@ const getCustomerOutstandingDues = asyncHandler(async (req, res) => {
     `SELECT * FROM customer_dues
      WHERE customer_id = ? AND created_by = ? AND status != 'settled'
      ORDER BY created_at ASC, id ASC`,
-    [customerId, req.user.id]
+    [customerId, businessOwnerId]
   );
 
   res.json({
@@ -931,11 +1002,17 @@ const getCustomerOutstandingDues = asyncHandler(async (req, res) => {
 // POST /api/payments/:id/add-to-khata
 // Links an existing Paid Out payment to Khata without creating duplicate rows
 const addPaymentToKhata = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "edit") && !hasPermission(req.user, "khata", "create")) {
+    throw new ApiError(403, "You do not have permission to link payment to Khata.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
 
   const [rows] = await pool.query(
     "SELECT * FROM payments WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
 
   if (!rows.length) {
@@ -954,13 +1031,20 @@ const addPaymentToKhata = asyncHandler(async (req, res) => {
 
   await pool.query(
     "UPDATE payments SET add_to_khata = 1 WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
 
   const [updated] = await pool.query(
     "SELECT * FROM payments WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
+
+  await logAuditEvent(req, {
+    action: "LINK_PAYMENT_TO_KHATA",
+    targetType: "payment",
+    targetId: id,
+    details: { payment_id: id },
+  });
 
   res.json({
     success: true,
@@ -971,6 +1055,12 @@ const addPaymentToKhata = asyncHandler(async (req, res) => {
 
 // GET /api/payments/unlinked-money-receipts
 const getUnlinkedMoneyReceipts = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "view") && !hasPermission(req.user, "invoices", "view")) {
+    throw new ApiError(403, "You do not have permission to view money receipts.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const [rows] = await pool.query(
     `SELECT mr.*, cu.name AS customer_name
      FROM money_receipts mr
@@ -979,7 +1069,7 @@ const getUnlinkedMoneyReceipts = asyncHandler(async (req, res) => {
        AND (mr.payment_id IS NULL)
        AND mr.created_by = ?
      ORDER BY mr.receipt_date DESC, mr.id DESC`,
-    [req.user.id]
+    [businessOwnerId]
   );
 
   res.json({
@@ -991,6 +1081,12 @@ const getUnlinkedMoneyReceipts = asyncHandler(async (req, res) => {
 
 // POST /api/payments/link-money-receipt/:id
 const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "create")) {
+    throw new ApiError(403, "You do not have permission to link money receipts to payments.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const id = req.params.id || req.body.money_receipt_id;
   const { payment_mode } = req.body || {};
 
@@ -1003,7 +1099,7 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
        FROM money_receipts mr
        LEFT JOIN customers cu ON cu.id = mr.customer_id
        WHERE mr.id = ? AND mr.created_by = ? FOR UPDATE`,
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (!rows.length) {
@@ -1036,7 +1132,7 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
         normalizePaymentMode(payment_mode || mr.payment_mode),
         receiptDateVal,
         mr.id,
-        req.user.id,
+        businessOwnerId,
         mr.receipt_date || mr.created_at,
       ]
     );
@@ -1045,14 +1141,21 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
 
     await conn.query(
       "UPDATE money_receipts SET is_linked_to_payment = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-      [paymentId, mr.id, req.user.id]
+      [paymentId, mr.id, businessOwnerId]
     );
 
     await conn.commit();
 
+    await logAuditEvent(req, {
+      action: "LINK_MONEY_RECEIPT_TO_PAYMENT",
+      targetType: "payment",
+      targetId: paymentId,
+      details: { money_receipt_id: mr.id, amount: mr.amount_received },
+    });
+
     const [paymentRows] = await pool.query(
       "SELECT * FROM payments WHERE id = ? AND created_by = ?",
-      [paymentId, req.user.id]
+      [paymentId, businessOwnerId]
     );
 
     res.status(201).json({
@@ -1071,6 +1174,12 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
 
 // GET /api/payments/unlinked-purchase-bills
 const getUnlinkedPurchaseBills = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "view") && !hasPermission(req.user, "inventory", "view")) {
+    throw new ApiError(403, "You do not have permission to view purchase bills.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const [rows] = await pool.query(
     `SELECT pb.*,
             COUNT(pbi.id) AS item_count,
@@ -1082,7 +1191,7 @@ const getUnlinkedPurchaseBills = asyncHandler(async (req, res) => {
        AND pb.created_by = ?
      GROUP BY pb.id
      ORDER BY pb.bill_date DESC, pb.id DESC`,
-    [req.user.id]
+    [businessOwnerId]
   );
 
   res.json({
@@ -1094,6 +1203,12 @@ const getUnlinkedPurchaseBills = asyncHandler(async (req, res) => {
 
 // POST /api/payments/link-purchase-bill/:id
 const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "create")) {
+    throw new ApiError(403, "You do not have permission to pay purchase bills.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const id =
     req.params?.id ||
     req.body?.purchase_bill_id ||
@@ -1114,7 +1229,7 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
 
     const [rows] = await conn.query(
       "SELECT * FROM purchase_bills WHERE id = ? AND created_by = ? FOR UPDATE",
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (!rows.length) {
@@ -1140,7 +1255,7 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
 
     const [existingPbPayments] = await conn.query(
       "SELECT * FROM payments WHERE (purchase_bill_id = ? OR id = ?) AND created_by = ? ORDER BY id ASC",
-      [pb.id, pb.payment_id || 0, req.user.id]
+      [pb.id, pb.payment_id || 0, businessOwnerId]
     );
 
     let paymentId;
@@ -1160,12 +1275,12 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
           pb.bill_date || null,
           pb.id,
           paymentId,
-          req.user.id,
+          businessOwnerId,
         ]
       );
       if (existingPbPayments.length > 1) {
         const extraIds = existingPbPayments.slice(1).map((p) => p.id);
-        await conn.query("DELETE FROM payments WHERE id IN (?) AND created_by = ?", [extraIds, req.user.id]);
+        await conn.query("DELETE FROM payments WHERE id IN (?) AND created_by = ?", [extraIds, businessOwnerId]);
       }
     } else {
       const [result] = await conn.query(
@@ -1179,7 +1294,7 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
           normalizePaymentMode(payment_mode),
           pb.bill_date,
           pb.id,
-          req.user.id,
+          businessOwnerId,
         ]
       );
       paymentId = result.insertId;
@@ -1187,14 +1302,21 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
 
     await conn.query(
       "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-      [paymentId, pb.id, req.user.id]
+      [paymentId, pb.id, businessOwnerId]
     );
 
     await conn.commit();
 
+    await logAuditEvent(req, {
+      action: "LINK_PURCHASE_BILL_TO_PAYMENT",
+      targetType: "payment",
+      targetId: paymentId,
+      details: { purchase_bill_id: pb.id, bill_number: pb.bill_number, amount: billTotal },
+    });
+
     const [paymentRows] = await pool.query(
       "SELECT * FROM payments WHERE id = ? AND created_by = ?",
-      [paymentId, req.user.id]
+      [paymentId, businessOwnerId]
     );
 
     res.status(201).json({
@@ -1213,6 +1335,12 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
 
 // GET /api/payments/unlinked-khata-debits
 const getUnlinkedKhataDebitsForPayment = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "payments", "view") && !hasPermission(req.user, "khata", "view")) {
+    throw new ApiError(403, "You do not have permission to view Khata debits.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const [rows] = await pool.query(
     `SELECT ke.*, cu.name AS customer_name, s.product_name
      FROM khata_entries ke
@@ -1223,7 +1351,7 @@ const getUnlinkedKhataDebitsForPayment = asyncHandler(async (req, res) => {
        AND (ke.is_skipped = 0 OR ke.is_skipped IS NULL)
        AND ke.created_by = ?
      ORDER BY ke.entry_date DESC, ke.id DESC`,
-    [req.user.id]
+    [businessOwnerId]
   );
 
   res.json({

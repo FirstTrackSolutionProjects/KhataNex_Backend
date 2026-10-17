@@ -1,9 +1,15 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 // POST /api/banking
 const createBanking = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "banking", "create")) {
+    throw new ApiError(403, "You do not have permission to add banking records.");
+  }
+
   const {
     bank_name,
     account_holder_name,
@@ -14,7 +20,7 @@ const createBanking = asyncHandler(async (req, res) => {
     is_default,
   } = req.body;
 
-  const userId = req.user?.id;
+  const userId = tenant.businessOwnerId;
 
   if (!userId) {
     throw new ApiError(401, "Authentication required.");
@@ -57,6 +63,13 @@ const createBanking = asyncHandler(async (req, res) => {
     [result.insertId, userId]
   );
 
+  await logAuditEvent(req, {
+    action: "CREATE_BANKING",
+    targetType: "banking",
+    targetId: result.insertId,
+    details: `Created bank account "${bank_name || "Bank"}" ending in ${String(account_number || "").slice(-4)}`,
+  });
+
   res.status(201).json({
     success: true,
     banking: rows[0],
@@ -65,7 +78,12 @@ const createBanking = asyncHandler(async (req, res) => {
 
 // GET /api/banking
 const listBanking = asyncHandler(async (req, res) => {
-  const userId = req.user?.id;
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "banking", "view")) {
+    throw new ApiError(403, "You do not have permission to view banking records.");
+  }
+
+  const userId = tenant.businessOwnerId;
 
   const [rows] = await pool.query(
     `SELECT b.*, u.name AS created_by_name
@@ -85,8 +103,13 @@ const listBanking = asyncHandler(async (req, res) => {
 
 // GET /api/banking/:id
 const getBanking = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "banking", "view")) {
+    throw new ApiError(403, "You do not have permission to view banking records.");
+  }
+
   const { id } = req.params;
-  const userId = req.user?.id;
+  const userId = tenant.businessOwnerId;
 
   const [rows] = await pool.query(
     "SELECT * FROM banking WHERE id = ? AND created_by = ?",
@@ -105,6 +128,11 @@ const getBanking = asyncHandler(async (req, res) => {
 
 // PATCH /api/banking/:id
 const updateBanking = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "banking", "edit")) {
+    throw new ApiError(403, "You do not have permission to update banking records.");
+  }
+
   const {
     bank_name,
     account_holder_name,
@@ -116,7 +144,7 @@ const updateBanking = asyncHandler(async (req, res) => {
   } = req.body;
 
   const { id } = req.params;
-  const userId = req.user?.id;
+  const userId = tenant.businessOwnerId;
 
   const [rows] = await pool.query(
     "SELECT * FROM banking WHERE id = ? AND created_by = ?",
@@ -189,6 +217,13 @@ const updateBanking = asyncHandler(async (req, res) => {
     [id, userId]
   );
 
+  await logAuditEvent(req, {
+    action: "UPDATE_BANKING",
+    targetType: "banking",
+    targetId: id,
+    details: `Updated banking record "${updated[0].bank_name || "Bank"}" (ID: ${id})`,
+  });
+
   res.json({
     success: true,
     message: "Banking details updated.",
@@ -198,8 +233,13 @@ const updateBanking = asyncHandler(async (req, res) => {
 
 // DELETE /api/banking/:id
 const deleteBanking = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "banking", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete banking records.");
+  }
+
   const { id } = req.params;
-  const userId = req.user?.id;
+  const userId = tenant.businessOwnerId;
 
   const [rows] = await pool.query(
     "SELECT * FROM banking WHERE id = ? AND created_by = ?",
@@ -235,6 +275,13 @@ const deleteBanking = asyncHandler(async (req, res) => {
     }
   }
 
+  await logAuditEvent(req, {
+    action: "DELETE_BANKING",
+    targetType: "banking",
+    targetId: id,
+    details: `Deleted banking record "${rows[0].bank_name || "Bank"}" (ID: ${id})`,
+  });
+
   res.json({
     success: true,
     message: "Banking record deleted.",
@@ -243,8 +290,13 @@ const deleteBanking = asyncHandler(async (req, res) => {
 
 // POST or PATCH /api/banking/:id/default
 const setDefaultBanking = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "banking", "edit")) {
+    throw new ApiError(403, "You do not have permission to update banking records.");
+  }
+
   const { id } = req.params;
-  const userId = req.user?.id;
+  const userId = tenant.businessOwnerId;
 
   const [rows] = await pool.query(
     "SELECT * FROM banking WHERE id = ? AND created_by = ?",

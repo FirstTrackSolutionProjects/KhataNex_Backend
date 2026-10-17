@@ -39,10 +39,15 @@ const errorHandler = (err, req, res, next) => {
     console.error(err);
   }
 
-  res.status(statusCode).json({
+  const response = {
     success: false,
     message,
-  });
+  };
+  if (err.code) {
+    response.code = err.code;
+  }
+
+  res.status(statusCode).json(response);
 };
 
 module.exports = { notFound, errorHandler };

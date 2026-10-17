@@ -1,6 +1,7 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 const SORTABLE = {
   name: "product_name",
@@ -133,6 +134,12 @@ const lookupLatestByHsn = async (hsn_code, userId) => {
 
 // POST /api/stock
 const addStock = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "inventory", "create")) {
+    throw new ApiError(403, "You do not have permission to add stock items.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   let {
     product_name,
     category,
@@ -169,7 +176,7 @@ const addStock = asyncHandler(async (req, res) => {
        FROM purchase_bill_items pbi
        JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
        WHERE pbi.id = ? AND pb.created_by = ?`,
-      [Number(targetItemId), req.user.id]
+      [Number(targetItemId), businessOwnerId]
     );
     if (itemRows.length) {
       const pbi = itemRows[0];
@@ -217,7 +224,7 @@ const addStock = asyncHandler(async (req, res) => {
            )`,
         [
           finalPurchaseBillId,
-          req.user.id,
+          businessOwnerId,
           product_name || "",
           product_name || "",
           hsn_code || null,
@@ -247,7 +254,7 @@ const addStock = asyncHandler(async (req, res) => {
              OR (pbi.hsn_code = ? AND ? IS NOT NULL)
            )`,
         [
-          req.user.id,
+          businessOwnerId,
           product_name || "",
           product_name || "",
           hsn_code || null,
@@ -264,7 +271,7 @@ const addStock = asyncHandler(async (req, res) => {
              OR (hsn_code = ? AND ? IS NOT NULL)
            )`,
         [
-          req.user.id,
+          businessOwnerId,
           product_name || "",
           product_name || "",
           hsn_code || null,
@@ -284,7 +291,7 @@ const addStock = asyncHandler(async (req, res) => {
 
   // Look up metadata by HSN if provided (never use purchase price as selling price)
   if (hsn_code) {
-    const match = await lookupLatestByHsn(hsn_code, req.user.id);
+    const match = await lookupLatestByHsn(hsn_code, businessOwnerId);
 
     if (match) {
       if (!unit && match.unit) unit = match.unit;
@@ -340,7 +347,7 @@ const addStock = asyncHandler(async (req, res) => {
     const trimmedName = String(product_name).trim();
     const [existingStock] = await pool.query(
       "SELECT * FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') DESC, id ASC LIMIT 1",
-      [trimmedName, trimmedName, req.user.id]
+      [trimmedName, trimmedName, businessOwnerId]
     );
 
     if (existingStock.length) {
@@ -381,7 +388,7 @@ const addStock = asyncHandler(async (req, res) => {
             resolvedQty,
             finalPurchaseBillId,
             stockId,
-            req.user.id,
+            businessOwnerId,
           ]
         );
       }
@@ -408,7 +415,7 @@ const addStock = asyncHandler(async (req, res) => {
         finalPrice,
         finalQuantity,
         finalPurchaseBillId,
-        req.user.id,
+        businessOwnerId,
       ]
     );
     stockId = result.insertId;
@@ -436,7 +443,7 @@ const addStock = asyncHandler(async (req, res) => {
       [
         stockId,
         finalPurchaseBillId,
-        req.user.id,
+        businessOwnerId,
         stockId,
         product_name || "",
         product_name || "",
@@ -452,16 +459,23 @@ const addStock = asyncHandler(async (req, res) => {
        JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
        SET pbi.product_id = ?
        WHERE pb.created_by = ? AND pbi.product_id IS NULL AND (pbi.item_name = ? OR LOWER(pbi.item_name) = LOWER(?))`,
-      [stockId, req.user.id, product_name, product_name]
+      [stockId, businessOwnerId, product_name, product_name]
     );
   }
 
   const [rows] = await pool.query(
     "SELECT * FROM stock WHERE id = ? AND created_by = ?",
-    [stockId, req.user.id]
+    [stockId, businessOwnerId]
   );
 
   const enriched = enrichStockItem(rows[0]);
+
+  await logAuditEvent(req, {
+    action: "CREATE_STOCK",
+    targetType: "stock",
+    targetId: stockId,
+    details: `Added stock item "${product_name || "Unnamed Item"}" (ID: ${stockId})`,
+  });
 
   res.status(201).json({
     success: true,
@@ -471,6 +485,12 @@ const addStock = asyncHandler(async (req, res) => {
 
 // GET /api/stock
 const listStock = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "inventory", "view")) {
+    throw new ApiError(403, "You do not have permission to view stock items.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const {
     sortBy = "name",
     order = "asc",
@@ -490,7 +510,7 @@ const listStock = asyncHandler(async (req, res) => {
     WHERE s.created_by = ?
   `;
 
-  const params = [req.user.id];
+  const params = [businessOwnerId];
 
   const requestedType = (type || item_type || "").trim().toLowerCase();
   if (requestedType && requestedType !== "all") {
@@ -539,6 +559,12 @@ const listStock = asyncHandler(async (req, res) => {
 
 // PUT /api/stock/:id
 const updateStock = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "inventory", "edit")) {
+    throw new ApiError(403, "You do not have permission to update stock items.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const { id } = req.params;
 
   const {
@@ -559,7 +585,7 @@ const updateStock = asyncHandler(async (req, res) => {
 
   const [rows] = await pool.query(
     "SELECT * FROM stock WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
 
   if (!rows.length) {
@@ -605,16 +631,23 @@ const updateStock = asyncHandler(async (req, res) => {
       price ?? null,
       quantity ?? null,
       id,
-      req.user.id,
+      businessOwnerId,
     ]
   );
 
   const [updated] = await pool.query(
     "SELECT * FROM stock WHERE id = ? AND created_by = ?",
-    [id, req.user.id]
+    [id, businessOwnerId]
   );
 
   const enriched = enrichStockItem(updated[0]);
+
+  await logAuditEvent(req, {
+    action: "UPDATE_STOCK",
+    targetType: "stock",
+    targetId: id,
+    details: `Updated stock item "${enriched.product_name || id}" (ID: ${id})`,
+  });
 
   res.json({
     success: true,
@@ -624,6 +657,12 @@ const updateStock = asyncHandler(async (req, res) => {
 
 // DELETE /api/stock/:id
 const deleteStock = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "inventory", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete stock items.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const stockId = req.params.id;
 
   const conn = await pool.getConnection();
@@ -631,14 +670,16 @@ const deleteStock = asyncHandler(async (req, res) => {
     await conn.beginTransaction();
 
     const [rows] = await conn.query(
-      "SELECT id FROM stock WHERE id = ? AND created_by = ?",
-      [stockId, req.user.id]
+      "SELECT id, product_name FROM stock WHERE id = ? AND created_by = ?",
+      [stockId, businessOwnerId]
     );
 
     if (!rows.length) {
       await conn.rollback();
       throw new ApiError(404, "Stock item not found.");
     }
+
+    const item = rows[0];
 
     // Unlink foreign key references safely so purchase bills and payments remain intact
     await conn.query(
@@ -653,7 +694,7 @@ const deleteStock = asyncHandler(async (req, res) => {
 
     const [result] = await conn.query(
       "DELETE FROM stock WHERE id = ? AND created_by = ?",
-      [stockId, req.user.id]
+      [stockId, businessOwnerId]
     );
 
     if (!result.affectedRows) {
@@ -662,6 +703,13 @@ const deleteStock = asyncHandler(async (req, res) => {
     }
 
     await conn.commit();
+
+    await logAuditEvent(req, {
+      action: "DELETE_STOCK",
+      targetType: "stock",
+      targetId: stockId,
+      details: `Deleted stock item "${item.product_name || stockId}" (ID: ${stockId})`,
+    });
 
     res.json({
       success: true,
@@ -677,6 +725,12 @@ const deleteStock = asyncHandler(async (req, res) => {
 
 // GET /api/stock/lookup
 const lookupStockOrPurchase = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "inventory", "view")) {
+    throw new ApiError(403, "You do not have permission to lookup stock items.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const hsn_code = req.query.hsn_code || req.query.hsn;
   const search = req.query.search || req.query.q || req.query.product_name;
 
@@ -706,7 +760,7 @@ const lookupStockOrPurchase = asyncHandler(async (req, res) => {
     JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
     WHERE pb.created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
   if (hsn_code) {
     sql += " AND pbi.hsn_code = ?";
     params.push(hsn_code);
@@ -731,7 +785,7 @@ const lookupStockOrPurchase = asyncHandler(async (req, res) => {
 
   // 2. Check stock
   let stockSql = `SELECT * FROM stock WHERE created_by = ?`;
-  const stockParams = [req.user.id];
+  const stockParams = [businessOwnerId];
   if (hsn_code) {
     stockSql += " AND hsn_code = ?";
     stockParams.push(hsn_code);
@@ -757,7 +811,7 @@ const lookupStockOrPurchase = asyncHandler(async (req, res) => {
 
   // 3. Check legacy purchase_invoices
   let legacySql = `SELECT product_name, hsn_code, quantity, price AS purchase_price, price, seller_name, invoice_date FROM purchase_invoices WHERE created_by = ?`;
-  const legacyParams = [req.user.id];
+  const legacyParams = [businessOwnerId];
   if (hsn_code) {
     legacySql += " AND hsn_code = ?";
     legacyParams.push(hsn_code);
@@ -785,6 +839,12 @@ const lookupStockOrPurchase = asyncHandler(async (req, res) => {
 
 // GET /api/stock/purchase-items
 const searchPurchaseItems = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  if (!hasPermission(req.user, "inventory", "view")) {
+    throw new ApiError(403, "You do not have permission to search purchase items.");
+  }
+  const businessOwnerId = tenant.businessOwnerId;
+
   const query = String(req.query.search || req.query.q || req.query.query || req.query.hsn_code || req.query.hsn || "").trim();
   const purchaseBillId = req.query.purchase_bill_id || req.query.purchaseBillId || req.query.bill_id;
 
@@ -810,7 +870,7 @@ const searchPurchaseItems = asyncHandler(async (req, res) => {
     JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
     WHERE pb.created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
 
   if (purchaseBillId) {
     sql += " AND pb.id = ?";

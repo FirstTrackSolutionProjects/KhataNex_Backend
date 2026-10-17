@@ -5,46 +5,16 @@ const ApiError = require("../utils/ApiError");
 const { relativeUploadPath } = require("../utils/upload");
 const { calculateReportMetrics, calculateGraphPoints, resolvePeriodRange, executeReportDrilldown } = require("./reportController");
 
-const ALLOWED_EMPLOYEE_PERMISSIONS = [
-  "support_chat",
-  "view_basic_user",
-  "create_invoice",
-  "create_quotation",
-  "create_receipt",
-  "view_khata",
-  "view_payments",
-  "manage_payments",
-  "manage_inventory",
-  "manage_vehicles",
-  "create_employee",
-  "edit_employee",
-  "manage_employee_permissions",
-];
+const {
+  ALL_ALLOWED_PERMISSIONS,
+  normalizePermissions: normalizePermissionsHelper,
+} = require("../utils/tenantContext");
+
+const ALLOWED_EMPLOYEE_PERMISSIONS = ALL_ALLOWED_PERMISSIONS;
 
 const normalizePermissions = (permissions) => {
   if (permissions === undefined || permissions === null) return null;
-
-  let value = permissions;
-  if (typeof value === "string") {
-    try {
-      value = JSON.parse(value);
-    } catch (err) {
-      throw new ApiError(400, "permissions must be a valid JSON array.");
-    }
-  }
-
-  if (!Array.isArray(value)) {
-    throw new ApiError(400, "permissions must be an array.");
-  }
-
-  const unique = [...new Set(value)];
-  const invalid = unique.filter((permission) => !ALLOWED_EMPLOYEE_PERMISSIONS.includes(permission));
-
-  if (invalid.length) {
-    throw new ApiError(400, "Invalid employee permission(s): " + invalid.join(", "));
-  }
-
-  return unique;
+  return normalizePermissionsHelper(permissions);
 };
 
 const publicUser = (u) => ({
@@ -66,6 +36,11 @@ const publicUser = (u) => ({
   pincode: u.pincode,
   country: u.country,
   employee_title: u.employee_title,
+  employee_code: u.employee_code,
+  joining_date: u.joining_date,
+  emergency_contact: u.emergency_contact,
+  notes: u.notes,
+  assigned_modules: typeof u.assigned_modules === "string" ? JSON.parse(u.assigned_modules) : (u.assigned_modules || []),
   permissions: u.permissions,
   date_of_birth: u.date_of_birth,
   employee_age: u.employee_age,
@@ -80,10 +55,35 @@ const publicUser = (u) => ({
   created_at: u.created_at,
 });
 
+/**
+ * Ensures employees belonging to a specific business owner cannot access
+ * or leak another tenant's profile or business data.
+ */
+const checkTenantAccess = async (reqUser, targetUserId) => {
+  if (reqUser && reqUser.role === "employee" && reqUser.created_by_admin) {
+    const [creatorRows] = await pool.query("SELECT id, role FROM users WHERE id = ?", [reqUser.created_by_admin]);
+    if (creatorRows.length && creatorRows[0].role === "user" && Number(targetUserId) !== Number(reqUser.created_by_admin)) {
+      throw new ApiError(403, "Access denied: you cannot access data from another business tenant.");
+    }
+  }
+};
+
 // GET /api/superadmin/users
 // Full overview of every user account, including financial and activity
 // summaries built from the existing transaction/document tables.
 const listUsers = asyncHandler(async (req, res) => {
+  let tenantFilter = "";
+  const queryParams = [];
+
+  // Tenant isolation: if employee belongs to a specific business owner, isolate strictly to that owner
+  if (req.user && req.user.role === "employee" && req.user.created_by_admin) {
+    const [creatorRows] = await pool.query("SELECT id, role FROM users WHERE id = ?", [req.user.created_by_admin]);
+    if (creatorRows.length && creatorRows[0].role === "user") {
+      tenantFilter = " AND u.id = ?";
+      queryParams.push(req.user.created_by_admin);
+    }
+  }
+
   const [rows] = await pool.query(
     `SELECT
        u.id,
@@ -382,11 +382,33 @@ const listUsers = asyncHandler(async (req, res) => {
          SELECT COUNT(*)
          FROM vehicle_trips v
          WHERE v.created_by = u.id
-       ) AS vehicle_trip_count
+       ) AS vehicle_trip_count,
+
+       latest_sub.plan_name AS subscription_plan_name,
+       latest_sub.plan_code AS subscription_plan_code,
+       latest_sub.ends_at AS subscription_ends_at,
+       latest_sub.is_complimentary AS subscription_is_complimentary,
+       latest_sub.status AS subscription_status,
+       CASE
+         WHEN latest_sub.ends_at IS NULL THEN 'none'
+         WHEN latest_sub.ends_at > NOW() THEN 'active'
+         ELSE 'expired'
+       END AS subscription_display_status
 
      FROM users u
-     WHERE u.role = 'user'
-     ORDER BY u.created_at DESC`
+     LEFT JOIN (
+       SELECT s1.user_id, s1.plan_id, s1.ends_at, s1.is_complimentary, s1.status, p.name AS plan_name, p.code AS plan_code
+       FROM subscriptions s1
+       JOIN (
+         SELECT user_id, MAX(ends_at) AS max_end
+         FROM subscriptions
+         GROUP BY user_id
+       ) s2 ON s1.user_id = s2.user_id AND s1.ends_at = s2.max_end
+       JOIN subscription_plans p ON s1.plan_id = p.id
+     ) latest_sub ON latest_sub.user_id = u.id
+     WHERE u.role = 'user'${tenantFilter}
+     ORDER BY u.created_at DESC`,
+    queryParams
   );
 
   const users = rows.map((user) => {
@@ -401,6 +423,16 @@ const listUsers = asyncHandler(async (req, res) => {
       expenses: totalExpenses,
       net_profit: netProfit,
       profit_or_loss: netProfit,
+      subscription: {
+        plan_name: user.subscription_plan_name || null,
+        plan_code: user.subscription_plan_code || null,
+        ends_at: user.subscription_ends_at || null,
+        remaining_days: user.subscription_ends_at
+          ? Math.max(0, Math.ceil((new Date(user.subscription_ends_at) - new Date()) / (1000 * 60 * 60 * 24)))
+          : 0,
+        status: user.subscription_display_status || "none",
+        is_complimentary: Boolean(user.subscription_is_complimentary),
+      },
       financials: {
         credit: Number(user.credit || 0),
         used_credits: Number(user.used_credits || 0),
@@ -430,22 +462,22 @@ const listUsers = asyncHandler(async (req, res) => {
 
 // GET /api/superadmin/users/:id
 const getUser = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  await checkTenantAccess(req.user, id);
+
   const [rows] = await pool.query(
     `SELECT id, name, email, phone, secondary_phone, business_name, business_type, gstin, pan, website, address, address_line1, address_line2, city, state, pincode, country, role, employee_role_type, employee_title, permissions, profile_photo_path, status, last_login_at, last_active_at, created_by_admin, created_at, updated_at
      FROM users WHERE id = ?`,
-    [req.params.id]
+    [id]
   );
   if (!rows.length) throw new ApiError(404, "User not found.");
   res.json({ success: true, user: rows[0] });
 });
 
-// POST /api/superadmin/employees
-// The super admin creates an employee account directly, assigning the
-// login credentials themselves (the employee never self-registers, and
-// the super admin's own credentials are never shared). Nothing except a
-// unique email + password is required — name/role type are optional.
+// GET /api/superadmin/users/:id/overview
 const getUserOverview = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
 
   const [userRows] = await pool.query(
     `SELECT
@@ -465,6 +497,37 @@ const getUserOverview = asyncHandler(async (req, res) => {
   }
 
   const user = userRows[0];
+
+  const [subRows] = await pool.query(
+    `SELECT s.id, s.status, s.plan_id, s.starts_at, s.ends_at, s.is_complimentary,
+            p.name AS plan_name, p.code AS plan_code, p.price_paise, p.duration_months
+     FROM subscriptions s
+     JOIN subscription_plans p ON s.plan_id = p.id
+     WHERE s.user_id = ?
+     ORDER BY s.ends_at DESC
+     LIMIT 1`,
+    [id]
+  );
+
+  let subscription = null;
+  if (subRows.length > 0) {
+    const sub = subRows[0];
+    const now = new Date();
+    const endsAt = sub.ends_at ? new Date(sub.ends_at) : null;
+    const isActive = sub.status === "active" && endsAt && endsAt > now;
+    const remainingDays = endsAt ? Math.max(0, Math.ceil((endsAt - now) / (1000 * 60 * 60 * 24))) : 0;
+    subscription = {
+      id: sub.id,
+      plan_name: sub.plan_name,
+      plan_code: sub.plan_code,
+      starts_at: sub.starts_at,
+      ends_at: sub.ends_at,
+      remaining_days: remainingDays,
+      status: isActive ? "active" : (endsAt && endsAt <= now ? "expired" : sub.status),
+      is_complimentary: Boolean(sub.is_complimentary),
+    };
+  }
+  user.subscription = subscription;
 
   const [
     customerResult,
@@ -560,93 +623,16 @@ const getUserOverview = asyncHandler(async (req, res) => {
   });
 });
 const createEmployee = asyncHandler(async (req, res) => {
-  const { name, email, password, phone, secondary_phone, employee_role_type, employee_title, date_of_birth, employee_age, address, pan, aadhaar_number, passport_number, permissions } = req.body;
-  if (!email || !password) {
-    throw new ApiError(400, "email and password are required to create an employee login.");
-  }
-
-  const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
-  if (existing.length) throw new ApiError(409, "An account with this email already exists.");
-
-  const normalizedPermissions = normalizePermissions(permissions);
-  const hashed = await bcrypt.hash(password, 10);
-
-  const [result] = await pool.query(
-    `INSERT INTO users (
-       name, email, phone, secondary_phone, password, role,
-       employee_role_type, employee_title, date_of_birth, employee_age,
-       address, pan, aadhaar_number, passport_number, profile_photo_path,
-       permissions, created_by_admin
-     )
-     VALUES (?, ?, ?, ?, ?, 'employee', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      name || null,
-      email,
-      phone || null,
-      secondary_phone || null,
-      hashed,
-      employee_role_type || null,
-      employee_title || null,
-      date_of_birth || null,
-      employee_age || null,
-      address || null,
-      pan || null,
-      aadhaar_number || null,
-      passport_number || null,
-      req.file ? relativeUploadPath(req.file.path) : null,
-      normalizedPermissions ? JSON.stringify(normalizedPermissions) : null,
-      req.user.id,
-    ]
-  );
-
-  const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [result.insertId]);
-  res.status(201).json({ success: true, employee: publicUser(rows[0]) });
-});
-
-// GET /api/superadmin/employees
-const listEmployees = asyncHandler(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, name, email, phone, secondary_phone,
-            employee_title, employee_role_type, date_of_birth, employee_age,
-            address, pan, aadhaar_number, passport_number,
-            profile_photo_path, permissions, status,
-            last_login_at, last_active_at, created_by_admin, created_at, updated_at
-     FROM users
-     WHERE role = 'employee'
-     ORDER BY created_at DESC`
-  );
-  res.json({ success: true, count: rows.length, employees: rows });
-});
-
-// GET /api/superadmin/employees/:id
-const getEmployee = asyncHandler(async (req, res) => {
-  const [rows] = await pool.query(
-    `SELECT id, name, email, phone, secondary_phone,
-            employee_title, employee_role_type, date_of_birth, employee_age,
-            address, pan, aadhaar_number, passport_number,
-            profile_photo_path, permissions, status,
-            last_login_at, last_active_at,
-            CASE WHEN last_active_at IS NOT NULL AND last_active_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) THEN 'logged_in' ELSE 'logged_out' END AS activity_status,
-            created_by_admin, created_at, updated_at
-     FROM users
-     WHERE id = ? AND role = 'employee'`,
-    [req.params.id]
-  );
-
-  if (!rows.length) throw new ApiError(404, "Employee not found.");
-
-  res.json({ success: true, employee: rows[0] });
-});
-
-
-// PATCH /api/superadmin/employees/:id
-// Update an employee's role-type label / phone / name. Nothing required.
-const updateEmployee = asyncHandler(async (req, res) => {
-  const { id } = req.params;
   const {
     name,
+    email,
+    password,
     phone,
     secondary_phone,
+    employee_code,
+    joining_date,
+    emergency_contact,
+    notes,
     employee_role_type,
     employee_title,
     date_of_birth,
@@ -656,6 +642,297 @@ const updateEmployee = asyncHandler(async (req, res) => {
     aadhaar_number,
     passport_number,
     permissions,
+    assigned_modules,
+  } = req.body;
+
+  if (!email || !password) {
+    throw new ApiError(400, "email and password are required to create an employee login.");
+  }
+
+  const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
+  if (existing.length) throw new ApiError(409, "An account with this email already exists.");
+
+  const normalizedPermissions = normalizePermissions(permissions);
+  let assignedModulesJson;
+  if (Array.isArray(assigned_modules)) {
+    assignedModulesJson = JSON.stringify(assigned_modules);
+  } else if (typeof assigned_modules === "string" && assigned_modules.trim().startsWith("[")) {
+    try {
+      assignedModulesJson = JSON.stringify(JSON.parse(assigned_modules));
+    } catch (_) {
+      assignedModulesJson = JSON.stringify([assigned_modules]);
+    }
+  } else if (typeof assigned_modules === "string" && assigned_modules.trim()) {
+    assignedModulesJson = JSON.stringify([assigned_modules.trim()]);
+  } else {
+    assignedModulesJson = JSON.stringify(["users", "help_centre"]);
+  }
+  const hashed = await bcrypt.hash(password, 10);
+
+  const [result] = await pool.query(
+    `INSERT INTO users (
+       name, email, phone, secondary_phone, employee_code, joining_date, emergency_contact, notes,
+       password, role, employee_role_type, employee_title, date_of_birth, employee_age,
+       address, pan, aadhaar_number, passport_number, profile_photo_path,
+       permissions, assigned_modules, created_by_admin
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      name || null,
+      email,
+      phone || null,
+      secondary_phone || null,
+      employee_code && employee_code.trim() ? employee_code.trim() : null,
+      joining_date && String(joining_date).trim() ? String(joining_date).trim().slice(0, 10) : null,
+      emergency_contact && emergency_contact.trim() ? emergency_contact.trim() : null,
+      notes && notes.trim() ? notes.trim() : null,
+      hashed,
+      employee_role_type && employee_role_type.trim() ? employee_role_type.trim() : "staff",
+      employee_title && employee_title.trim() ? employee_title.trim() : null,
+      date_of_birth && String(date_of_birth).trim() ? String(date_of_birth).trim().slice(0, 10) : null,
+      employee_age !== "" && employee_age !== null && !isNaN(Number(employee_age)) ? parseInt(employee_age, 10) : null,
+      address && address.trim() ? address.trim() : null,
+      pan && pan.trim() ? pan.trim() : null,
+      aadhaar_number && aadhaar_number.trim() ? aadhaar_number.trim() : null,
+      passport_number && passport_number.trim() ? passport_number.trim() : null,
+      req.file ? relativeUploadPath(req.file.path) : null,
+      normalizedPermissions ? JSON.stringify(normalizedPermissions) : null,
+      assignedModulesJson,
+      req.user.id,
+    ]
+  );
+
+  const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [result.insertId]);
+
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, 'CREATE_EMPLOYEE', 'employee', ?, NULL, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        String(result.insertId),
+        JSON.stringify(publicUser(rows[0])),
+        JSON.stringify({ name: rows[0].name, email: rows[0].email }),
+        req.ip || null,
+      ]
+    );
+  } catch (_) {}
+
+  res.status(201).json({ success: true, employee: publicUser(rows[0]) });
+});
+
+// GET /api/superadmin/employees
+const listEmployees = asyncHandler(async (req, res) => {
+  const { search, status, page, limit } = req.query;
+
+  let query = `
+    SELECT u.id, u.name, u.email, u.phone, u.secondary_phone,
+           u.employee_code, u.joining_date, u.emergency_contact, u.notes, u.assigned_modules,
+           u.employee_title, u.employee_role_type, u.date_of_birth, u.employee_age,
+           u.address, u.pan, u.aadhaar_number, u.passport_number,
+           u.profile_photo_path, u.permissions, u.status,
+           u.last_login_at, u.last_active_at,
+           CASE WHEN u.last_active_at IS NOT NULL AND u.last_active_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) THEN 'logged_in' ELSE 'logged_out' END AS activity_status,
+           u.created_by_admin, u.created_at, u.updated_at,
+           COALESCE(fb.rating_avg, 0) AS rating_avg,
+           COALESCE(fb.rating_count, 0) AS rating_count,
+           COALESCE(tc.tickets_handled, 0) AS tickets_handled
+    FROM users u
+    LEFT JOIN (
+      SELECT employee_id, ROUND(AVG(rating), 1) AS rating_avg, COUNT(*) AS rating_count
+      FROM support_ticket_feedback
+      GROUP BY employee_id
+    ) fb ON fb.employee_id = u.id
+    LEFT JOIN (
+      SELECT assigned_employee_id, COUNT(*) AS tickets_handled
+      FROM support_tickets
+      GROUP BY assigned_employee_id
+    ) tc ON tc.assigned_employee_id = u.id
+    WHERE u.role = 'employee' AND u.deleted_at IS NULL
+  `;
+  const params = [];
+
+  if (status && (status === "active" || status === "inactive")) {
+    query += " AND u.status = ?";
+    params.push(status);
+  }
+
+  if (search && search.trim()) {
+    const s = `%${search.trim()}%`;
+    query += " AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR u.employee_code LIKE ? OR u.employee_title LIKE ?)";
+    params.push(s, s, s, s, s);
+  }
+
+  query += " ORDER BY u.created_at DESC";
+
+  const [rows] = await pool.query(query, params);
+
+  const formatted = rows.map((emp) => {
+    let assigned = [];
+    if (Array.isArray(emp.assigned_modules)) assigned = emp.assigned_modules;
+    else if (typeof emp.assigned_modules === "string") {
+      try { assigned = JSON.parse(emp.assigned_modules); } catch (_) { assigned = []; }
+    }
+    return {
+      ...emp,
+      rating_avg: Number(emp.rating_avg || 0),
+      rating_count: Number(emp.rating_count || 0),
+      tickets_handled: Number(emp.tickets_handled || 0),
+      assigned_modules: assigned,
+    };
+  });
+
+  const pageNum = Math.max(1, Number(page) || 1);
+  const limitNum = Math.min(100, Math.max(1, Number(limit) || 50));
+  const total = formatted.length;
+  const paginated = page ? formatted.slice((pageNum - 1) * limitNum, pageNum * limitNum) : formatted;
+
+  res.json({
+    success: true,
+    count: paginated.length,
+    total,
+    page: pageNum,
+    totalPages: Math.ceil(total / limitNum) || 1,
+    employees: paginated,
+  });
+});
+
+// GET /api/superadmin/employees/:id
+const getEmployee = asyncHandler(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT u.id, u.name, u.email, u.phone, u.secondary_phone,
+            u.employee_code, u.joining_date, u.emergency_contact, u.notes, u.assigned_modules,
+            u.employee_title, u.employee_role_type, u.date_of_birth, u.employee_age,
+            u.address, u.pan, u.aadhaar_number, u.passport_number,
+            u.profile_photo_path, u.permissions, u.status,
+            u.last_login_at, u.last_active_at,
+            CASE WHEN u.last_active_at IS NOT NULL AND u.last_active_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE) THEN 'logged_in' ELSE 'logged_out' END AS activity_status,
+            u.created_by_admin, u.created_at, u.updated_at,
+            COALESCE(fb.rating_avg, 0) AS rating_avg,
+            COALESCE(fb.rating_count, 0) AS rating_count,
+            COALESCE(tc.tickets_handled, 0) AS tickets_handled,
+            COALESCE(tc.tickets_resolved, 0) AS tickets_resolved
+     FROM users u
+     LEFT JOIN (
+       SELECT employee_id, ROUND(AVG(rating), 1) AS rating_avg, COUNT(*) AS rating_count
+       FROM support_ticket_feedback
+       GROUP BY employee_id
+     ) fb ON fb.employee_id = u.id
+     LEFT JOIN (
+       SELECT assigned_employee_id,
+              COUNT(*) AS tickets_handled,
+              COUNT(CASE WHEN status IN ('resolved', 'closed') THEN 1 END) AS tickets_resolved
+       FROM support_tickets
+       GROUP BY assigned_employee_id
+     ) tc ON tc.assigned_employee_id = u.id
+     WHERE u.id = ? AND u.role = 'employee'`,
+    [req.params.id]
+  );
+
+  if (!rows.length) throw new ApiError(404, "Employee not found.");
+
+  const emp = rows[0];
+  let assigned = [];
+  if (Array.isArray(emp.assigned_modules)) assigned = emp.assigned_modules;
+  else if (typeof emp.assigned_modules === "string") {
+    try { assigned = JSON.parse(emp.assigned_modules); } catch (_) { assigned = []; }
+  }
+
+  // Rating distribution counts (5 down to 1)
+  const [distRows] = await pool.query(
+    `SELECT rating, COUNT(*) AS count
+     FROM support_ticket_feedback
+     WHERE employee_id = ?
+     GROUP BY rating`,
+    [req.params.id]
+  );
+  const ratingDistribution = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+  for (const r of distRows) {
+    if (ratingDistribution[r.rating] !== undefined) {
+      ratingDistribution[r.rating] = Number(r.count);
+    }
+  }
+
+  // Recent customer feedback
+  const [recentFeedback] = await pool.query(
+    `SELECT stf.id, stf.rating, stf.comment, stf.created_at,
+            st.ticket_number, st.subject AS ticket_subject,
+            u.name AS customer_name, u.email AS customer_email
+     FROM support_ticket_feedback stf
+     JOIN support_tickets st ON st.id = stf.ticket_id
+     JOIN users u ON u.id = stf.user_id
+     WHERE stf.employee_id = ?
+     ORDER BY stf.created_at DESC
+     LIMIT 10`,
+    [req.params.id]
+  );
+
+  // Employee action and target audit logs
+  const [auditLogs] = await pool.query(
+    `SELECT a.id, a.actor_id, a.actor_role, a.action, a.target_type, a.target_id, a.details, a.created_at, a.ip_address,
+            COALESCE(i.invoice_number, '') AS invoice_number,
+            COALESCE(i.total_amount, 0) AS invoice_total,
+            COALESCE(i.to_name, '') AS invoice_recipient,
+            COALESCE(i.pdf_path, '') AS invoice_pdf,
+            COALESCE(q.quotation_number, '') AS quotation_number,
+            COALESCE(q.total_amount, 0) AS quotation_total,
+            COALESCE(q.to_name, '') AS quotation_recipient,
+            COALESCE(q.pdf_path, '') AS quotation_pdf,
+            COALESCE(mr.receipt_number, '') AS receipt_number,
+            COALESCE(mr.amount_received, 0) AS receipt_amount,
+            COALESCE(mr.received_from_name, '') AS receipt_recipient,
+            COALESCE(mr.pdf_path, '') AS receipt_pdf
+     FROM admin_audit_logs a
+     LEFT JOIN invoices i ON a.target_type = 'invoice' AND i.id = CAST(a.target_id AS UNSIGNED)
+     LEFT JOIN quotations q ON a.target_type = 'quotation' AND q.id = CAST(a.target_id AS UNSIGNED)
+     LEFT JOIN money_receipts mr ON (a.target_type = 'receipt' OR a.target_type = 'money_receipt') AND mr.id = CAST(a.target_id AS UNSIGNED)
+     WHERE a.actor_id = ? OR (a.target_type = 'employee' AND a.target_id = ?)
+     ORDER BY a.created_at DESC
+     LIMIT 100`,
+    [req.params.id, String(req.params.id)]
+  );
+
+  res.json({
+    success: true,
+    employee: {
+      ...emp,
+      rating_avg: Number(emp.rating_avg || 0),
+      rating_count: Number(emp.rating_count || 0),
+      tickets_handled: Number(emp.tickets_handled || 0),
+      tickets_resolved: Number(emp.tickets_resolved || 0),
+      assigned_modules: assigned,
+      rating_distribution: ratingDistribution,
+      recent_feedback: recentFeedback,
+      audit_logs: auditLogs,
+    },
+  });
+});
+
+// PATCH /api/superadmin/employees/:id
+const updateEmployee = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const {
+    name,
+    email,
+    phone,
+    secondary_phone,
+    employee_code,
+    joining_date,
+    emergency_contact,
+    notes,
+    employee_role_type,
+    employee_title,
+    date_of_birth,
+    employee_age,
+    address,
+    pan,
+    aadhaar_number,
+    passport_number,
+    permissions,
+    assigned_modules,
+    status,
+    password,
   } = req.body;
 
   const [rows] = await pool.query(
@@ -663,43 +940,180 @@ const updateEmployee = asyncHandler(async (req, res) => {
     [id]
   );
   if (!rows.length) throw new ApiError(404, "Employee not found.");
+  const current = rows[0];
 
-  const normalizedPermissions = normalizePermissions(permissions);
+  // If email is changing, ensure uniqueness
+  if (email && email.trim() && email.trim().toLowerCase() !== current.email.toLowerCase()) {
+    const [conflict] = await pool.query(
+      "SELECT id FROM users WHERE email = ? AND id != ?",
+      [email.trim().toLowerCase(), id]
+    );
+    if (conflict.length) {
+      throw new ApiError(409, "An account with this email already exists.");
+    }
+  }
+
+  // Sanitize values cleanly
+  const nameVal = name !== undefined ? (name && name.trim() ? name.trim() : null) : current.name;
+  const emailVal = email !== undefined ? (email && email.trim() ? email.trim().toLowerCase() : current.email) : current.email;
+  const phoneVal = phone !== undefined ? (phone && phone.trim() ? phone.trim() : null) : current.phone;
+  const secondaryPhoneVal = secondary_phone !== undefined ? (secondary_phone && secondary_phone.trim() ? secondary_phone.trim() : null) : current.secondary_phone;
+  const employeeCodeVal = employee_code !== undefined ? (employee_code && employee_code.trim() ? employee_code.trim() : null) : current.employee_code;
+  const joiningDateVal = joining_date !== undefined
+    ? (joining_date && String(joining_date).trim() ? String(joining_date).trim().slice(0, 10) : null)
+    : (current.joining_date ? new Date(current.joining_date).toISOString().slice(0, 10) : null);
+  const emergencyContactVal = emergency_contact !== undefined ? (emergency_contact && emergency_contact.trim() ? emergency_contact.trim() : null) : current.emergency_contact;
+  const notesVal = notes !== undefined ? (notes && notes.trim() ? notes.trim() : null) : current.notes;
+  const roleTypeVal = employee_role_type !== undefined ? (employee_role_type && employee_role_type.trim() ? employee_role_type.trim() : "staff") : current.employee_role_type;
+  const titleVal = employee_title !== undefined ? (employee_title && employee_title.trim() ? employee_title.trim() : null) : current.employee_title;
+  const dobVal = date_of_birth !== undefined
+    ? (date_of_birth && String(date_of_birth).trim() ? String(date_of_birth).trim().slice(0, 10) : null)
+    : (current.date_of_birth ? new Date(current.date_of_birth).toISOString().slice(0, 10) : null);
+  const ageVal = employee_age !== undefined
+    ? (employee_age !== "" && employee_age !== null && !isNaN(Number(employee_age)) ? parseInt(employee_age, 10) : null)
+    : current.employee_age;
+  const addressVal = address !== undefined ? (address && address.trim() ? address.trim() : null) : current.address;
+  const panVal = pan !== undefined ? (pan && pan.trim() ? pan.trim() : null) : current.pan;
+  const aadhaarVal = aadhaar_number !== undefined ? (aadhaar_number && aadhaar_number.trim() ? aadhaar_number.trim() : null) : current.aadhaar_number;
+  const passportVal = passport_number !== undefined ? (passport_number && passport_number.trim() ? passport_number.trim() : null) : current.passport_number;
+
+  const photoPath = req.file ? relativeUploadPath(req.file.path) : null;
+  const photoVal = photoPath !== null ? photoPath : current.profile_photo_path;
+
+  let assignedModulesJson = current.assigned_modules;
+  if (assigned_modules !== undefined) {
+    if (Array.isArray(assigned_modules)) {
+      assignedModulesJson = JSON.stringify(assigned_modules);
+    } else if (typeof assigned_modules === "string" && assigned_modules.trim().startsWith("[")) {
+      try {
+        assignedModulesJson = JSON.stringify(JSON.parse(assigned_modules));
+      } catch (_) {
+        assignedModulesJson = JSON.stringify([assigned_modules]);
+      }
+    } else if (typeof assigned_modules === "string" && assigned_modules.trim()) {
+      assignedModulesJson = JSON.stringify([assigned_modules.trim()]);
+    } else {
+      assignedModulesJson = JSON.stringify([]);
+    }
+  }
+
+  const normalizedPermissions = permissions !== undefined ? normalizePermissions(permissions) : (current.permissions ? (typeof current.permissions === "string" ? JSON.parse(current.permissions) : current.permissions) : []);
+  const permissionsJson = JSON.stringify(normalizedPermissions);
+
+  let hashedPassword = current.password;
+  if (password && password.trim()) {
+    hashedPassword = await bcrypt.hash(password.trim(), 10);
+  }
+
+  const statusVal = status !== undefined ? (status && status.trim() ? status.trim() : current.status) : current.status;
 
   await pool.query(
     `UPDATE users SET
-       name = COALESCE(?, name),
-       phone = COALESCE(?, phone),
-       secondary_phone = COALESCE(?, secondary_phone),
-       employee_role_type = COALESCE(?, employee_role_type),
-       employee_title = COALESCE(?, employee_title),
-       date_of_birth = COALESCE(?, date_of_birth),
-       employee_age = COALESCE(?, employee_age),
-       address = COALESCE(?, address),
-       pan = COALESCE(?, pan),
-       aadhaar_number = COALESCE(?, aadhaar_number),
-       passport_number = COALESCE(?, passport_number),
-       permissions = COALESCE(?, permissions)
+       name = ?,
+       email = ?,
+       phone = ?,
+       secondary_phone = ?,
+       employee_code = ?,
+       joining_date = ?,
+       emergency_contact = ?,
+       notes = ?,
+       employee_role_type = ?,
+       employee_title = ?,
+       date_of_birth = ?,
+       employee_age = ?,
+       address = ?,
+       pan = ?,
+       aadhaar_number = ?,
+       passport_number = ?,
+       profile_photo_path = ?,
+       permissions = ?,
+       assigned_modules = ?,
+       status = ?,
+       password = ?
      WHERE id = ?`,
     [
-      name ?? null,
-      phone ?? null,
-      secondary_phone ?? null,
-      employee_role_type ?? null,
-      employee_title ?? null,
-      date_of_birth ?? null,
-      employee_age ?? null,
-      address ?? null,
-      pan ?? null,
-      aadhaar_number ?? null,
-      passport_number ?? null,
-      normalizedPermissions === null ? null : JSON.stringify(normalizedPermissions),
+      nameVal,
+      emailVal,
+      phoneVal,
+      secondaryPhoneVal,
+      employeeCodeVal,
+      joiningDateVal,
+      emergencyContactVal,
+      notesVal,
+      roleTypeVal,
+      titleVal,
+      dobVal,
+      ageVal,
+      addressVal,
+      panVal,
+      aadhaarVal,
+      passportVal,
+      photoVal,
+      permissionsJson,
+      assignedModulesJson,
+      statusVal,
+      hashedPassword,
       id,
     ]
   );
 
   const [updated] = await pool.query("SELECT * FROM users WHERE id = ?", [id]);
+
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, 'UPDATE_EMPLOYEE', 'employee', ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        String(id),
+        JSON.stringify(publicUser(current)),
+        JSON.stringify(publicUser(updated[0])),
+        JSON.stringify({ name: updated[0].name, email: updated[0].email }),
+        req.ip || null,
+      ]
+    );
+  } catch (_) {}
+
   res.json({ success: true, employee: publicUser(updated[0]) });
+});
+
+// DELETE /api/superadmin/employees/:id
+const deleteEmployee = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE id = ? AND role = 'employee'",
+    [id]
+  );
+  if (!rows.length) throw new ApiError(404, "Employee not found.");
+  const target = rows[0];
+
+  await pool.query(
+    "UPDATE users SET status = 'inactive', deleted_at = NOW(), deleted_by = ?, last_active_at = NULL WHERE id = ?",
+    [req.user.id, id]
+  );
+
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, 'DELETE_EMPLOYEE', 'employee', ?, ?, NULL, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        String(id),
+        JSON.stringify(publicUser(target)),
+        JSON.stringify({ name: target.name, email: target.email, action: "soft_deleted_and_deactivated" }),
+        req.ip || null,
+      ]
+    );
+  } catch (_) {}
+
+  res.json({
+    success: true,
+    message: `Employee "${target.name || target.email}" was deactivated and removed from active roster.`,
+    employee: { id: target.id, email: target.email, name: target.name },
+  });
 });
 
 // PATCH /api/superadmin/users/:id/status
@@ -933,6 +1347,7 @@ const calculateUserReports = async (id, rangeFrom = null, rangeTo = null, period
 
 const getUserData = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const type = String(req.query.type || "").trim().toLowerCase();
 
   const [userRows] = await pool.query(
@@ -942,6 +1357,46 @@ const getUserData = asyncHandler(async (req, res) => {
 
   if (!userRows.length) {
     throw new ApiError(404, "User not found.");
+  }
+
+  // Delegated employee module access enforcement
+  if (req.user.role === "employee") {
+    let assigned = [];
+    if (Array.isArray(req.user.assigned_modules)) assigned = req.user.assigned_modules;
+    else if (typeof req.user.assigned_modules === "string") {
+      try { assigned = JSON.parse(req.user.assigned_modules); } catch (_) { assigned = []; }
+    }
+
+    if (!assigned.includes("all")) {
+      const moduleMap = {
+        customers: "customers",
+        khata: "khata",
+        payments: "payments",
+        "purchase-bills": "inventory",
+        purchase_bills: "inventory",
+        purchases: "inventory",
+        inventory: "inventory",
+        stock: "inventory",
+        vehicles: "vehicles",
+        invoices: "invoices",
+        quotations: "invoices",
+        "money-receipts": "invoices",
+        reports: "reports",
+        "reports-drilldown": "reports",
+        drilldown: "reports",
+        billing: "billing",
+        subscriptions: "billing",
+      };
+      const requiredMod = moduleMap[type];
+      const hasAccess = requiredMod && (
+        assigned.includes(requiredMod) ||
+        (type === "quotations" && (assigned.includes("quotations") || assigned.includes("invoices"))) ||
+        (type === "money-receipts" && (assigned.includes("payments") || assigned.includes("invoices")))
+      );
+      if (!hasAccess) {
+        throw new ApiError(403, `You do not have permission to view ${type.replace(/[-_]/g, " ")}.`);
+      }
+    }
   }
 
   let rows = [];
@@ -1346,10 +1801,43 @@ const getUserData = asyncHandler(async (req, res) => {
       });
     }
 
+    case "billing":
+    case "subscriptions": {
+      const [subscriptions] = await pool.query(
+        `SELECT s.*, p.name AS plan_name, p.code AS plan_code
+         FROM subscriptions s
+         LEFT JOIN subscription_plans p ON s.plan_id = p.id
+         WHERE s.user_id = ?
+         ORDER BY s.ends_at DESC`,
+        [id]
+      );
+      const [orders] = await pool.query(
+        `SELECT so.*, p.name AS plan_name
+         FROM subscription_orders so
+         LEFT JOIN subscription_plans p ON so.plan_id = p.id
+         WHERE so.user_id = ?
+         ORDER BY so.created_at DESC`,
+        [id]
+      );
+      const now = new Date();
+      const activeSub = subscriptions.find((s) => s.status === "active" && new Date(s.ends_at) > now) || null;
+      return res.json({
+        success: true,
+        user: userRows[0],
+        type: "billing",
+        activeSubscription: activeSub,
+        subscriptions,
+        orders,
+        records: orders,
+        data: orders,
+        count: orders.length,
+      });
+    }
+
     default:
       throw new ApiError(
         400,
-        "Invalid data type. Use customers, khata, payments, purchase-bills, invoices, quotations, money-receipts, inventory, vehicles, or reports."
+        "Invalid data type. Use customers, khata, payments, purchase-bills, invoices, quotations, money-receipts, inventory, vehicles, reports, or billing."
       );
   }
 
@@ -1379,6 +1867,7 @@ const getUserData = asyncHandler(async (req, res) => {
 
 const getUserRecord = asyncHandler(async (req, res) => {
   const { id, recordId } = req.params;
+  await checkTenantAccess(req.user, id);
   const type = String(req.query.type || "").trim().toLowerCase();
 
   const [userRows] = await pool.query(
@@ -1768,6 +2257,7 @@ const getUserRecord = asyncHandler(async (req, res) => {
 
 const getUserCustomers = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -1793,6 +2283,7 @@ const getUserCustomers = asyncHandler(async (req, res) => {
 
 const getUserKhata = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2024,6 +2515,7 @@ const getUserKhata = asyncHandler(async (req, res) => {
 
 const getUserPayments = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2076,6 +2568,7 @@ const getUserPayments = asyncHandler(async (req, res) => {
 
 const getUserPurchaseBills = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2160,6 +2653,7 @@ const getUserPurchaseBills = asyncHandler(async (req, res) => {
 
 const getUserReportDrilldown = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2181,6 +2675,7 @@ const getUserReportDrilldown = asyncHandler(async (req, res) => {
 
 const getUserInventory = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2252,6 +2747,7 @@ const getUserInventory = asyncHandler(async (req, res) => {
 
 const getUserVehicles = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2278,6 +2774,7 @@ const getUserVehicles = asyncHandler(async (req, res) => {
 
 const getUserReports = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2301,6 +2798,7 @@ const getUserReports = asyncHandler(async (req, res) => {
 
 const getUserReportGraph = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  await checkTenantAccess(req.user, id);
   const [userRows] = await pool.query(
     "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
     [id]
@@ -2373,6 +2871,151 @@ const deleteUserCustomer = asyncHandler(async (req, res) => {
   }
 });
 
+const getUserInvoices = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  await checkTenantAccess(req.user, id);
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  const [rows] = await pool.query(
+    `SELECT i.*,
+            COALESCE(i.to_name, c.name) AS customer_name,
+            COALESCE(i.to_email, c.email) AS customer_email,
+            COALESCE(i.to_phone, c.phone) AS customer_phone,
+            u.name AS created_by_name
+     FROM invoices i
+     LEFT JOIN customers c ON c.id = i.customer_id AND c.created_by = i.created_by
+     LEFT JOIN users u ON u.id = i.created_by
+     WHERE i.doc_type = 'invoice' AND i.created_by = ?
+     ORDER BY i.invoice_date DESC, i.id DESC`,
+    [id]
+  );
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    count: rows.length,
+    invoices: rows,
+    records: rows,
+    data: rows,
+  });
+});
+
+const getUserQuotations = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  await checkTenantAccess(req.user, id);
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  const [rows] = await pool.query(
+    `SELECT q.*,
+            'quotation' AS doc_type,
+            q.quotation_number AS invoice_number,
+            q.quotation_date AS invoice_date,
+            COALESCE(q.to_name, c.name) AS customer_name,
+            COALESCE(q.to_email, c.email) AS customer_email,
+            COALESCE(q.to_phone, c.phone) AS customer_phone,
+            u.name AS created_by_name
+     FROM quotations q
+     LEFT JOIN customers c ON c.id = q.customer_id AND c.created_by = q.created_by
+     LEFT JOIN users u ON u.id = q.created_by
+     WHERE q.created_by = ?
+     ORDER BY q.quotation_date DESC, q.id DESC`,
+    [id]
+  );
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    count: rows.length,
+    quotations: rows,
+    records: rows,
+    data: rows,
+  });
+});
+
+const getUserMoneyReceipts = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  await checkTenantAccess(req.user, id);
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  const [rows] = await pool.query(
+    `SELECT mr.*,
+            COALESCE(mr.received_from_name, c.name) AS customer_name,
+            c.email AS customer_email,
+            c.phone AS customer_phone,
+            u.name AS created_by_name
+     FROM money_receipts mr
+     LEFT JOIN customers c ON c.id = mr.customer_id
+     LEFT JOIN users u ON u.id = mr.created_by
+     WHERE mr.created_by = ?
+     ORDER BY mr.receipt_date DESC, mr.id DESC`,
+    [id]
+  );
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    count: rows.length,
+    receipts: rows,
+    money_receipts: rows,
+    records: rows,
+    data: rows,
+  });
+});
+
+const getUserBilling = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  await checkTenantAccess(req.user, id);
+  const [userRows] = await pool.query(
+    "SELECT id, name, business_name FROM users WHERE id = ? AND role = 'user'",
+    [id]
+  );
+  if (!userRows.length) throw new ApiError(404, "User not found.");
+
+  const [subscriptions] = await pool.query(
+    `SELECT s.*, p.name AS plan_name, p.code AS plan_code
+     FROM subscriptions s
+     LEFT JOIN subscription_plans p ON s.plan_id = p.id
+     WHERE s.user_id = ?
+     ORDER BY s.ends_at DESC`,
+    [id]
+  );
+
+  const [orders] = await pool.query(
+    `SELECT so.*, p.name AS plan_name
+     FROM subscription_orders so
+     LEFT JOIN subscription_plans p ON so.plan_id = p.id
+     WHERE so.user_id = ?
+     ORDER BY so.created_at DESC`,
+    [id]
+  );
+
+  const now = new Date();
+  const activeSub = subscriptions.find((s) => s.status === "active" && new Date(s.ends_at) > now) || null;
+
+  res.json({
+    success: true,
+    user: userRows[0],
+    activeSubscription: activeSub,
+    subscriptions,
+    orders,
+    records: orders,
+    data: orders,
+    count: orders.length,
+  });
+});
+
 module.exports = {
   getUserRecord,
   getUserData,
@@ -2384,6 +3027,10 @@ module.exports = {
   getUserReportGraph,
   getUserPayments,
   getUserPurchaseBills,
+  getUserInvoices,
+  getUserQuotations,
+  getUserMoneyReceipts,
+  getUserBilling,
   getUserReportDrilldown,
   deleteUserCustomer,
   listUsers,
@@ -2393,6 +3040,7 @@ module.exports = {
   listEmployees,
   getEmployee,
   updateEmployee,
+  deleteEmployee,
   setUserStatus,
   deleteUser,
 };

@@ -12,11 +12,26 @@ const signToken = (user) =>
     { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
   );
 
+const parseJsonField = (val) => {
+  if (val === undefined || val === null) return [];
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+};
+
 const publicUser = (u) => ({
   id: u.id,
   name: u.name,
   email: u.email,
   phone: u.phone,
+  secondary_phone: u.secondary_phone,
 
   business_name: u.business_name,
   business_type: u.business_type,
@@ -46,7 +61,14 @@ const publicUser = (u) => ({
 
   role: u.role,
   employee_role_type: u.employee_role_type,
+  employee_title: u.employee_title,
+  employee_code: u.employee_code,
+  profile_photo_path: u.profile_photo_path,
+  assigned_modules: parseJsonField(u.assigned_modules),
+  permissions: parseJsonField(u.permissions),
+  created_by_admin: u.created_by_admin,
   status: u.status,
+  created_at: u.created_at,
 });
 
 // POST /api/auth/register
