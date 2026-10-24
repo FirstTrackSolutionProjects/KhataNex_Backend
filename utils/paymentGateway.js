@@ -13,11 +13,14 @@ function getAdapter() {
   const provider = (process.env.PAYMENT_PROVIDER || "razorpay").toLowerCase();
 
   if (isProd) {
-    if (provider === "mock") {
+    if (provider === "mock" || process.env.RAZORPAY_MOCK_GATEWAY === "true") {
       throw new ApiError(500, "Mock payment provider cannot be used in production.");
     }
     if (!razorpay.isConfigured()) {
-      throw new ApiError(503, "Payment checkout is currently unconfigured in production. Live Razorpay credentials are required.");
+      throw new ApiError(503, "Payment checkout is currently unconfigured in production. Live Razorpay credentials (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET) are required.");
+    }
+    if (razorpay.isTestMode()) {
+      throw new ApiError(503, "Test mode Razorpay credentials detected in production. Live Razorpay credentials (starting with rzp_live_) are required.");
     }
     return razorpay;
   }

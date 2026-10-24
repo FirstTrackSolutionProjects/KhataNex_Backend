@@ -30,8 +30,27 @@ const handlePaymentWebhook = asyncHandler(async (req, res) => {
   }
 
   const payload = req.body || {};
-  const eventId = payload.event_id || payload.id || `evt_${Date.now()}`;
   const eventType = payload.event || "unknown";
+  const paymentEntity = payload.payload?.payment?.entity || {};
+  const orderEntity = payload.payload?.order?.entity || {};
+  const eventId =
+    payload.event_id ||
+    payload.id ||
+    (paymentEntity.id ? `${eventType}_${paymentEntity.id}` : null) ||
+    (orderEntity.id ? `${eventType}_${orderEntity.id}` : null) ||
+    null;
+
+  // Guard: If payload lacks top-level event ID and usable entity IDs, do NOT fabricate an idempotency key.
+  // Acknowledge receipt safely and ignore without processing as a normal financial event.
+  if (!eventId) {
+    console.warn("⚠️ [PaymentWebhook] Webhook payload missing event ID and entity IDs; safely ignoring.");
+    return res.status(200).json({
+      success: true,
+      ignored: true,
+      status: "ignored",
+      message: "Webhook ignored: missing event identifier and usable entity IDs.",
+    });
+  }
 
   // Check for duplicate processed events
   const [existingEvents] = await pool.query(
@@ -42,18 +61,27 @@ const handlePaymentWebhook = asyncHandler(async (req, res) => {
     return res.status(200).json({ success: true, duplicate: true, message: "Event already processed." });
   }
 
-  // Insert event log
-  const [ins] = await pool.query(
-    `INSERT INTO payment_webhook_events (provider, event_id, event_type, payload, status)
-     VALUES ('razorpay', ?, ?, ?, 'processed')`,
-    [eventId, eventType, JSON.stringify(payload)]
-  );
-  const logId = ins.insertId;
+  // Insert event log (safely handle concurrent duplicate insertions)
+  let logId;
+  try {
+    const [ins] = await pool.query(
+      `INSERT INTO payment_webhook_events (provider, event_id, event_type, payload, status)
+       VALUES ('razorpay', ?, ?, ?, 'processed')`,
+      [eventId, eventType, JSON.stringify(payload)]
+    );
+    logId = ins.insertId;
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(200).json({ success: true, duplicate: true, message: "Event already processed." });
+    }
+    throw err;
+  }
 
   const finish = (status, errorMsg = null) => {
+    const dbStatus = ["processed", "ignored", "failed"].includes(status) ? status : "processed";
     pool.query(
       "UPDATE payment_webhook_events SET status = ?, error_message = ? WHERE id = ?",
-      [status, errorMsg, logId]
+      [dbStatus, errorMsg, logId]
     ).catch(console.error);
     return res.status(200).json({ success: true, event: eventType, status });
   };

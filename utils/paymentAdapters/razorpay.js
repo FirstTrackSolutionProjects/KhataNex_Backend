@@ -9,25 +9,77 @@ const ApiError = require("../ApiError");
  */
 class RazorpayAdapter {
   constructor() {
-    this.keyId = process.env.RAZORPAY_KEY_ID || "";
-    this.keySecret = process.env.RAZORPAY_KEY_SECRET || "";
-    this.webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || this.keySecret;
+    this.keyId = this.readEnvKeyId();
+    this.keySecret = this.readEnvKeySecret();
+    this.webhookSecret = this.readEnvWebhookSecret();
+  }
+
+  readEnvKeyId() {
+    const raw =
+      process.env.RAZORPAY_KEY_ID ||
+      process.env.RAZORPAY_LIVE_KEY_ID ||
+      process.env.RAZOR_PAY_KEY_ID ||
+      process.env.RZP_KEY_ID ||
+      process.env.RAZORPAY_KEY ||
+      "";
+    return String(raw).trim();
+  }
+
+  readEnvKeySecret() {
+    const raw =
+      process.env.RAZORPAY_KEY_SECRET ||
+      process.env.RAZORPAY_LIVE_KEY_SECRET ||
+      process.env.RAZOR_PAY_KEY_SECRET ||
+      process.env.RZP_KEY_SECRET ||
+      process.env.RAZORPAY_SECRET ||
+      "";
+    return String(raw).trim();
+  }
+
+  readEnvWebhookSecret() {
+    const raw =
+      process.env.RAZORPAY_WEBHOOK_SECRET ||
+      process.env.RAZOR_PAY_WEBHOOK_SECRET ||
+      process.env.RZP_WEBHOOK_SECRET ||
+      "";
+    const trimmed = String(raw).trim();
+    if (trimmed) return trimmed;
+    // In production, do not silently fall back to the API Key Secret.
+    if (process.env.NODE_ENV === "production") {
+      return "";
+    }
+    return this.readEnvKeySecret();
   }
 
   getKeyId() {
-    return process.env.RAZORPAY_KEY_ID || this.keyId || (process.env.RAZORPAY_MOCK_GATEWAY === "true" ? "rzp_test_mock_suite" : "");
+    const envVal = this.readEnvKeyId();
+    if (envVal) return envVal;
+    if (process.env.NODE_ENV !== "production" && process.env.RAZORPAY_MOCK_GATEWAY === "true") {
+      return "rzp_test_mock_suite";
+    }
+    return "";
   }
 
   getKeySecret() {
-    return process.env.RAZORPAY_KEY_SECRET || this.keySecret || (process.env.RAZORPAY_MOCK_GATEWAY === "true" ? "mock_razorpay_secret_for_tests" : "");
+    const envVal = this.readEnvKeySecret();
+    if (envVal) return envVal;
+    if (process.env.NODE_ENV !== "production" && process.env.RAZORPAY_MOCK_GATEWAY === "true") {
+      return "mock_razorpay_secret_for_tests";
+    }
+    return "";
   }
 
   getWebhookSecret() {
-    return process.env.RAZORPAY_WEBHOOK_SECRET || this.webhookSecret || this.getKeySecret();
+    const envVal = this.readEnvWebhookSecret();
+    if (envVal) return envVal;
+    if (process.env.NODE_ENV === "production") {
+      return "";
+    }
+    return this.getKeySecret();
   }
 
   isConfigured() {
-    if (process.env.RAZORPAY_MOCK_GATEWAY === "true") return true;
+    if (process.env.NODE_ENV !== "production" && process.env.RAZORPAY_MOCK_GATEWAY === "true") return true;
     return Boolean(this.getKeyId() && this.getKeySecret());
   }
 
@@ -53,13 +105,13 @@ class RazorpayAdapter {
       throw new ApiError(503, "Razorpay API credentials (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET) are not configured.");
     }
 
-    // Safety guard: prevent accidental live charges if test mode is explicitly enforced
-    if (process.env.RAZORPAY_FORCE_TEST_MODE === "true" && !this.isTestMode()) {
+    // Safety guard: prevent accidental live charges if test mode is explicitly enforced in non-production
+    if (process.env.NODE_ENV !== "production" && process.env.RAZORPAY_FORCE_TEST_MODE === "true" && !this.isTestMode()) {
       throw new ApiError(400, "Live mode Razorpay key blocked: RAZORPAY_FORCE_TEST_MODE is enabled.");
     }
 
-    // Deterministic mock order creation for automated test suites
-    if (process.env.RAZORPAY_MOCK_GATEWAY === "true") {
+    // Deterministic mock order creation for automated test suites (strictly forbidden in production)
+    if (process.env.NODE_ENV !== "production" && process.env.RAZORPAY_MOCK_GATEWAY === "true") {
       return {
         provider: "razorpay",
         providerOrderId: `order_test_${orderId}_${Date.now()}`,
