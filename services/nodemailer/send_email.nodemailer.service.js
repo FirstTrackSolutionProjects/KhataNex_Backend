@@ -1,4 +1,4 @@
-const { transporter } = require("../../utils/mailer.js")
+const { sendMail } = require("../../utils/mailer.js");
 
 /**
  * Sends an email via Nodemailer.
@@ -7,13 +7,12 @@ const { transporter } = require("../../utils/mailer.js")
  * @param {import("nodemailer").Attachment[]} [attachments=[]] - Optional file attachments
  */
 const sendEmail = async (to, template, attachments = []) => {
-    await transporter.sendMail({
-        from: process.env.SMTP_USER,
-        to: to,
-        subject: template.subject,
-        html: template.html,
-        attachments,
-    });
-}
+  return sendMail({
+    to,
+    subject: template?.subject || "Message from KhataNex",
+    html: template?.html || "",
+    attachments,
+  });
+};
 
 module.exports = sendEmail;

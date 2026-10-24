@@ -16,9 +16,13 @@ const {
   getCashInBankDrilldown,
   getNetProfitDrilldown,
 } = require("../controllers/reportController");
+const { getSubscriptionReports } = require("../controllers/billingAdminController");
 const { authenticate, authorize } = require("../middleware/auth");
 
 router.use(authenticate, authorize("user", "employee", "superadmin"));
+
+// Dedicated Superadmin subscription reports
+router.get("/subscriptions", authorize("superadmin"), getSubscriptionReports);
 
 // Drill-down transaction routes for each report metric
 router.get("/drilldown/:metric", getReportDrilldown);

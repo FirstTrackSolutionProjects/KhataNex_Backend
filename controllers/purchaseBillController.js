@@ -8,6 +8,20 @@ const normalizeRate = (value) => {
   return rate;
 };
 
+const formatDateTimeForMySQL = (val) => {
+  if (!val) return null;
+  const d = new Date(val);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 19).replace("T", " ");
+};
+
+const formatDateForMySQL = (val) => {
+  if (!val) return null;
+  const d = new Date(val);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+};
+
 // Check if an item is a real, non-empty item to eliminate automatic/empty/duplicate item creation
 const isValidItem = (item) => {
   if (!item || typeof item !== "object") return false;
@@ -174,6 +188,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
       }
     }
 
+    const formattedBillDate = formatDateTimeForMySQL(bill_date);
     const [billResult] = await connection.query(
       `INSERT INTO purchase_bills
        (bill_number, vendor_name, bill_date, gst_rate, created_by)
@@ -181,7 +196,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
       [
         bill_number ? String(bill_number).trim() : null,
         vendor_name ? String(vendor_name).trim() : null,
-        bill_date || null,
+        formattedBillDate,
         req.user.id,
       ]
     );
@@ -263,7 +278,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
     // Auto-create linked payment: exactly one payment per purchase bill
     const paymentMode = (req.body.payment_mode && String(req.body.payment_mode).trim().toLowerCase() === "cash") ? "cash" : "online";
     const partyName = (req.body.party_name || vendor_name) ? String(req.body.party_name || vendor_name).trim() : "Vendor";
-    const paymentDate = bill_date || req.body.payment_date || null;
+    const paymentDate = formatDateForMySQL(bill_date || req.body.payment_date);
     const purpose = req.body.purpose || req.body.description || req.body.notes || (bill_number ? `Purchase Bill #${bill_number}` : "Purchase Bill");
 
     const [existingPayments] = await connection.query(
@@ -496,6 +511,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
     }
 
     // Update bill details
+    const formattedBillDate = formatDateTimeForMySQL(bill_date);
     await connection.query(
       `UPDATE purchase_bills
        SET
@@ -507,7 +523,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
       [
         bill_number ? String(bill_number).trim() : null,
         vendor_name ? String(vendor_name).trim() : null,
-        bill_date || null,
+        formattedBillDate,
         id,
         req.user.id,
       ]
@@ -627,7 +643,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           partyName,
           paymentMode || null,
           purpose || null,
-          bill_date || null,
+          formatDateForMySQL(bill_date),
           primaryPaymentId,
           req.user.id,
         ]
@@ -653,7 +669,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           purpose || "Purchase Bill",
           updatedBillTotal,
           paymentMode || "online",
-          bill_date || null,
+          formatDateForMySQL(bill_date),
           id,
           req.user.id,
         ]

@@ -1,0 +1,24 @@
+{
+  "watch": [
+    "server.js",
+    "controllers",
+    "middleware",
+    "routes",
+    "utils",
+    "config"
+  ],
+  "ext": "js,json",
+  "ignore": [
+    "uploads/**",
+    "uploads/*",
+    "public/**",
+    "private/**",
+    "db/**",
+    "scripts/**",
+    "node_modules/**",
+    "*.log",
+    "assets/**"
+  ],
+  "delay": 1000
+}
+

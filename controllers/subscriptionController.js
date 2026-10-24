@@ -158,44 +158,85 @@ const createOrder = asyncHandler(async (req, res) => {
 
   const orderNumber = `ORD-${Date.now()}-${req.user.id}`;
 
-  const [ins] = await pool.query(
-    `INSERT INTO subscription_orders 
-       (order_number, user_id, plan_id, is_introductory, list_price_paise, introductory_discount_paise,
-        promotion_id, coupon_id, coupon_code, coupon_discount_paise, discount_paise, taxable_paise, tax_percent,
-        tax_paise, total_paise, currency, status, provider)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INR', 'created', 'razorpay')`,
-    [
-      orderNumber,
-      req.user.id,
-      plan.id,
-      pricing.isIntroductory ? 1 : 0,
-      pricing.listPricePaise,
-      pricing.introductoryDiscountPaise,
-      pricing.promotionId,
-      pricing.couponId,
-      pricing.couponCode,
-      pricing.couponDiscountPaise,
-      pricing.discountPaise,
-      pricing.taxablePaise,
-      pricing.taxPercent,
-      pricing.taxPaise,
-      pricing.totalPaise,
-    ]
-  );
+  const conn = await pool.getConnection();
+  let orderId;
+  try {
+    await conn.beginTransaction();
 
-  const orderId = ins.insertId;
+    if (pricing.couponId) {
+      const [lockedCoupons] = await conn.query(
+        "SELECT * FROM coupons WHERE id = ? FOR UPDATE",
+        [pricing.couponId]
+      );
+      const lockedCoupon = lockedCoupons[0];
+      if (!lockedCoupon || !lockedCoupon.is_active || lockedCoupon.deleted_at) {
+        throw new ApiError(400, "Coupon is no longer available.");
+      }
 
-  // Reserve coupon redemption if coupon applied
-  if (pricing.couponId) {
-    try {
-      await pool.query(
+      if (lockedCoupon.max_redemptions !== null && lockedCoupon.max_redemptions !== undefined) {
+        const [counts] = await conn.query(
+          `SELECT COUNT(*) as active_count FROM coupon_redemptions
+           WHERE coupon_id = ? AND (status = 'redeemed' OR (status = 'reserved' AND created_at >= NOW() - INTERVAL 30 MINUTE))`,
+          [lockedCoupon.id]
+        );
+        if ((counts[0]?.active_count || 0) >= lockedCoupon.max_redemptions) {
+          throw new ApiError(400, `Coupon "${lockedCoupon.code}" redemption limit has been reached.`);
+        }
+      }
+
+      if (lockedCoupon.per_user_limit) {
+        const [userCounts] = await conn.query(
+          `SELECT COUNT(*) as user_count FROM coupon_redemptions
+           WHERE coupon_id = ? AND user_id = ? AND (status = 'redeemed' OR (status = 'reserved' AND created_at >= NOW() - INTERVAL 30 MINUTE))`,
+          [lockedCoupon.id, req.user.id]
+        );
+        if ((userCounts[0]?.user_count || 0) >= lockedCoupon.per_user_limit) {
+          throw new ApiError(400, `You have already redeemed coupon "${lockedCoupon.code}".`);
+        }
+      }
+    }
+
+    const [ins] = await conn.query(
+      `INSERT INTO subscription_orders 
+         (order_number, user_id, plan_id, is_introductory, list_price_paise, introductory_discount_paise,
+          promotion_id, coupon_id, coupon_code, coupon_discount_paise, discount_paise, taxable_paise, tax_percent,
+          tax_paise, total_paise, currency, status, provider)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INR', 'created', 'razorpay')`,
+      [
+        orderNumber,
+        req.user.id,
+        plan.id,
+        pricing.isIntroductory ? 1 : 0,
+        pricing.listPricePaise,
+        pricing.introductoryDiscountPaise,
+        pricing.promotionId,
+        pricing.couponId,
+        pricing.couponCode,
+        pricing.couponDiscountPaise,
+        pricing.discountPaise,
+        pricing.taxablePaise,
+        pricing.taxPercent,
+        pricing.taxPaise,
+        pricing.totalPaise,
+      ]
+    );
+
+    orderId = ins.insertId;
+
+    if (pricing.couponId) {
+      await conn.query(
         `INSERT INTO coupon_redemptions (coupon_id, user_id, order_id, status)
          VALUES (?, ?, ?, 'reserved')`,
         [pricing.couponId, req.user.id, orderId]
       );
-    } catch (couponErr) {
-      console.warn(`[CreateOrder] Coupon reservation failed for order ${orderId}:`, couponErr.message);
     }
+
+    await conn.commit();
+  } catch (txErr) {
+    await conn.rollback();
+    throw txErr;
+  } finally {
+    conn.release();
   }
 
   // Handle 100% off zero-payable orders immediately without gateway
@@ -258,7 +299,13 @@ const createOrder = asyncHandler(async (req, res) => {
  */
 const verifyOrderPayment = asyncHandler(async (req, res) => {
   const orderId = Number(req.params.id);
-  const { provider_payment_id, provider_signature } = req.body;
+  const providerPaymentId = req.body.provider_payment_id || req.body.razorpay_payment_id;
+  const providerSignature = req.body.provider_signature || req.body.razorpay_signature;
+  const providerOrderId = req.body.provider_order_id || req.body.razorpay_order_id;
+
+  if (!providerPaymentId || !providerSignature) {
+    throw new ApiError(400, "Payment verification requires payment ID and signature.");
+  }
 
   const [orders] = await pool.query(
     "SELECT * FROM subscription_orders WHERE id = ? AND user_id = ?",
@@ -271,17 +318,25 @@ const verifyOrderPayment = asyncHandler(async (req, res) => {
     return res.json({ success: true, status: "paid", message: "Order is already fulfilled." });
   }
 
+  if (order.status === "cancelled" || order.status === "failed") {
+    throw new ApiError(400, `Cannot verify payment for an order with status '${order.status}'. Please initiate a new checkout.`);
+  }
+
+  if (providerOrderId && order.provider_order_id && providerOrderId !== order.provider_order_id) {
+    throw new ApiError(400, "Order ID mismatch: Payment does not match this subscription order.");
+  }
+
   const isValid = gateway.verifyPayment({
     providerOrderId: order.provider_order_id,
-    providerPaymentId: provider_payment_id,
-    signature: provider_signature,
+    providerPaymentId,
+    signature: providerSignature,
   });
 
   if (!isValid) {
     throw new ApiError(400, "Payment verification signature failed.");
   }
 
-  await fulfillOrder(order.id, provider_payment_id, provider_signature);
+  await fulfillOrder(order.id, providerPaymentId, providerSignature);
 
   res.json({
     success: true,

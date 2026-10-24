@@ -25,6 +25,7 @@ const {
   updateEmployee,
   deleteEmployee,
   setUserStatus,
+  updateUser,
   deleteUser,
 } = require("../controllers/superAdminController");
 const { authenticate, authorize, authorizePermission, authorizeModule, requirePermission } = require("../middleware/auth");
@@ -59,6 +60,7 @@ router.get("/users/:id/reports/drilldown/:metric", authorizeModule("reports"), g
 router.get("/users/:id/reports/drilldown", authorizeModule("reports"), getUserReportDrilldown);
 router.delete("/users/:id/customers/:customerId", authorize("superadmin"), deleteUserCustomer);
 router.get("/users/:id/records/:recordId", authorize("superadmin", "employee"), getUserRecord);
+router.patch("/users/:id", authorize("superadmin"), updateUser);
 router.patch("/users/:id/status", authorize("superadmin"), setUserStatus);
 router.delete("/users/:id", authorize("superadmin"), deleteUser);
 

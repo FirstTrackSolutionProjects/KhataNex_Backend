@@ -61,8 +61,11 @@ module.exports = {
     return {
       provider: razorpayConfigured ? "razorpay" : (mockOptIn ? "mock" : "unconfigured"),
       isConfigured: razorpayConfigured,
-      keyIdPreview: razorpayConfigured ? `${(process.env.RAZORPAY_KEY_ID || "").slice(0, 8)}...` : null,
-      webhookConfigured: Boolean(process.env.RAZORPAY_WEBHOOK_SECRET),
+      mode: razorpayConfigured ? razorpay.getMode() : (mockOptIn ? "mock" : "unconfigured"),
+      isTestMode: razorpayConfigured ? razorpay.isTestMode() : false,
+      isLiveMode: razorpayConfigured ? razorpay.isLiveMode() : false,
+      keyIdPreview: razorpayConfigured ? `${(razorpay.getKeyId() || "").slice(0, 8)}...` : null,
+      webhookConfigured: Boolean(razorpay.getWebhookSecret()),
       mockAllowed: !isProd,
       mockActive: !razorpayConfigured && mockOptIn,
       environment: isProd ? "production" : "development",

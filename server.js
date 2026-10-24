@@ -27,9 +27,15 @@ const fileRoutes = require("./routes/fileRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const paymentWebhookRoutes = require("./routes/paymentWebhookRoutes");
 const billingAdminRoutes = require("./routes/billingAdminRoutes");
+const helpCentreRoutes = require("./routes/helpCentreRoutes");
+const superAdminDashboardRoutes = require("./routes/superAdminDashboardRoutes");
+const emailService = require("./services/emailService");
 const { requireActiveSubscription } = require("./middleware/requireSubscription");
 
 const app = express();
+
+// Start background durable email queue worker (sweeps every 60s)
+emailService.startQueueWorker(60000);
 
 //*app.use(helmet({ crossOriginResourcePolicy: false })); // allow serving /uploads images/PDFs cross-origin to the frontend
 
@@ -90,10 +96,14 @@ app.use("/api/auth", authRoutes);
 app.use("/api/contacts", contactRoutes);
 app.use("/api/superadmin/billing", billingAdminRoutes);
 app.use("/api/super-admin/billing", billingAdminRoutes);
+app.use("/api/superadmin/dashboard", superAdminDashboardRoutes);
+app.use("/api/super-admin/dashboard", superAdminDashboardRoutes);
 app.use("/api/superadmin", superAdminRoutes);
 app.use("/api/super-admin", superAdminRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
 app.use("/api/webhooks/payment", paymentWebhookRoutes);
+app.use("/api/help-centre", helpCentreRoutes);
+app.use("/api/helpcentre", helpCentreRoutes);
 
 // Protected business write routes (guarded by requireActiveSubscription when enabled)
 app.use("/api/customers", requireActiveSubscription, customerRoutes);
@@ -106,7 +116,7 @@ app.use("/api/purchase-invoices", requireActiveSubscription, purchaseInvoiceRout
 app.use("/api/purchase-bills", requireActiveSubscription, purchaseBillRoutes);
 app.use("/api/documents", requireActiveSubscription, documentRoutes);
 app.use("/api/vehicles", requireActiveSubscription, vehicleRoutes);
-app.use("/api/settings", settingsRoutes);
+app.use("/api/settings", requireActiveSubscription, settingsRoutes);
 app.use("/api/khata", requireActiveSubscription, khataRoutes);
 app.use("/api/banking", requireActiveSubscription, bankingRoutes);
 app.use("/api/files", fileRoutes);
@@ -115,4 +125,16 @@ app.use(notFound);
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 FIRST TRACK KHATANEX API running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`🚀 FIRST TRACK KHATANEX API running on port ${PORT}`));
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`❌ Port ${PORT} is already in use.`);
+  } else {
+    console.error("❌ Server listen error:", err);
+  }
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("⚠️ Unhandled Rejection:", reason);
+});

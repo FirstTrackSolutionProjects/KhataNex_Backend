@@ -26,6 +26,10 @@ const MIGRATION_HISTORY = [
   "migration_018_subscription_billing.sql",
   "migration_019_user_audit_and_soft_delete.sql",
   "migration_020_subscription_pricing_and_settings.sql",
+  "migration_021_promotions_and_coupon_enhancements.sql",
+  "migration_022_plan_management_employees_help_centre.sql",
+  "migration_023_support_ticket_feedback.sql",
+  "migration_024_subscription_billing_and_email_outbox.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -233,6 +237,34 @@ const MIGRATION_SCHEMA_CHECKS = {
   "migration_020_subscription_pricing_and_settings.sql": async (conn, db) => {
     const [r] = await conn.query(
       "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'subscription_settings'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_021_promotions_and_coupon_enhancements.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'promotions'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_022_plan_management_employees_help_centre.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'support_tickets'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_023_support_ticket_feedback.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'support_ticket_feedback'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_024_subscription_billing_and_email_outbox.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'email_outbox'",
       [db]
     );
     return r.length > 0;
