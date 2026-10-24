@@ -1117,6 +1117,100 @@ const deleteEmployee = asyncHandler(async (req, res) => {
 });
 
 // PATCH /api/superadmin/users/:id/status
+// PATCH /api/superadmin/users/:id
+// Superadmin updates user profile details with validation and audit logging
+const updateUser = asyncHandler(async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (!targetId || Number.isNaN(targetId)) {
+    throw new ApiError(400, "Invalid user ID provided.");
+  }
+
+  const [targets] = await pool.query("SELECT * FROM users WHERE id = ?", [targetId]);
+  if (!targets.length) {
+    throw new ApiError(404, "User not found.");
+  }
+  const existingUser = targets[0];
+
+  const allowedFields = [
+    "name",
+    "email",
+    "phone",
+    "secondary_phone",
+    "business_name",
+    "business_type",
+    "gstin",
+    "pan",
+    "address",
+    "address_line1",
+    "address_line2",
+    "city",
+    "state",
+    "pincode",
+    "notes",
+    "status",
+  ];
+
+  const updates = {};
+  const changes = [];
+
+  for (const field of allowedFields) {
+    if (req.body[field] !== undefined) {
+      const val = req.body[field] === null ? null : String(req.body[field]).trim();
+      if (field === "email" && val && val !== existingUser.email) {
+        const [conflict] = await pool.query("SELECT id FROM users WHERE email = ? AND id != ?", [val, targetId]);
+        if (conflict.length > 0) {
+          throw new ApiError(409, "Email address is already in use by another account.");
+        }
+      }
+      if (field === "status" && val && !["active", "inactive"].includes(val)) {
+        throw new ApiError(400, "status must be 'active' or 'inactive'.");
+      }
+      updates[field] = val;
+      if (existingUser[field] !== val) {
+        changes.push({ field, old: existingUser[field], new: val });
+      }
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    const setClauses = Object.keys(updates).map((f) => `\`${f}\` = ?`).join(", ");
+    const setValues = Object.values(updates);
+    setValues.push(targetId);
+
+    await pool.query(`UPDATE users SET ${setClauses}, updated_at = NOW() WHERE id = ?`, setValues);
+
+    try {
+      await pool.query(
+        `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.user.id,
+          req.user.role || "superadmin",
+          "UPDATE_USER_PROFILE",
+          "user",
+          String(targetId),
+          JSON.stringify(existingUser),
+          JSON.stringify(updates),
+          JSON.stringify({ changes }),
+          req.ip || "127.0.0.1",
+        ]
+      );
+    } catch (auditErr) {
+      console.warn("admin_audit_logs error:", auditErr.message);
+    }
+  }
+
+  const [updatedRows] = await pool.query("SELECT * FROM users WHERE id = ?", [targetId]);
+  const updatedUser = updatedRows[0];
+  delete updatedUser.password;
+
+  res.json({
+    success: true,
+    message: "User profile updated successfully.",
+    user: updatedUser,
+  });
+});
+
 // Activate/deactivate any account (user or employee).
 const setUserStatus = asyncHandler(async (req, res) => {
   const { status } = req.body;
@@ -3042,5 +3136,6 @@ module.exports = {
   updateEmployee,
   deleteEmployee,
   setUserStatus,
+  updateUser,
   deleteUser,
 };

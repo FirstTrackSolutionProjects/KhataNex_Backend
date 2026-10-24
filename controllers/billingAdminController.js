@@ -963,6 +963,24 @@ const grantSubscription = asyncHandler(async (req, res) => {
     );
   } catch (_) {}
 
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        "GRANT_COMPLIMENTARY_SUBSCRIPTION",
+        "subscription",
+        String(subs[0]?.id || orderId),
+        null,
+        JSON.stringify(subs[0] || {}),
+        JSON.stringify({ user_id, user_name: users[0]?.name, plan_code, notes, orderId }),
+        req.ip || "127.0.0.1",
+      ]
+    );
+  } catch (_) {}
+
   res.status(201).json({
     success: true,
     message: `Complimentary subscription granted for ${users[0].name}.`,
@@ -1124,6 +1142,24 @@ const revokeUserSubscription = asyncHandler(async (req, res) => {
     );
   } catch (_) {}
 
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        "REVOKE_USER_SUBSCRIPTION",
+        "subscription",
+        String(activeSubs[0]?.id || userId),
+        JSON.stringify(activeSubs[0] || {}),
+        JSON.stringify({ status: "cancelled", revoked_at: new Date() }),
+        JSON.stringify({ userId, reason }),
+        req.ip || "127.0.0.1",
+      ]
+    );
+  } catch (_) {}
+
   res.json({
     success: true,
     message: `Active subscription revoked for user #${userId}.`,
@@ -1149,9 +1185,186 @@ const resetIntroOffer = asyncHandler(async (req, res) => {
     );
   } catch (_) {}
 
+  try {
+    await pool.query(
+      `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        req.user.role || "superadmin",
+        "RESET_INTRO_OFFER",
+        "user",
+        String(userId),
+        JSON.stringify({ has_used_intro_offer: users[0].has_used_intro_offer }),
+        JSON.stringify({ has_used_intro_offer: 0 }),
+        JSON.stringify({ userId, user_name: users[0].name }),
+        req.ip || "127.0.0.1",
+      ]
+    );
+  } catch (_) {}
+
   res.json({
     success: true,
     message: `One-time introductory offer eligibility reset for ${users[0].name}.`,
+  });
+});
+
+/**
+ * GET /api/superadmin/billing/reports
+ * Real drilldown report backed by authoritative database queries for Subscriptions
+ */
+const getSubscriptionReports = asyncHandler(async (req, res) => {
+  const {
+    period = "this_month",
+    from,
+    to,
+    plan_code,
+    status = "paid",
+    coupon_code,
+    search = "",
+    page = 1,
+    limit = 20,
+  } = req.query;
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+  const offset = (pageNum - 1) * limitNum;
+  const cleanSearch = String(search || "").trim();
+
+  // Date boundaries
+  let dateFilter = "";
+  const filterParams = [];
+
+  if (from && to) {
+    dateFilter = " AND o.created_at >= ? AND o.created_at <= ?";
+    filterParams.push(from, to);
+  } else if (period === "today") {
+    dateFilter = " AND DATE(o.created_at) = CURDATE()";
+  } else if (period === "this_week") {
+    dateFilter = " AND YEARWEEK(o.created_at, 1) = YEARWEEK(CURDATE(), 1)";
+  } else if (period === "this_month") {
+    dateFilter = " AND YEAR(o.created_at) = YEAR(CURDATE()) AND MONTH(o.created_at) = MONTH(CURDATE())";
+  } else if (period === "this_year") {
+    dateFilter = " AND YEAR(o.created_at) = YEAR(CURDATE())";
+  }
+
+  let statusFilter = "";
+  if (status && status !== "all") {
+    statusFilter = " AND o.status = ?";
+    filterParams.push(status);
+  }
+
+  let planFilter = "";
+  if (plan_code) {
+    planFilter = " AND p.code = ?";
+    filterParams.push(plan_code);
+  }
+
+  let couponFilter = "";
+  if (coupon_code) {
+    couponFilter = " AND o.coupon_code = ?";
+    filterParams.push(coupon_code);
+  }
+
+  let searchFilter = "";
+  if (cleanSearch) {
+    searchFilter = " AND (u.name LIKE ? OR u.email LIKE ? OR o.order_number LIKE ? OR o.provider_payment_id LIKE ?)";
+    filterParams.push(`%${cleanSearch}%`, `%${cleanSearch}%`, `%${cleanSearch}%`, `%${cleanSearch}%`);
+  }
+
+  // 1. KPI Aggregates for the filtered period
+  const [summaryRows] = await pool.query(
+    `SELECT 
+       COUNT(*) AS total_orders,
+       SUM(CASE WHEN o.status = 'paid' THEN 1 ELSE 0 END) AS paid_orders_count,
+       SUM(CASE WHEN o.status IN ('failed', 'cancelled') THEN 1 ELSE 0 END) AS failed_payments_count,
+       COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.total_paise ELSE 0 END), 0) AS total_collections_paise,
+       COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.list_price_paise ELSE 0 END), 0) AS gross_order_paise,
+       COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.discount_paise ELSE 0 END), 0) AS total_discounts_paise,
+       COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.coupon_discount_paise ELSE 0 END), 0) AS coupon_discounts_paise,
+       COALESCE(SUM(CASE WHEN o.status = 'paid' THEN o.tax_paise ELSE 0 END), 0) AS tax_collected_paise
+     FROM subscription_orders o
+     JOIN subscription_plans p ON o.plan_id = p.id
+     JOIN users u ON o.user_id = u.id
+     WHERE 1=1 ${dateFilter} ${statusFilter} ${planFilter} ${couponFilter} ${searchFilter}`,
+    filterParams
+  );
+
+  const summary = summaryRows[0] || {};
+
+  // 2. Global subscription state metrics
+  const [activeSubsRows] = await pool.query(
+    "SELECT COUNT(*) AS count FROM subscriptions WHERE status = 'active' AND ends_at > NOW()"
+  );
+  const activePaidSubscriptions = Number(activeSubsRows[0]?.count || 0);
+
+  const [expiringRows] = await pool.query(
+    "SELECT COUNT(*) AS count FROM subscriptions WHERE status = 'active' AND ends_at > NOW() AND ends_at <= NOW() + INTERVAL 7 DAY"
+  );
+  const expiringSubscriptions = Number(expiringRows[0]?.count || 0);
+
+  // 3. Paginated detail rows
+  const [countRows] = await pool.query(
+    `SELECT COUNT(*) AS count
+     FROM subscription_orders o
+     JOIN subscription_plans p ON o.plan_id = p.id
+     JOIN users u ON o.user_id = u.id
+     WHERE 1=1 ${dateFilter} ${statusFilter} ${planFilter} ${couponFilter} ${searchFilter}`,
+    filterParams
+  );
+  const totalCount = Number(countRows[0]?.count || 0);
+  const totalPages = Math.ceil(totalCount / limitNum);
+
+  const [rows] = await pool.query(
+    `SELECT 
+       o.id, o.order_number, o.created_at, o.paid_at, o.status,
+       o.list_price_paise, o.discount_paise, o.coupon_discount_paise, o.introductory_discount_paise,
+       o.taxable_paise, o.tax_paise, o.total_paise, o.currency,
+       o.provider, o.provider_payment_id, o.provider_order_id,
+       o.coupon_code,
+       (o.list_price_paise / 100) AS base_amount,
+       (o.discount_paise / 100) AS discount_amount,
+       (o.tax_paise / 100) AS tax_amount,
+       (o.total_paise / 100) AS final_amount,
+       u.id AS user_id, u.name AS customer_name, u.email AS customer_email, u.phone AS customer_phone, u.business_name,
+       p.name AS plan_name, p.code AS plan_code, p.duration_months,
+       s.starts_at, s.ends_at,
+       i.invoice_number, i.pdf_filename
+     FROM subscription_orders o
+     JOIN subscription_plans p ON o.plan_id = p.id
+     JOIN users u ON o.user_id = u.id
+     LEFT JOIN subscriptions s ON s.order_id = o.id
+     LEFT JOIN subscription_invoices i ON i.order_id = o.id
+     WHERE 1=1 ${dateFilter} ${statusFilter} ${planFilter} ${couponFilter} ${searchFilter}
+     ORDER BY o.created_at DESC
+     LIMIT ? OFFSET ?`,
+    [...filterParams, limitNum, offset]
+  );
+
+  res.json({
+    success: true,
+    period,
+    metrics: {
+      totalCollections: Number(summary.total_collections_paise) / 100,
+      totalCollectionsPaise: Number(summary.total_collections_paise),
+      paidOrdersCount: Number(summary.paid_orders_count || 0),
+      failedPaymentsCount: Number(summary.failed_payments_count || 0),
+      totalOrders: Number(summary.total_orders || 0),
+      activePaidSubscriptions,
+      expiringSubscriptions,
+      grossOrderValue: Number(summary.gross_order_paise) / 100,
+      totalDiscountsGranted: Number(summary.total_discounts_paise) / 100,
+      couponDiscountsGranted: Number(summary.coupon_discounts_paise) / 100,
+      taxCollected: Number(summary.tax_collected_paise) / 100,
+      netCollections: Number(summary.total_collections_paise) / 100,
+    },
+    pagination: {
+      totalCount,
+      totalPages,
+      currentPage: pageNum,
+      limit: limitNum,
+    },
+    rows,
   });
 });
 
@@ -1178,4 +1391,5 @@ module.exports = {
   updateSettings,
   revokeUserSubscription,
   resetIntroOffer,
+  getSubscriptionReports,
 };

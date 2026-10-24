@@ -69,14 +69,13 @@ async function issueInvoice(orderId) {
   // Render PDF
   await renderAndSavePdf(invoiceId, order);
 
-  // Email invoice if user has an email
+  // Email invoice if user has an email via durable outbox
   if (order.user_email) {
     try {
       const filePath = invoiceFilePath(pdfFilename);
-      await sendInvoiceEmail(order.user_email, invoiceNumber, order.plan_name, filePath);
-      await pool.query("UPDATE subscription_invoices SET emailed_at = NOW() WHERE id = ?", [invoiceId]);
+      await sendInvoiceEmail(order.user_email, invoiceNumber, order.plan_name, filePath, invoiceId);
     } catch (mailErr) {
-      console.warn(`[SubscriptionInvoice] Failed to email invoice ${invoiceNumber}:`, mailErr.message || mailErr);
+      console.warn(`[SubscriptionInvoice] Failed to enqueue invoice email ${invoiceNumber}:`, mailErr.message || mailErr);
     }
   }
 
@@ -125,14 +124,11 @@ async function renderAndSavePdf(invoiceId, cachedOrder = null) {
 }
 
 /**
- * Sends invoice email via nodemailer service
+ * Sends invoice email via durable outbox email service
  */
-async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath) {
-  const attachments = fs.existsSync(attachmentPath)
-    ? [{ filename: `${invoiceNumber}.pdf`, path: attachmentPath }]
-    : [];
-
-  return sendMail({
+async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath, invoiceId = null) {
+  const emailService = require("../services/emailService");
+  return emailService.enqueue({
     to: toEmail,
     subject: `Your KhataNex Subscription Invoice (${invoiceNumber})`,
     text: `Hello,\n\nThank you for choosing KhataNex. Your subscription for ${planName} is now active.\nPlease find your tax invoice ${invoiceNumber} attached.\n\nWarm regards,\nTeam KhataNex`,
@@ -146,7 +142,11 @@ async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath
         <p style="font-size: 12px; color: #64748b;">If you have any questions or require assistance, please reply to this email or contact support.</p>
       </div>
     `,
-    attachments,
+    attachmentPath,
+    attachmentName: `${invoiceNumber}.pdf`,
+    category: "subscription_invoice",
+    referenceType: "subscription_invoice",
+    referenceId: invoiceId || invoiceNumber,
   });
 }
 

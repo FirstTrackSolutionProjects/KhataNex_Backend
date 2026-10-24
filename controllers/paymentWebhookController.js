@@ -14,7 +14,11 @@ const { fulfillOrder } = require("../utils/subscriptionLogic");
  */
 const handlePaymentWebhook = asyncHandler(async (req, res) => {
   const signature = req.headers["x-razorpay-signature"];
-  const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body);
+  const rawBody = req.rawBody ? req.rawBody.toString("utf8") : (typeof req.body === "string" ? req.body : JSON.stringify(req.body));
+
+  if (!signature) {
+    throw new ApiError(400, "Missing x-razorpay-signature header.");
+  }
 
   const isValid = gateway.verifyWebhookSignature({
     rawBody,

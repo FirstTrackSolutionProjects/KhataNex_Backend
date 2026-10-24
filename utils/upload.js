@@ -5,7 +5,7 @@ const fs = require("fs");
 const UPLOAD_ROOT = path.join(__dirname, "..", "uploads");
 
 // Make sure every subfolder we use actually exists on disk.
-["logos", "employee-photos", "loading-photos", "unloading-photos", "waybills-uploaded", "waybills-generated", "purchase-invoices", "invoices", "vehicle-photos", "trip-photos"].forEach(
+["logos", "employee-photos", "loading-photos", "unloading-photos", "waybills-uploaded", "waybills-generated", "purchase-invoices", "invoices", "vehicle-photos", "trip-photos", "support-attachments"].forEach(
   (dir) => {
     const full = path.join(UPLOAD_ROOT, dir);
     if (!fs.existsSync(full)) fs.mkdirSync(full, { recursive: true });
@@ -43,6 +43,11 @@ const uploadUnloadingPhoto = multer({ storage: storage("unloading-photos"), file
 const uploadWaybillDoc = multer({ storage: storage("waybills-uploaded"), fileFilter: documentFilter, limits: maxSize(10) });
 const uploadPurchaseInvoiceDoc = multer({
   storage: storage("purchase-invoices"),
+  fileFilter: documentFilter,
+  limits: maxSize(10),
+});
+const uploadSupportAttachment = multer({
+  storage: storage("support-attachments"),
   fileFilter: documentFilter,
   limits: maxSize(10),
 });
@@ -104,6 +109,7 @@ module.exports = {
   uploadUnloadingPhoto,
   uploadWaybillDoc,
   uploadPurchaseInvoiceDoc,
+  uploadSupportAttachment,
   uploadVehicleTripFiles,
   relativeUploadPath,
 };

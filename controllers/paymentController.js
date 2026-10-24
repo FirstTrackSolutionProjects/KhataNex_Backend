@@ -108,6 +108,25 @@ const normalizePaymentMode = (mode) => {
   return "online";
 };
 
+const formatDateForMySQL = (val) => {
+  if (!val) return null;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+    if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
+      return trimmed.slice(0, 10);
+    }
+  }
+  const d = new Date(val);
+  if (Number.isNaN(d.getTime())) return null;
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
 // POST /api/payments
 const addPayment = asyncHandler(async (req, res) => {
   const tenant = getTenantContext(req);
@@ -312,7 +331,7 @@ const addPayment = asyncHandler(async (req, res) => {
       if (existingPbPayments.length > 0) {
         const primaryPayment = existingPbPayments[0];
         const resolvedMode = normalizePaymentMode(payment_mode || req.body?.mode || primaryPayment.payment_mode);
-        const resolvedDate = payment_date || primaryPayment.payment_date || pb.bill_date;
+        const resolvedDate = formatDateForMySQL(payment_date || primaryPayment.payment_date || pb.bill_date);
 
         await conn.query(
           `UPDATE payments
@@ -397,7 +416,7 @@ const addPayment = asyncHandler(async (req, res) => {
         resolvedPartyName = mr.received_from_name;
       }
       if (!payment_date && mr.receipt_date) {
-        payment_date = String(mr.receipt_date).slice(0, 10);
+        payment_date = formatDateForMySQL(mr.receipt_date);
       }
       linkedMoneyReceiptCreatedAt = mr.receipt_date || mr.created_at;
     }
@@ -549,6 +568,8 @@ const addPayment = asyncHandler(async (req, res) => {
         ? Boolean(add_to_khata === true || add_to_khata === "true" || add_to_khata === 1)
         : 0;
 
+    const resolvedPaymentDate = formatDateForMySQL(payment_date);
+
     const [result] = await conn.query(
       `INSERT INTO payments
         (payment_category, party_name, customer_id, purpose, amount,
@@ -562,7 +583,7 @@ const addPayment = asyncHandler(async (req, res) => {
         resolvedPurpose,
         finalAmount,
         normalizePaymentMode(payment_mode),
-        payment_date || null,
+        resolvedPaymentDate || null,
         linkedProductId,
         linkedProductName,
         linkedQuantity,
@@ -649,7 +670,85 @@ const listPayments = asyncHandler(async (req, res) => {
   }
   const businessOwnerId = tenant.businessOwnerId;
 
-  const { category, purpose, customer_id, from, to } = req.query;
+  const { category, purpose, customer_id, from, to, search } = req.query;
+
+  // Handle dedicated Superadmin Subscriptions category
+  if (category && String(category).trim().toLowerCase() === "subscriptions") {
+    if (req.user.role !== "superadmin") {
+      throw new ApiError(403, "Subscription payments category is restricted to Superadmin.");
+    }
+
+    let subSql = `
+      SELECT o.id,
+             o.id AS payment_id,
+             o.order_number,
+             o.total_paise,
+             o.list_price_paise,
+             o.coupon_discount_paise,
+             o.introductory_discount_paise,
+             o.discount_paise,
+             o.taxable_paise,
+             o.tax_paise,
+             o.tax_percent,
+             (o.total_paise / 100) AS amount,
+             (o.list_price_paise / 100) AS base_amount,
+             (o.discount_paise / 100) AS discount,
+             (o.tax_paise / 100) AS tax,
+             o.status AS payment_status,
+             o.status,
+             'subscriptions' AS payment_category,
+             'SaaS Subscription' AS purpose,
+             'online' AS payment_mode,
+             o.provider,
+             o.provider_payment_id,
+             o.provider_order_id,
+             COALESCE(o.paid_at, o.created_at) AS payment_date,
+             COALESCE(o.paid_at, o.created_at) AS effective_date,
+             TIME(COALESCE(o.paid_at, o.created_at)) AS payment_time,
+             TIME(COALESCE(o.paid_at, o.created_at)) AS time,
+             'verified_collection' AS settlement_status,
+             u.id AS user_id,
+             u.name AS party_name,
+             u.name AS customer_name,
+             u.email AS customer_email,
+             u.phone AS customer_phone,
+             u.business_name,
+             p.name AS plan_name,
+             p.duration_months,
+             i.invoice_number,
+             i.pdf_filename
+      FROM subscription_orders o
+      JOIN users u ON o.user_id = u.id
+      JOIN subscription_plans p ON o.plan_id = p.id
+      LEFT JOIN subscription_invoices i ON i.order_id = o.id
+      WHERE o.status = 'paid'
+    `;
+    const subParams = [];
+
+    if (search) {
+      subSql += " AND (u.name LIKE ? OR u.email LIKE ? OR o.order_number LIKE ? OR o.provider_payment_id LIKE ?)";
+      subParams.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+    }
+
+    if (from) {
+      subSql += " AND o.paid_at >= ?";
+      subParams.push(from);
+    }
+    if (to) {
+      subSql += " AND o.paid_at <= ?";
+      subParams.push(to);
+    }
+
+    subSql += " ORDER BY o.paid_at DESC LIMIT 100";
+    const [subRows] = await pool.query(subSql, subParams);
+
+    return res.json({
+      success: true,
+      category: "subscriptions",
+      accountingNotice: "Payments shown represent verified gateway collections (verified_collection). Payouts to the bank settle per gateway cycle (T+2 business days) and are tracked separately under Settlements.",
+      payments: subRows,
+    });
+  }
 
   let sql = `
     SELECT p.*,
@@ -785,7 +884,7 @@ const updatePayment = asyncHandler(async (req, res) => {
     const resolvedPurpose = purpose || payment.purpose;
     const resolvedCategory = resolveCategory(resolvedPurpose, payment_category || payment.payment_category);
     const resolvedMode = normalizePaymentMode(payment_mode || payment.payment_mode);
-    const finalDate = payment_date || payment.payment_date;
+    const finalDate = formatDateForMySQL(payment_date || payment.payment_date);
 
     const amountDiff = newAmount - Number(payment.amount);
     if (amountDiff !== 0 && payment.customer_id) {
@@ -1117,7 +1216,7 @@ const linkMoneyReceiptToPayment = asyncHandler(async (req, res) => {
     const category = mr.against_type === "advance" ? "advance_receivable" : "money_received";
     const purpose = mr.against_type === "advance" ? "Advance Receivable" : "Money Received";
 
-    const receiptDateVal = mr.receipt_date ? String(mr.receipt_date).slice(0, 10) : null;
+    const receiptDateVal = formatDateForMySQL(mr.receipt_date);
     const [result] = await conn.query(
       `INSERT INTO payments
         (payment_category, party_name, customer_id, purpose, amount,
@@ -1272,7 +1371,7 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
           billTotal,
           normalizePaymentMode(payment_mode || primaryPayment.payment_mode),
           pb.vendor_name || null,
-          pb.bill_date || null,
+          formatDateForMySQL(pb.bill_date),
           pb.id,
           paymentId,
           businessOwnerId,
@@ -1292,7 +1391,7 @@ const linkPurchaseBillToPayment = asyncHandler(async (req, res) => {
           pb.vendor_name || "Vendor",
           billTotal,
           normalizePaymentMode(payment_mode),
-          pb.bill_date,
+          formatDateForMySQL(pb.bill_date),
           pb.id,
           businessOwnerId,
         ]

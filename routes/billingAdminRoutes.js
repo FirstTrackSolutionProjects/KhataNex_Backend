@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const { authenticate, authorize } = require("../middleware/auth");
+const { authenticate, authorize, authorizeModule, requirePermission } = require("../middleware/auth");
 const {
   getBillingOverview,
   getExpiryCohorts,
@@ -24,6 +24,7 @@ const {
   updateSettings,
   revokeUserSubscription,
   resetIntroOffer,
+  getSubscriptionReports,
 } = require("../controllers/billingAdminController");
 
 // All routes require authentication
@@ -32,35 +33,37 @@ router.use(authenticate);
 // Read-only user billing details accessible to Superadmin and delegated Employees (for user support)
 router.get("/users/:id", authorize("superadmin", "employee"), getUserBillingDetails);
 
-// All subsequent billing admin management routes are strictly restricted to Superadmin
-router.use(authorize("superadmin"));
+// Billing administration routes: Superadmin has full access; Employees assigned to "billing" module
+// are authorized with granular permissions.
+router.use(authorize("superadmin", "employee"), authorizeModule("billing"));
 
-router.get("/overview", getBillingOverview);
-router.get("/expiry-cohorts", getExpiryCohorts);
-router.get("/alerts", getSubscriptionAlerts);
-router.get("/users-search", searchUsersBilling);
+router.get("/overview", requirePermission("billing", "view"), getBillingOverview);
+router.get("/expiry-cohorts", requirePermission("billing", "view"), getExpiryCohorts);
+router.get("/alerts", requirePermission("billing", "view"), getSubscriptionAlerts);
+router.get("/users-search", requirePermission("billing", "view"), searchUsersBilling);
 
-router.get("/settings", getSettings);
-router.patch("/settings", updateSettings);
+router.get("/settings", requirePermission("billing", "view"), getSettings);
+router.patch("/settings", authorize("superadmin"), updateSettings);
 
-router.get("/plans", listAdminPlans);
-router.post("/plans", createPlan);
-router.put("/plans/:id", updatePlan);
+router.get("/plans", requirePermission("billing", "view"), listAdminPlans);
+router.post("/plans", requirePermission("billing", "create"), createPlan);
+router.put("/plans/:id", requirePermission("billing", "edit"), updatePlan);
 
-router.get("/coupons", listAdminCoupons);
-router.post("/coupons", createCoupon);
-router.put("/coupons/:id", updateCoupon);
-router.delete("/coupons/:id", deleteCoupon);
+router.get("/coupons", requirePermission("billing", "view"), listAdminCoupons);
+router.post("/coupons", requirePermission("billing", "create"), createCoupon);
+router.put("/coupons/:id", requirePermission("billing", "edit"), updateCoupon);
+router.delete("/coupons/:id", requirePermission("billing", "delete"), deleteCoupon);
 
-router.get("/promotions", listAdminPromotions);
-router.post("/promotions", createPromotion);
-router.put("/promotions/:id", updatePromotion);
-router.delete("/promotions/:id", deletePromotion);
+router.get("/promotions", requirePermission("billing", "view"), listAdminPromotions);
+router.post("/promotions", requirePermission("billing", "create"), createPromotion);
+router.put("/promotions/:id", requirePermission("billing", "edit"), updatePromotion);
+router.delete("/promotions/:id", requirePermission("billing", "delete"), deletePromotion);
 
-router.get("/orders", listAdminOrders);
-router.post("/grant", grantSubscription);
-router.post("/users/:id/revoke", revokeUserSubscription);
-router.post("/users/:id/reset-intro", resetIntroOffer);
+router.get("/orders", requirePermission("billing", "view"), listAdminOrders);
+router.get("/reports", requirePermission("billing", "view"), getSubscriptionReports);
+router.post("/grant", requirePermission("billing", "create"), grantSubscription);
+router.post("/users/:id/revoke", requirePermission("billing", "delete"), revokeUserSubscription);
+router.post("/users/:id/reset-intro", requirePermission("billing", "edit"), resetIntroOffer);
 
 module.exports = router;
 

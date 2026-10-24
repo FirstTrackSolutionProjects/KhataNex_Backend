@@ -41,9 +41,13 @@ const authenticate = async (req, res, next) => {
       user.assigned_modules = [];
     }
 
-    await pool.query("UPDATE users SET last_active_at = NOW() WHERE id = ?", [user.id]);
-
-    user.last_active_at = new Date();
+    // Throttle activity updates to once per minute to prevent unnecessary database writes
+    const nowTime = new Date();
+    const lastActive = user.last_active_at ? new Date(user.last_active_at) : null;
+    if (!lastActive || (nowTime - lastActive) > 60000) {
+      pool.query("UPDATE users SET last_active_at = NOW() WHERE id = ?", [user.id]).catch(() => {});
+      user.last_active_at = nowTime;
+    }
 
     req.user = user; // always reflects the latest role from the DB
     next();

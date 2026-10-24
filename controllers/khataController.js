@@ -29,6 +29,25 @@ const getDateBoundaries = (period) => {
   return { from: null, to: null };
 };
 
+const formatDateForMySQL = (val) => {
+  if (!val) return null;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+    if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
+      return trimmed.slice(0, 10);
+    }
+  }
+  const d = new Date(val);
+  if (Number.isNaN(d.getTime())) return null;
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
 // GET /api/khata?customer_id=&from=&to=&type=&period=
 // Unified ledger feed containing:
 //   - collections (sales) -> type: 'credit'
@@ -663,7 +682,7 @@ const addKhataDebit = asyncHandler(async (req, res) => {
     }
 
     const rawDate = entry_date || date || new Date().toISOString().split("T")[0];
-    const finalDate = String(rawDate).slice(0, 10);
+    const finalDate = formatDateForMySQL(rawDate);
     const rawTime = entry_time || time || new Date().toTimeString().split(" ")[0];
     const finalTime = String(rawTime).slice(0, 8);
     const resolvedDescription = description && String(description).trim() ? String(description).trim() : "Debit Entry";
@@ -876,7 +895,7 @@ const addKhataCredit = asyncHandler(async (req, res) => {
     const linkedCustomerId = await resolveKhataCustomer(conn, req.body, businessOwnerId);
 
     const rawDate = entry_date || date || new Date().toISOString().split("T")[0];
-    const finalDate = String(rawDate).slice(0, 10);
+    const finalDate = formatDateForMySQL(rawDate);
     const rawTime = entry_time || time || new Date().toTimeString().split(" ")[0];
     const finalTime = String(rawTime).slice(0, 8);
 
@@ -1124,7 +1143,7 @@ const addKhataDue = asyncHandler(async (req, res) => {
     }
 
     const rawDate = due_date || date || null;
-    const finalDueDate = rawDate ? String(rawDate).slice(0, 10) : null;
+    const finalDueDate = formatDateForMySQL(rawDate);
     const rawTime = due_time || entry_time || time || new Date().toTimeString().split(" ")[0];
     const finalTime = String(rawTime).slice(0, 8);
 
@@ -1487,7 +1506,7 @@ const updateKhataEntry = asyncHandler(async (req, res) => {
       let linkedQuantity = entry.quantity;
       let linkedUnitPrice = entry.unit_price;
       const rawDate = entry_date || date || entry.entry_date;
-      const finalDate = rawDate ? String(rawDate).slice(0, 10) : new Date().toISOString().split("T")[0];
+      const finalDate = formatDateForMySQL(rawDate) || new Date().toISOString().split("T")[0];
       const rawTime = req.body.entry_time || req.body.time || entry.entry_time || "00:00:00";
       const finalTime = String(rawTime).slice(0, 8);
       const finalDesc = description !== undefined ? description : entry.description;

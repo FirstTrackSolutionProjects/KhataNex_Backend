@@ -462,8 +462,8 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
     conn.release();
   }
 
-  // Issue invoice asynchronously if required and not zero-priced complimentary
-  if (invoice && order.total_paise > 0) {
+  // Issue invoice asynchronously if required (including 100% discounted zero-cost orders)
+  if (invoice) {
     try {
       const { issueInvoice } = require("./subscriptionInvoice");
       await issueInvoice(order.id);
