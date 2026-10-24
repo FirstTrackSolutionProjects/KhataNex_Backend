@@ -67,12 +67,63 @@ const requireActiveSubscription = async (req, res, next) => {
   }
 
   try {
-    // Determine the billing owner account (employees inherit from owner)
-    let ownerId = req.user.id;
-    if (req.user.role === "employee" && req.user.created_by_admin) {
-      ownerId = req.user.created_by_admin;
+    // Determine billing owner account: employees inherit subscription entitlement from their business owner
+    if (req.user.role === "employee") {
+      const ownerId = req.user.created_by_admin;
+      if (!ownerId) {
+        return res.status(403).json({
+          success: false,
+          code: "NO_BUSINESS_OWNER",
+          message: "Your employee account is not linked to an active business owner.",
+          isEmployee: true,
+        });
+      }
+
+      const [ownerRows] = await pool.query(
+        "SELECT id, name, email, role, status FROM users WHERE id = ?",
+        [ownerId]
+      );
+      if (!ownerRows.length || ownerRows[0].status !== "active") {
+        return res.status(403).json({
+          success: false,
+          code: "OWNER_INACTIVE",
+          message: "Your associated business owner account is inactive.",
+          isEmployee: true,
+        });
+      }
+
+      const owner = ownerRows[0];
+      // If owner is a superadmin, they have automatic platform bypass
+      if (owner.role === "superadmin") {
+        return next();
+      }
+
+      // Check owner's active subscription
+      const [rows] = await pool.query(
+        `SELECT id, user_id, plan_id, order_id, starts_at, ends_at, status, is_complimentary
+         FROM subscriptions
+         WHERE user_id = ?
+           AND status = 'active'
+           AND ends_at > NOW()
+         ORDER BY ends_at DESC LIMIT 1`,
+        [owner.id]
+      );
+
+      if (!rows.length) {
+        return res.status(403).json({
+          success: false,
+          code: "SUBSCRIPTION_REQUIRED",
+          reason: "OWNER_SUBSCRIPTION_REQUIRED",
+          message: "Your business owner's subscription has expired or is inactive. Please contact your account owner to renew.",
+          isEmployee: true,
+        });
+      }
+
+      req.subscription = rows[0];
+      return next();
     }
 
+    // Regular business owner / user
     const [rows] = await pool.query(
       `SELECT id, user_id, plan_id, order_id, starts_at, ends_at, status, is_complimentary 
        FROM subscriptions 
@@ -80,7 +131,7 @@ const requireActiveSubscription = async (req, res, next) => {
          AND status = 'active'
          AND ends_at > NOW() 
        ORDER BY ends_at DESC LIMIT 1`,
-      [ownerId]
+      [req.user.id]
     );
 
     if (!rows.length) {

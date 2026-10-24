@@ -137,6 +137,13 @@ const previewPrice = asyncHandler(async (req, res) => {
  * Creates a durable order, reserves coupon, and initializes provider checkout
  */
 const createOrder = asyncHandler(async (req, res) => {
+  if (req.user.role === "employee") {
+    throw new ApiError(400, "Employees inherit subscription entitlement from their business owner and cannot purchase independent subscriptions.");
+  }
+  if (req.user.role === "superadmin") {
+    throw new ApiError(400, "Superadmins have automatic unlimited access and cannot purchase subscriptions.");
+  }
+
   const { plan_code, coupon_code, promo_code } = req.body;
   if (!plan_code) throw new ApiError(400, "plan_code is required.");
 
@@ -375,9 +382,111 @@ const getOrder = asyncHandler(async (req, res) => {
  * Returns current user's active subscription, remaining days, and billing history
  */
 const getMySubscription = asyncHandler(async (req, res) => {
-  const userId = req.user.role === "employee" && req.user.created_by_admin
-    ? req.user.created_by_admin
-    : req.user.id;
+  const settings = await getSubscriptionSettings();
+
+  // Superadmins have platform-wide unlimited access
+  if (req.user.role === "superadmin") {
+    return res.json({
+      success: true,
+      activeSubscription: {
+        id: 0,
+        plan_name: "Superadmin Access",
+        plan_code: "superadmin",
+        status: "active",
+        ends_at: null,
+        is_complimentary: 1,
+      },
+      remainingDays: 9999,
+      isIntroductoryEligible: false,
+      enforcement: settings.subscription_enforcement,
+      billingHistory: [],
+      isSuperadmin: true,
+    });
+  }
+
+  // Employees inherit subscription from their business owner
+  if (req.user.role === "employee") {
+    const ownerId = req.user.created_by_admin;
+    if (!ownerId) {
+      return res.json({
+        success: true,
+        activeSubscription: null,
+        remainingDays: 0,
+        isIntroductoryEligible: false,
+        enforcement: settings.subscription_enforcement,
+        billingHistory: [],
+        isEmployee: true,
+        owner: null,
+      });
+    }
+
+    const [ownerRows] = await pool.query(
+      "SELECT id, name, email, business_name, role, status FROM users WHERE id = ?",
+      [ownerId]
+    );
+    const owner = ownerRows[0] || null;
+
+    if (owner?.role === "superadmin") {
+      return res.json({
+        success: true,
+        activeSubscription: {
+          id: 0,
+          plan_name: "Superadmin Access",
+          plan_code: "superadmin",
+          status: "active",
+          ends_at: null,
+          is_complimentary: 1,
+        },
+        remainingDays: 9999,
+        isIntroductoryEligible: false,
+        enforcement: settings.subscription_enforcement,
+        billingHistory: [],
+        isEmployee: true,
+        owner: {
+          id: owner.id,
+          name: owner.name,
+          business_name: owner.business_name,
+        },
+      });
+    }
+
+    // Regular business owner
+    const [activeSubs] = await pool.query(
+      `SELECT s.*, p.name AS plan_name, p.code AS plan_code, p.duration_months
+       FROM subscriptions s
+       JOIN subscription_plans p ON s.plan_id = p.id
+       WHERE s.user_id = ? AND s.status = 'active' AND s.ends_at > NOW()
+       ORDER BY s.ends_at DESC LIMIT 1`,
+      [ownerId]
+    );
+
+    const activeSubscription = activeSubs[0] || null;
+    let remainingDays = 0;
+    if (activeSubscription) {
+      const diffMs = new Date(activeSubscription.ends_at) - new Date();
+      remainingDays = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+    }
+
+    return res.json({
+      success: true,
+      activeSubscription,
+      remainingDays,
+      isIntroductoryEligible: false,
+      enforcement: settings.subscription_enforcement,
+      billingHistory: [],
+      isEmployee: true,
+      owner: owner
+        ? {
+            id: owner.id,
+            name: owner.name,
+            business_name: owner.business_name,
+          }
+        : null,
+    });
+  }
+
+  // Regular business owner / user
+  const userId = req.user.id;
 
   // Active subscription
   const [activeSubs] = await pool.query(
@@ -410,7 +519,6 @@ const getMySubscription = asyncHandler(async (req, res) => {
   );
 
   const isIntroductoryEligible = await isEligibleForIntroductoryOffer(userId);
-  const settings = await getSubscriptionSettings();
 
   res.json({
     success: true,
@@ -419,6 +527,7 @@ const getMySubscription = asyncHandler(async (req, res) => {
     isIntroductoryEligible,
     enforcement: settings.subscription_enforcement,
     billingHistory: orders,
+    isEmployee: false,
   });
 });
 

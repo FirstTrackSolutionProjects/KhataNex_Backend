@@ -61,7 +61,7 @@ router.delete("/promotions/:id", requirePermission("billing", "delete"), deleteP
 
 router.get("/orders", requirePermission("billing", "view"), listAdminOrders);
 router.get("/reports", requirePermission("billing", "view"), getSubscriptionReports);
-router.post("/grant", requirePermission("billing", "create"), grantSubscription);
+router.post("/grant", authorize("superadmin"), grantSubscription);
 router.post("/users/:id/revoke", requirePermission("billing", "delete"), revokeUserSubscription);
 router.post("/users/:id/reset-intro", requirePermission("billing", "edit"), resetIntroOffer);
 

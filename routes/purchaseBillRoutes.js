@@ -16,25 +16,24 @@ const {
 const {
   authenticate,
   authorize,
+  authorizeModule,
+  requirePermission,
 } = require("../middleware/auth");
 
 router.use(
   authenticate,
-  authorize(
-    "user",
-    "employee",
-    "superadmin"
-  )
+  authorize("user", "employee", "superadmin"),
+  authorizeModule("purchases", "inventory")
 );
 
-router.get("/items", searchPurchaseItems);
-router.get("/search-items", searchPurchaseItems);
-router.get("/", listPurchaseBills);
-router.get("/:id", getPurchaseBill);
-router.post("/", addPurchaseBill);
-router.put("/:id", updatePurchaseBill);
-router.delete("/:id", deletePurchaseBill);
-router.post("/:id/pay", linkPurchaseBillToPayment);
-router.post("/:id/payment", linkPurchaseBillToPayment);
+router.get("/items", requirePermission("purchases", "view"), searchPurchaseItems);
+router.get("/search-items", requirePermission("purchases", "view"), searchPurchaseItems);
+router.get("/", requirePermission("purchases", "view"), listPurchaseBills);
+router.get("/:id", requirePermission("purchases", "view"), getPurchaseBill);
+router.post("/", requirePermission("purchases", "create"), addPurchaseBill);
+router.put("/:id", requirePermission("purchases", "edit"), updatePurchaseBill);
+router.delete("/:id", requirePermission("purchases", "delete"), deletePurchaseBill);
+router.post("/:id/pay", requirePermission("purchases", "edit"), linkPurchaseBillToPayment);
+router.post("/:id/payment", requirePermission("purchases", "edit"), linkPurchaseBillToPayment);
 
 module.exports = router;

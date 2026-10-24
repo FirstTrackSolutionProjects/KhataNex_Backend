@@ -529,6 +529,37 @@ const getUserOverview = asyncHandler(async (req, res) => {
   }
   user.subscription = subscription;
 
+  const [grantRows] = await pool.query(
+    `SELECT a.id, a.actor_id, a.action, a.target_id, a.details, a.created_at,
+            u.name AS granted_by_name, u.email AS granted_by_email
+     FROM admin_audit_logs a
+     LEFT JOIN users u ON a.actor_id = u.id
+     WHERE a.action = 'GRANT_COMPLIMENTARY_SUBSCRIPTION'
+       AND (
+         JSON_UNQUOTE(JSON_EXTRACT(a.details, '$.user_id')) = ?
+         OR a.target_id IN (SELECT CAST(id AS CHAR) FROM subscriptions WHERE user_id = ?)
+       )
+     ORDER BY a.created_at DESC`,
+    [String(id), id]
+  );
+
+  user.grant_history = grantRows.map((r) => {
+    let details = {};
+    try {
+      details = typeof r.details === "string" ? JSON.parse(r.details) : (r.details || {});
+    } catch (_) {}
+    return {
+      id: r.id,
+      created_at: r.created_at,
+      granted_by_name: r.granted_by_name || details.granted_by_name || "Superadmin",
+      granted_by_email: r.granted_by_email || details.granted_by_email || "",
+      plan_name: details.plan_name || details.plan_code || "Complimentary Plan",
+      plan_code: details.plan_code || "",
+      duration_months: details.duration_months || 1,
+      notes: details.notes || "",
+    };
+  });
+
   const [
     customerResult,
     invoiceResult,
@@ -3110,6 +3141,92 @@ const getUserBilling = asyncHandler(async (req, res) => {
   });
 });
 
+// GET /api/superadmin/audit-logs
+const listAuditLogs = asyncHandler(async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+  const offset = (page - 1) * limit;
+
+  const {
+    actor_id,
+    target_type,
+    action,
+    startDate,
+    endDate,
+    search,
+  } = req.query;
+
+  let whereClauses = ["1=1"];
+  const params = [];
+
+  if (actor_id) {
+    whereClauses.push("a.actor_id = ?");
+    params.push(actor_id);
+  }
+
+  if (target_type) {
+    whereClauses.push("a.target_type = ?");
+    params.push(target_type);
+  }
+
+  if (action) {
+    whereClauses.push("a.action = ?");
+    params.push(action);
+  }
+
+  if (startDate) {
+    whereClauses.push("a.created_at >= ?");
+    params.push(new Date(startDate).toISOString().slice(0, 19).replace("T", " "));
+  }
+
+  if (endDate) {
+    whereClauses.push("a.created_at <= ?");
+    params.push(new Date(endDate).toISOString().slice(0, 19).replace("T", " "));
+  }
+
+  if (search) {
+    whereClauses.push("(a.action LIKE ? OR a.target_type LIKE ? OR a.target_id LIKE ? OR CAST(a.details AS CHAR) LIKE ? OR u.name LIKE ? OR u.email LIKE ?)");
+    const term = `%${search}%`;
+    params.push(term, term, term, term, term, term);
+  }
+
+  const whereSql = whereClauses.join(" AND ");
+
+  const [countRows] = await pool.query(
+    `SELECT COUNT(*) AS total
+     FROM admin_audit_logs a
+     LEFT JOIN users u ON u.id = a.actor_id
+     WHERE ${whereSql}`,
+    params
+  );
+  const total = countRows[0]?.total || 0;
+
+  const [logs] = await pool.query(
+    `SELECT a.id, a.actor_id, a.actor_role, a.action, a.target_type, a.target_id,
+            a.before_value, a.after_value, a.details, a.ip_address, a.created_at,
+            u.name AS actor_name, u.email AS actor_email, u.phone AS actor_phone
+     FROM admin_audit_logs a
+     LEFT JOIN users u ON u.id = a.actor_id
+     WHERE ${whereSql}
+     ORDER BY a.created_at DESC, a.id DESC
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+
+  res.json({
+    success: true,
+    data: logs,
+    audit_logs: logs,
+    logs,
+    pagination: {
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit) || 1,
+    },
+  });
+});
+
 module.exports = {
   getUserRecord,
   getUserData,
@@ -3138,4 +3255,5 @@ module.exports = {
   setUserStatus,
   updateUser,
   deleteUser,
+  listAuditLogs,
 };

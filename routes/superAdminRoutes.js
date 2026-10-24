@@ -27,6 +27,7 @@ const {
   setUserStatus,
   updateUser,
   deleteUser,
+  listAuditLogs,
 } = require("../controllers/superAdminController");
 const { authenticate, authorize, authorizePermission, authorizeModule, requirePermission } = require("../middleware/auth");
 const { uploadEmployeePhoto } = require("../utils/upload");
@@ -68,7 +69,10 @@ router.delete("/users/:id", authorize("superadmin"), deleteUser);
 router.post("/employees", authorize("superadmin"), uploadEmployeePhoto.single("profile_photo"), createEmployee);
 router.get("/employees", authorize("superadmin"), listEmployees);
 router.get("/employees/:id", authorize("superadmin"), getEmployee);
-router.patch("/employees/:id", authorize("superadmin"), uploadEmployeePhoto.single("profile_photo"), updateEmployee);
+router.patch("/employees/:id", uploadEmployeePhoto.single("profile_photo"), updateEmployee);
 router.delete("/employees/:id", authorize("superadmin"), deleteEmployee);
+
+// Audit Logs — Superadmin only
+router.get("/audit-logs", authorize("superadmin"), listAuditLogs);
 
 module.exports = router;

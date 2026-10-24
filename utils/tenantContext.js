@@ -13,9 +13,11 @@ const MODULE_OPERATIONS = {
   khata: ["view", "create", "edit", "delete"],
   payments: ["view", "create", "edit", "delete"],
   inventory: ["view", "create", "edit", "delete"],
+  purchases: ["view", "create", "edit", "delete"],
   vehicles: ["view", "create", "edit", "delete"],
   banking: ["view", "create", "edit", "delete"],
   reports: ["view", "export"],
+  dashboard: ["view", "export"],
   billing: ["view"],
   help_centre: ["view", "reply", "claim", "resolve"],
 };
@@ -126,8 +128,10 @@ function hasPermission(user, moduleName, operation = "view") {
 
   if (user.role !== "employee") return false;
 
-  // Normalize module name (e.g. receipts vs money_receipts)
-  const canonicalMod = moduleName === "receipts" ? "money_receipts" : moduleName;
+  // Normalize module name (e.g. receipts vs money_receipts, dashboard vs reports, purchase_bills vs purchases)
+  let canonicalMod = moduleName === "receipts" ? "money_receipts" : moduleName;
+  if (canonicalMod === "dashboard") canonicalMod = "reports";
+  if (canonicalMod === "purchase_bills") canonicalMod = "purchases";
 
   // Check module assignment
   let assigned = user.assigned_modules;
@@ -140,11 +144,15 @@ function hasPermission(user, moduleName, operation = "view") {
   }
   if (!Array.isArray(assigned)) assigned = [];
 
+  const isPurchasesCheck = canonicalMod === "purchases";
   const hasModule =
     assigned.includes("all") ||
     assigned.includes("manage_all") ||
     assigned.includes(canonicalMod) ||
-    assigned.includes(moduleName);
+    assigned.includes(moduleName) ||
+    (canonicalMod === "reports" && assigned.includes("dashboard")) ||
+    (canonicalMod === "dashboard" && assigned.includes("reports")) ||
+    (isPurchasesCheck && (assigned.includes("inventory") || assigned.includes("stock")));
 
   if (!hasModule) return false;
 
@@ -164,14 +172,19 @@ function hasPermission(user, moduleName, operation = "view") {
   }
 
   // Check module wildcard
-  if (permissions.includes(`${canonicalMod}:*`) || permissions.includes(`${moduleName}:*`)) {
+  if (
+    permissions.includes(`${canonicalMod}:*`) ||
+    permissions.includes(`${moduleName}:*`) ||
+    (isPurchasesCheck && permissions.includes("inventory:*"))
+  ) {
     return true;
   }
 
   // Check exact granular permission
   if (
     permissions.includes(`${canonicalMod}:${operation}`) ||
-    permissions.includes(`${moduleName}:${operation}`)
+    permissions.includes(`${moduleName}:${operation}`) ||
+    (isPurchasesCheck && permissions.includes(`inventory:${operation}`))
   ) {
     return true;
   }
@@ -185,14 +198,25 @@ function hasPermission(user, moduleName, operation = "view") {
     "khata:view": "view_khata",
     "payments:view": "view_payments",
     "payments:create": "manage_payments",
+    "inventory:view": "view_inventory",
     "inventory:create": "manage_inventory",
     "inventory:edit": "manage_inventory",
+    "purchases:view": "view_inventory",
+    "purchases:create": "manage_inventory",
+    "purchases:edit": "manage_inventory",
     "vehicles:create": "manage_vehicles",
     "vehicles:edit": "manage_vehicles",
   };
 
   const legacyKey = `${canonicalMod}:${operation}`;
   if (legacyActionMap[legacyKey] && permissions.includes(legacyActionMap[legacyKey])) {
+    return true;
+  }
+
+  if (
+    (canonicalMod === "inventory" || isPurchasesCheck) &&
+    (permissions.includes("manage_inventory") || permissions.includes("inventory:*"))
+  ) {
     return true;
   }
 
@@ -218,35 +242,57 @@ function hasPermission(user, moduleName, operation = "view") {
 /**
  * Standard audit logger for employee and administrative operations
  */
-async function logAuditEvent({
-  actorId,
-  actorRole,
-  action,
-  targetType,
-  targetId,
-  beforeValue = null,
-  afterValue = null,
-  details = null,
-  ipAddress = null,
-}) {
+async function logAuditEvent(reqOrEvent, maybeEvent = null) {
   try {
-    const detailsStr = details && typeof details === "object" ? JSON.stringify(details) : (details || null);
-    const beforeStr = beforeValue && typeof beforeValue === "object" ? JSON.stringify(beforeValue) : (beforeValue || null);
-    const afterStr = afterValue && typeof afterValue === "object" ? JSON.stringify(afterValue) : (afterValue || null);
+    let event = {};
+    if (maybeEvent && typeof maybeEvent === "object") {
+      const req = reqOrEvent;
+      const tenant = getTenantContext(req);
+      event = {
+        actorId: tenant.actorId,
+        actorRole: tenant.actorRole,
+        ipAddress: req?.ip || req?.connection?.remoteAddress || null,
+        ...maybeEvent,
+      };
+      if (!event.targetAccountId && tenant.businessOwnerId && tenant.businessOwnerId !== tenant.actorId) {
+        event.targetAccountId = tenant.businessOwnerId;
+      }
+    } else {
+      event = { ...(reqOrEvent || {}) };
+    }
+
+    let detailsObj = event.details;
+    if (typeof detailsObj === "string") {
+      try {
+        detailsObj = JSON.parse(detailsObj);
+      } catch (_) {
+        detailsObj = { message: detailsObj };
+      }
+    } else if (!detailsObj || typeof detailsObj !== "object") {
+      detailsObj = {};
+    }
+
+    if (event.targetAccountId) {
+      detailsObj.target_account_id = event.targetAccountId;
+    }
+
+    const detailsStr = JSON.stringify(detailsObj);
+    const beforeStr = event.beforeValue && typeof event.beforeValue === "object" ? JSON.stringify(event.beforeValue) : (event.beforeValue || null);
+    const afterStr = event.afterValue && typeof event.afterValue === "object" ? JSON.stringify(event.afterValue) : (event.afterValue || null);
 
     await pool.query(
       `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        actorId,
-        actorRole,
-        action,
-        targetType,
-        targetId ? String(targetId) : null,
+        event.actorId || 1,
+        event.actorRole || "system",
+        event.action || "UNKNOWN_ACTION",
+        event.targetType || "general",
+        event.targetId ? String(event.targetId) : null,
         beforeStr,
         afterStr,
         detailsStr,
-        ipAddress || null,
+        event.ipAddress || null,
       ]
     );
   } catch (err) {

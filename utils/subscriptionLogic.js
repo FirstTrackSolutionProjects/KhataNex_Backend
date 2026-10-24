@@ -364,7 +364,8 @@ async function priceOrder({ plan, isIntroductoryEligible, couponCode, promoCode,
  * - Marks order as paid
  * - Issues invoice asynchronously
  */
-async function fulfillOrder(orderId, providerPaymentId, providerSignature = null, { invoice = true } = {}) {
+async function fulfillOrder(orderId, providerPaymentId, providerSignature = null, options = {}) {
+  const invoice = options.invoice !== false;
   const conn = await pool.getConnection();
   let order;
 
@@ -408,7 +409,7 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
       "SELECT duration_months FROM subscription_plans WHERE id = ?",
       [order.plan_id]
     );
-    const durationMonths = plans[0]?.duration_months || 1;
+    const durationMonths = (options && options.durationMonths) ? Number(options.durationMonths) : (plans[0]?.duration_months || 1);
 
     // Calendar arithmetic: if active subscription exists, start when that term ends; otherwise start NOW
     await conn.query(
