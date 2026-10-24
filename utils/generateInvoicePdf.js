@@ -891,26 +891,14 @@ const generateInvoicePdf = ({
 
 /*
  * ============================================================
- * QUOTATION PDF
+ * EXPORTS (DELEGATED TO GENERATEDOCUMENTPDF)
  * ============================================================
  */
-
-const generateQuotationPdf = ({
-  doc,
-  customer,
-  items,
-  company,
-}) => {
-  return generateInvoicePdf({
-    doc: { ...doc, doc_type: "quotation" },
-    customer,
-    items,
-    company,
-  });
-};
+const documentPdf = require("./generateDocumentPdf");
 
 module.exports = {
-  generateInvoicePdf,
-  generateQuotationPdf,
-  resolveWatermarkEnabled,
+  generateInvoicePdf: documentPdf.generateInvoicePdf,
+  generateQuotationPdf: documentPdf.generateQuotationPdf,
+  resolveWatermarkEnabled: documentPdf.resolveWatermarkEnabled,
 };
+

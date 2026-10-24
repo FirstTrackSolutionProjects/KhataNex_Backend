@@ -1,6 +1,7 @@
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
+const { getTenantContext, hasPermission, logAuditEvent } = require("../utils/tenantContext");
 
 const normalizeRate = (value) => {
   const rate = Number(value);
@@ -152,6 +153,12 @@ const getBillWithItems = async (billId, userId) => {
 
 // POST /api/purchase-bills
 const addPurchaseBill = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
+  if (!hasPermission(req.user, "purchases", "create")) {
+    throw new ApiError(403, "You do not have permission to create purchase bills.");
+  }
+
   const {
     bill_number,
     vendor_name,
@@ -181,7 +188,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
     if (bill_number && String(bill_number).trim()) {
       const [existingBill] = await connection.query(
         "SELECT id FROM purchase_bills WHERE bill_number = ? AND created_by = ? LIMIT 1",
-        [String(bill_number).trim(), req.user.id]
+        [String(bill_number).trim(), businessOwnerId]
       );
       if (existingBill.length) {
         throw new ApiError(400, `Purchase bill '${bill_number}' already exists.`);
@@ -197,7 +204,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
         bill_number ? String(bill_number).trim() : null,
         vendor_name ? String(vendor_name).trim() : null,
         formattedBillDate,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
@@ -212,7 +219,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
       if (!productId && item.item_name) {
         const [matching] = await connection.query(
           "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
-          [item.item_name, item.item_name, req.user.id]
+          [item.item_name, item.item_name, businessOwnerId]
         );
         if (matching.length) {
           productId = matching[0].id;
@@ -261,7 +268,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
           `UPDATE stock
            SET quantity = quantity + ?
            WHERE id = ? AND created_by = ?`,
-          [totalQty, prodId, req.user.id]
+          [totalQty, prodId, businessOwnerId]
         );
       }
     }
@@ -294,7 +301,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
         bill_number || "",
         bill_number ? `Purchase Bill ${bill_number}` : "",
         bill_number || "",
-        req.user.id
+        businessOwnerId
       ]
     );
 
@@ -307,13 +314,13 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
              amount = ?, payment_mode = ?, payment_date = COALESCE(?, CURRENT_DATE),
              purchase_bill_id = ?
          WHERE id = ? AND created_by = ?`,
-        [partyName, purpose, billTotal, paymentMode, paymentDate, purchaseBillId, paymentId, req.user.id]
+        [partyName, purpose, billTotal, paymentMode, paymentDate, purchaseBillId, paymentId, businessOwnerId]
       );
       if (existingPayments.length > 1) {
         const extraIds = existingPayments.slice(1).map((p) => p.id);
         await connection.query(
           "UPDATE payments SET purchase_bill_id = ?, payment_category = 'paid_by_business' WHERE id IN (?) AND created_by = ?",
-          [purchaseBillId, extraIds, req.user.id]
+          [purchaseBillId, extraIds, businessOwnerId]
         );
       }
     } else {
@@ -321,7 +328,7 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
         `INSERT INTO payments
           (payment_category, party_name, purpose, amount, payment_mode, payment_date, purchase_bill_id, add_to_khata, created_by)
          VALUES ('paid_by_business', ?, ?, ?, ?, COALESCE(?, CURRENT_DATE), ?, 0, ?)`,
-        [partyName, purpose, billTotal, paymentMode, paymentDate, purchaseBillId, req.user.id]
+        [partyName, purpose, billTotal, paymentMode, paymentDate, purchaseBillId, businessOwnerId]
       );
       paymentId = payRes.insertId;
     }
@@ -333,7 +340,14 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
 
     await connection.commit();
 
-    const purchaseBill = await getBillWithItems(purchaseBillId, req.user.id);
+    const purchaseBill = await getBillWithItems(purchaseBillId, businessOwnerId);
+
+    await logAuditEvent(req, {
+      action: "CREATE_PURCHASE_BILL",
+      targetType: "purchase_bill",
+      targetId: purchaseBillId,
+      details: `Created purchase bill "${bill_number || purchaseBillId}" from vendor "${vendor_name || "Vendor"}" for ₹${billTotal}`,
+    });
 
     res.status(201).json({
       success: true,
@@ -349,6 +363,12 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
 
 // GET /api/purchase-bills
 const listPurchaseBills = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
+  if (!hasPermission(req.user, "purchases", "view")) {
+    throw new ApiError(403, "You do not have permission to view purchase bills.");
+  }
+
   const search = String(req.query.search || "").trim();
 
   let sql = `
@@ -359,7 +379,7 @@ const listPurchaseBills = asyncHandler(async (req, res) => {
     WHERE b.created_by = ?
   `;
 
-  const params = [req.user.id];
+  const params = [businessOwnerId];
 
   if (search) {
     sql += `
@@ -421,7 +441,13 @@ const listPurchaseBills = asyncHandler(async (req, res) => {
 
 // GET /api/purchase-bills/:id
 const getPurchaseBill = asyncHandler(async (req, res) => {
-  const purchaseBill = await getBillWithItems(req.params.id, req.user.id);
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
+  if (!hasPermission(req.user, "purchases", "view")) {
+    throw new ApiError(403, "You do not have permission to view purchase bills.");
+  }
+
+  const purchaseBill = await getBillWithItems(req.params.id, businessOwnerId);
 
   res.json({
     success: true,
@@ -431,6 +457,12 @@ const getPurchaseBill = asyncHandler(async (req, res) => {
 
 // PUT /api/purchase-bills/:id
 const updatePurchaseBill = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
+  if (!hasPermission(req.user, "purchases", "edit")) {
+    throw new ApiError(403, "You do not have permission to edit purchase bills.");
+  }
+
   const { id } = req.params;
   const {
     bill_number,
@@ -463,7 +495,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
        FROM purchase_bills
        WHERE id = ? AND created_by = ?
        FOR UPDATE`,
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (!existing.length) {
@@ -487,7 +519,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
         if (!productId && oldItem.item_name) {
           const [matching] = await connection.query(
             "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
-            [oldItem.item_name, oldItem.item_name, req.user.id]
+            [oldItem.item_name, oldItem.item_name, businessOwnerId]
           );
           if (matching.length) {
             productId = matching[0].id;
@@ -505,7 +537,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           `UPDATE stock
            SET quantity = quantity - ?
            WHERE id = ? AND created_by = ?`,
-          [totalQty, prodId, req.user.id]
+          [totalQty, prodId, businessOwnerId]
         );
       }
     }
@@ -525,7 +557,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
         vendor_name ? String(vendor_name).trim() : null,
         formattedBillDate,
         id,
-        req.user.id,
+        businessOwnerId,
       ]
     );
 
@@ -546,7 +578,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
       if (!productId && item.item_name) {
         const [matching] = await connection.query(
           "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
-          [item.item_name, item.item_name, req.user.id]
+          [item.item_name, item.item_name, businessOwnerId]
         );
         if (matching.length) {
           productId = matching[0].id;
@@ -594,7 +626,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           `UPDATE stock
            SET quantity = quantity + ?
            WHERE id = ? AND created_by = ?`,
-          [totalQty, prodId, req.user.id]
+          [totalQty, prodId, businessOwnerId]
         );
       }
     }
@@ -625,7 +657,7 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
         bill_number || "",
         bill_number ? `Purchase Bill ${bill_number}` : "",
         bill_number || "",
-        req.user.id
+        businessOwnerId
       ]
     );
     if (existingPayments.length > 0) {
@@ -645,19 +677,19 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           purpose || null,
           formatDateForMySQL(bill_date),
           primaryPaymentId,
-          req.user.id,
+          businessOwnerId,
         ]
       );
       if (existingPayments.length > 1) {
         const extraIds = existingPayments.slice(1).map((p) => p.id);
         await connection.query(
           "UPDATE payments SET purchase_bill_id = ?, payment_category = 'paid_by_business' WHERE id IN (?) AND created_by = ?",
-          [id, extraIds, req.user.id]
+          [id, extraIds, businessOwnerId]
         );
       }
       await connection.query(
         "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-        [primaryPaymentId, id, req.user.id]
+        [primaryPaymentId, id, businessOwnerId]
       );
     } else {
       const [payRes] = await connection.query(
@@ -671,18 +703,25 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           paymentMode || "online",
           formatDateForMySQL(bill_date),
           id,
-          req.user.id,
+          businessOwnerId,
         ]
       );
       await connection.query(
         "UPDATE purchase_bills SET is_paid = 1, payment_id = ? WHERE id = ? AND created_by = ?",
-        [payRes.insertId, id, req.user.id]
+        [payRes.insertId, id, businessOwnerId]
       );
     }
 
     await connection.commit();
 
-    const purchaseBill = await getBillWithItems(id, req.user.id);
+    const purchaseBill = await getBillWithItems(id, businessOwnerId);
+
+    await logAuditEvent(req, {
+      action: "UPDATE_PURCHASE_BILL",
+      targetType: "purchase_bill",
+      targetId: id,
+      details: `Updated purchase bill "${bill_number || id}" for ₹${updatedBillTotal}`,
+    });
 
     res.json({
       success: true,
@@ -698,6 +737,12 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
 
 // DELETE /api/purchase-bills/:id
 const deletePurchaseBill = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
+  if (!hasPermission(req.user, "purchases", "delete")) {
+    throw new ApiError(403, "You do not have permission to delete purchase bills.");
+  }
+
   const { id } = req.params;
 
   const connection = await pool.getConnection();
@@ -706,11 +751,11 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
     await connection.beginTransaction();
 
     const [existing] = await connection.query(
-      `SELECT id
+      `SELECT id, payment_id
        FROM purchase_bills
        WHERE id = ? AND created_by = ?
        FOR UPDATE`,
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     if (!existing.length) {
@@ -734,7 +779,7 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
         if (!productId && item.item_name) {
           const [matching] = await connection.query(
             "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
-            [item.item_name, item.item_name, req.user.id]
+            [item.item_name, item.item_name, businessOwnerId]
           );
           if (matching.length) {
             productId = matching[0].id;
@@ -752,7 +797,7 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
           `UPDATE stock
            SET quantity = quantity - ?
            WHERE id = ? AND created_by = ?`,
-          [totalQty, prodId, req.user.id]
+          [totalQty, prodId, businessOwnerId]
         );
       }
     }
@@ -768,16 +813,23 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
     await connection.query(
       `DELETE FROM payments
        WHERE (purchase_bill_id = ? OR id = ?) AND created_by = ?`,
-      [id, existing[0].payment_id || 0, req.user.id]
+      [id, existing[0].payment_id || 0, businessOwnerId]
     );
 
     await connection.query(
       `DELETE FROM purchase_bills
        WHERE id = ? AND created_by = ?`,
-      [id, req.user.id]
+      [id, businessOwnerId]
     );
 
     await connection.commit();
+
+    await logAuditEvent(req, {
+      action: "DELETE_PURCHASE_BILL",
+      targetType: "purchase_bill",
+      targetId: id,
+      details: `Deleted purchase bill ID ${id}`,
+    });
 
     res.json({
       success: true,
@@ -793,6 +845,12 @@ const deletePurchaseBill = asyncHandler(async (req, res) => {
 
 // GET /api/purchase-bills/items
 const searchPurchaseItems = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const businessOwnerId = tenant.businessOwnerId;
+  if (!hasPermission(req.user, "purchases", "view") && !hasPermission(req.user, "inventory", "view")) {
+    throw new ApiError(403, "You do not have permission to search purchase items.");
+  }
+
   const query = String(req.query.search || req.query.q || req.query.query || req.query.hsn_code || req.query.hsn || "").trim();
   const purchaseBillId = req.query.purchase_bill_id || req.query.purchaseBillId || req.query.bill_id;
 
@@ -818,7 +876,7 @@ const searchPurchaseItems = asyncHandler(async (req, res) => {
     JOIN purchase_bills pb ON pb.id = pbi.purchase_bill_id
     WHERE pb.created_by = ?
   `;
-  const params = [req.user.id];
+  const params = [businessOwnerId];
 
   if (purchaseBillId) {
     sql += " AND pb.id = ?";

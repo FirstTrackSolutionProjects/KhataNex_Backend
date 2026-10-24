@@ -46,7 +46,7 @@ const optionalAuthenticate = async (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const [rows] = await pool.query(
-      "SELECT id, name, email, role, employee_role_type, permissions, status FROM users WHERE id = ?",
+      "SELECT id, name, email, role, employee_role_type, permissions, status, created_by_admin FROM users WHERE id = ?",
       [decoded.id]
     );
     if (rows[0] && rows[0].status === "active") {

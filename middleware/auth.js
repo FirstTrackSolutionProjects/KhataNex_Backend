@@ -133,6 +133,11 @@ const authorizeModule = (...requiredModules) => (req, res, next) => {
     if (assigned.includes("all") || assigned.includes("manage_all")) {
       return next();
     }
+    // Inherited Purchases access: Inventory access grants Purchases access
+    const isPurchases = requiredModules.includes("purchases") || requiredModules.includes("purchase_bills");
+    if (isPurchases && (assigned.includes("inventory") || assigned.includes("stock"))) {
+      return next();
+    }
     const hasModule = requiredModules.some((mod) => assigned.includes(mod));
     if (hasModule) return next();
     return next(new ApiError(403, `Access denied: you are not assigned to the [${requiredModules.join(", ")}] module.`));

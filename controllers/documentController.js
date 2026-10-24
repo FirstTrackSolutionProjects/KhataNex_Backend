@@ -1031,58 +1031,32 @@ const createDocument =
           let resolvedProductId = item.product_id || null;
           const reqQty = cleanNumber(item.quantity, 1);
 
-          if (item.item_type !== "service") {
-            let stockRow = null;
-
-            if (resolvedProductId) {
-              const [rows] = await conn.query(
-                "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
-                [resolvedProductId, tenant.businessOwnerId]
-              );
-              if (rows.length) stockRow = rows[0];
-            }
-
-            if (!stockRow && item.product_name) {
-              const [rows] = await conn.query(
-                "SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ? FOR UPDATE",
-                [item.product_name, tenant.businessOwnerId]
-              );
-              if (rows.length) stockRow = rows[0];
-            }
-
-            if (!stockRow) {
-              await conn.rollback();
-              throw new ApiError(
-                400,
-                `Insufficient stock for product "${item.product_name}". Requested: ${reqQty}, Available: 0`,
-                {
-                  product_name: item.product_name,
-                  requested_quantity: reqQty,
-                  available_stock: 0,
-                }
-              );
-            }
-
-            const availableStock = Number(stockRow.quantity || 0);
-            if (availableStock < reqQty) {
-              await conn.rollback();
-              throw new ApiError(
-                400,
-                `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
-                {
-                  product_name: stockRow.product_name,
-                  requested_quantity: reqQty,
-                  available_stock: availableStock,
-                }
-              );
-            }
-
-            await conn.query(
-              "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-              [reqQty, stockRow.id, tenant.businessOwnerId]
+          if (item.item_type !== "service" && resolvedProductId) {
+            const [rows] = await conn.query(
+              "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
+              [resolvedProductId, tenant.businessOwnerId]
             );
+            if (rows.length) {
+              const stockRow = rows[0];
+              const availableStock = Number(stockRow.quantity || 0);
+              if (availableStock < reqQty) {
+                await conn.rollback();
+                throw new ApiError(
+                  400,
+                  `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
+                  {
+                    product_name: stockRow.product_name,
+                    requested_quantity: reqQty,
+                    available_stock: availableStock,
+                  }
+                );
+              }
 
-            resolvedProductId = stockRow.id;
+              await conn.query(
+                "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
+                [reqQty, stockRow.id, tenant.businessOwnerId]
+              );
+            }
           }
 
           await conn.query(
@@ -1295,55 +1269,6 @@ const createDocument =
           const item of
             totals.calculatedItems
         ) {
-          let resolvedProductId = item.product_id || null;
-          const reqQty = cleanNumber(item.quantity, 1);
-
-          if (item.item_type !== "service") {
-            let stockRow = null;
-
-            if (resolvedProductId) {
-              const [rows] = await conn.query(
-                "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?",
-                [resolvedProductId, tenant.businessOwnerId]
-              );
-              if (rows.length) stockRow = rows[0];
-            }
-
-            if (!stockRow && item.product_name) {
-              const [rows] = await conn.query(
-                "SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?",
-                [item.product_name, tenant.businessOwnerId]
-              );
-              if (rows.length) stockRow = rows[0];
-            }
-
-            if (!stockRow) {
-              await conn.rollback();
-              throw new ApiError(
-                400,
-                `Insufficient stock for product "${item.product_name}". Requested: ${reqQty}, Available: 0`,
-                {
-                  product_name: item.product_name,
-                  requested_quantity: reqQty,
-                  available_stock: 0,
-                }
-              );
-            }
-
-            const availableStock = Number(stockRow.quantity || 0);
-            if (availableStock < reqQty) {
-              await conn.rollback();
-              throw new ApiError(
-                400,
-                `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
-                {
-                  product_name: stockRow.product_name,
-                  requested_quantity: reqQty,
-                  available_stock: availableStock,
-                }
-              );
-            }
-          }
 
           await conn.query(
             `INSERT INTO quotation_items (
@@ -2692,6 +2617,16 @@ const listDocuments =
     const canViewInvoices = !tenant.isEmployee || hasPermission(req.user, "invoices", "view");
     const canViewQuotations = !tenant.isEmployee || hasPermission(req.user, "quotations", "view");
 
+    if (tenant.isEmployee && !canViewInvoices && !canViewQuotations) {
+      throw new ApiError(403, "Access denied: you do not have permission to view documents.");
+    }
+    if (doc_type === "invoice" && !canViewInvoices) {
+      throw new ApiError(403, "Access denied: you do not have permission to view invoices.");
+    }
+    if (doc_type === "quotation" && !canViewQuotations) {
+      throw new ApiError(403, "Access denied: you do not have permission to view quotations.");
+    }
+
     const rows = [];
 
     /*
@@ -3926,43 +3861,6 @@ const updateDocument = asyncHandler(async (req, res) => {
       );
 
       for (const item of calculatedItems) {
-        const reqQty = cleanNumber(item.quantity, 1);
-        if (item.item_type !== "service") {
-          let stockRow = null;
-          if (item.product_id) {
-            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ?", [item.product_id, tenant.businessOwnerId]);
-            if (rows.length) stockRow = rows[0];
-          }
-          if (!stockRow && item.product_name) {
-            const [rows] = await conn.query("SELECT id, product_name, quantity FROM stock WHERE product_name = ? AND created_by = ?", [item.product_name, tenant.businessOwnerId]);
-            if (rows.length) stockRow = rows[0];
-          }
-          if (!stockRow) {
-            await conn.rollback();
-            throw new ApiError(
-              400,
-              `Insufficient stock for product "${item.product_name}". Requested: ${reqQty}, Available: 0`,
-              {
-                product_name: item.product_name,
-                requested_quantity: reqQty,
-                available_stock: 0,
-              }
-            );
-          }
-          const availableStock = Number(stockRow.quantity || 0);
-          if (availableStock < reqQty) {
-            await conn.rollback();
-            throw new ApiError(
-              400,
-              `Insufficient stock for product "${stockRow.product_name}". Requested: ${reqQty}, Available: ${availableStock}`,
-              {
-                product_name: stockRow.product_name,
-                requested_quantity: reqQty,
-                available_stock: availableStock,
-              }
-            );
-          }
-        }
 
         await conn.query(
           `INSERT INTO quotation_items
@@ -3990,14 +3888,10 @@ const updateDocument = asyncHandler(async (req, res) => {
       // Reverse previous stock deductions
       const [oldItems] = await conn.query("SELECT * FROM invoice_items WHERE invoice_id = ?", [id]);
       for (const oldItem of oldItems) {
-        if (oldItem.item_type !== "service") {
+        if (oldItem.item_type !== "service" && oldItem.product_id) {
           const qty = Number(oldItem.quantity || 0);
           if (qty > 0) {
-            if (oldItem.product_id) {
-              await conn.query("UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?", [qty, oldItem.product_id, invoice.created_by]);
-            } else if (oldItem.product_name) {
-              await conn.query("UPDATE stock SET quantity = quantity + ? WHERE product_name = ? AND created_by = ?", [qty, oldItem.product_name, invoice.created_by]);
-            }
+            await conn.query("UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?", [qty, oldItem.product_id, invoice.created_by]);
           }
         }
       }
@@ -4012,6 +3906,7 @@ const updateDocument = asyncHandler(async (req, res) => {
           if (stRows.length) {
             const avail = Number(stRows[0].quantity || 0);
             if (reqQty > avail) {
+              await conn.rollback();
               throw new ApiError(400, `Insufficient stock for "${stRows[0].product_name}". Available: ${avail}.`);
             }
             await conn.query("UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?", [reqQty, item.product_id, tenant.businessOwnerId]);

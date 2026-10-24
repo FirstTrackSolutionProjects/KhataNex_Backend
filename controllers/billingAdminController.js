@@ -901,11 +901,43 @@ const getUserBillingDetails = asyncHandler(async (req, res) => {
     [userId]
   );
 
+  const [grantHistoryRows] = await pool.query(
+    `SELECT a.id, a.actor_id, a.action, a.target_id, a.details, a.created_at,
+            u.name AS granted_by_name, u.email AS granted_by_email, u.role AS granted_by_role
+     FROM admin_audit_logs a
+     LEFT JOIN users u ON a.actor_id = u.id
+     WHERE a.action = 'GRANT_COMPLIMENTARY_SUBSCRIPTION'
+       AND (
+         JSON_UNQUOTE(JSON_EXTRACT(a.details, '$.user_id')) = ?
+         OR a.target_id IN (SELECT CAST(id AS CHAR) FROM subscriptions WHERE user_id = ?)
+       )
+     ORDER BY a.created_at DESC`,
+    [String(userId), userId]
+  );
+
+  const grantHistory = grantHistoryRows.map((r) => {
+    let details = {};
+    try {
+      details = typeof r.details === "string" ? JSON.parse(r.details) : (r.details || {});
+    } catch (_) {}
+    return {
+      id: r.id,
+      created_at: r.created_at,
+      granted_by_name: r.granted_by_name || details.granted_by_name || "Superadmin",
+      granted_by_email: r.granted_by_email || details.granted_by_email || "",
+      plan_name: details.plan_name || details.plan_code || "Complimentary Plan",
+      plan_code: details.plan_code || "",
+      duration_months: details.duration_months || 1,
+      notes: details.notes || "",
+    };
+  });
+
   res.json({
     success: true,
     user,
     subscriptions,
     orders,
+    grantHistory,
   });
 });
 
@@ -915,14 +947,37 @@ const getUserBillingDetails = asyncHandler(async (req, res) => {
  * Creates manual order and fulfills subscription with is_complimentary = 1.
  */
 const grantSubscription = asyncHandler(async (req, res) => {
-  const { user_id, plan_code, notes } = req.body;
+  // Defense-in-depth: only authenticated superadmin can grant complimentary subscriptions
+  if (req.user?.role !== "superadmin") {
+    throw new ApiError(403, "Only Superadmin can grant complimentary subscriptions.");
+  }
+
+  const { user_id, plan_code, duration_months, notes } = req.body;
 
   if (!user_id || !plan_code) {
     throw new ApiError(400, "user_id and plan_code are required.");
   }
 
-  const [users] = await pool.query("SELECT id, name, email FROM users WHERE id = ?", [user_id]);
+  const [users] = await pool.query("SELECT id, name, email, role, status FROM users WHERE id = ?", [user_id]);
   if (!users.length) throw new ApiError(404, "User not found.");
+  const targetUser = users[0];
+
+  if (targetUser.role === "superadmin") {
+    throw new ApiError(400, "Superadmin accounts have unlimited access and do not require subscriptions.");
+  }
+  if (targetUser.role === "employee") {
+    throw new ApiError(400, "Employees inherit their business owner's subscription. Grant the subscription to the business owner instead.");
+  }
+
+  // Prevent duplicate/concurrent grant actions within a 5-second window
+  const [recentGrants] = await pool.query(
+    `SELECT id, created_at FROM subscription_orders
+     WHERE user_id = ? AND provider = 'manual' AND created_at >= NOW() - INTERVAL 5 SECOND`,
+    [user_id]
+  );
+  if (recentGrants.length > 0) {
+    throw new ApiError(409, "A complimentary subscription grant is already in progress for this user. Please wait a few seconds.");
+  }
 
   const [plans] = await pool.query(
     "SELECT * FROM subscription_plans WHERE code = ?",
@@ -931,6 +986,7 @@ const grantSubscription = asyncHandler(async (req, res) => {
   if (!plans.length) throw new ApiError(404, "Plan not found.");
   const plan = plans[0];
 
+  const durationMonths = duration_months ? Math.max(1, Math.min(60, Number(duration_months))) : plan.duration_months;
   const orderNumber = `GRANT-${Date.now()}-${user_id}`;
 
   const [ins] = await pool.query(
@@ -944,8 +1000,8 @@ const grantSubscription = asyncHandler(async (req, res) => {
 
   const orderId = ins.insertId;
 
-  // Fulfill without charging or generating paid invoice
-  await fulfillOrder(orderId, null, null, { invoice: false });
+  // Fulfill without charging or generating paid invoice, respecting durationMonths
+  await fulfillOrder(orderId, null, null, { invoice: false, durationMonths });
 
   const [subs] = await pool.query(
     `SELECT s.*, p.name AS plan_name 
@@ -955,11 +1011,17 @@ const grantSubscription = asyncHandler(async (req, res) => {
     [orderId]
   );
 
+  if (notes && subs[0]?.id) {
+    try {
+      await pool.query("UPDATE subscriptions SET notes = ? WHERE id = ?", [notes, subs[0].id]);
+    } catch (_) {}
+  }
+
   try {
     await pool.query(
       `INSERT INTO subscription_settings_audit (superadmin_id, action, previous_value, new_value)
        VALUES (?, 'grant_subscription', NULL, ?)`,
-      [req.user.id, JSON.stringify({ user_id, plan_code, notes, orderId })]
+      [req.user.id, JSON.stringify({ user_id, plan_code, duration_months: durationMonths, notes, orderId })]
     );
   } catch (_) {}
 
@@ -975,7 +1037,19 @@ const grantSubscription = asyncHandler(async (req, res) => {
         String(subs[0]?.id || orderId),
         null,
         JSON.stringify(subs[0] || {}),
-        JSON.stringify({ user_id, user_name: users[0]?.name, plan_code, notes, orderId }),
+        JSON.stringify({
+          user_id,
+          user_name: targetUser.name,
+          user_email: targetUser.email,
+          plan_code: plan.code,
+          plan_name: plan.name,
+          duration_months: durationMonths,
+          notes: notes || null,
+          order_id: orderId,
+          granted_by_id: req.user.id,
+          granted_by_name: req.user.name,
+          granted_by_email: req.user.email,
+        }),
         req.ip || "127.0.0.1",
       ]
     );
@@ -983,7 +1057,7 @@ const grantSubscription = asyncHandler(async (req, res) => {
 
   res.status(201).json({
     success: true,
-    message: `Complimentary subscription granted for ${users[0].name}.`,
+    message: `Complimentary subscription granted for ${targetUser.name}.`,
     subscription: subs[0],
   });
 });
