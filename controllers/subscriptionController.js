@@ -262,18 +262,30 @@ const createOrder = asyncHandler(async (req, res) => {
   }
 
   // Initialize checkout with payment provider
-  const checkout = await gateway.createOrder({
-    orderId,
-    amountPaise: pricing.totalPaise,
-    currency: "INR",
-    receipt: orderNumber,
-    notes: {
+  let checkout;
+  try {
+    checkout = await gateway.createOrder({
       orderId,
-      orderNumber,
-      userId: req.user.id,
-      planCode: plan.code,
-    },
-  });
+      amountPaise: pricing.totalPaise,
+      currency: "INR",
+      receipt: orderNumber,
+      notes: {
+        orderId,
+        orderNumber,
+        userId: req.user.id,
+        planCode: plan.code,
+      },
+    });
+  } catch (gatewayErr) {
+    await pool.query("UPDATE subscription_orders SET status = 'failed', notes = ? WHERE id = ?", [
+      gatewayErr.message || "Gateway initialization failed",
+      orderId,
+    ]);
+    if (pricing.couponId) {
+      await pool.query("UPDATE coupon_redemptions SET status = 'released' WHERE order_id = ?", [orderId]);
+    }
+    throw gatewayErr;
+  }
 
   // Update order record with provider details
   await pool.query(

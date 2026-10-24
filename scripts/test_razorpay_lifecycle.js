@@ -574,6 +574,216 @@ async function runTests() {
       `Employee active subscription: ${Boolean(empMeData.activeSubscription)}, Gateway status: ${saStatus.provider}`
     );
 
+    // -------------------------------------------------------------------------
+    // 19. Production safeguards: test credentials blocked & missing keys fail safely
+    // -------------------------------------------------------------------------
+    const origEnv = process.env.NODE_ENV;
+    const origKey = process.env.RAZORPAY_KEY_ID;
+    const origSecret = process.env.RAZORPAY_KEY_SECRET;
+    try {
+      process.env.NODE_ENV = "production";
+      delete process.env.RAZORPAY_KEY_ID;
+      delete process.env.RAZORPAY_KEY_SECRET;
+      delete process.env.RAZORPAY_LIVE_KEY_ID;
+      delete process.env.RAZORPAY_LIVE_KEY_SECRET;
+      delete process.env.RAZOR_PAY_KEY_ID;
+      delete process.env.RZP_KEY_ID;
+      delete process.env.RAZORPAY_KEY;
+
+      let missingBlocked = false;
+      try {
+        await gateway.createOrder({ orderId: 99999, amountPaise: 10000 });
+      } catch (err) {
+        missingBlocked = (err.statusCode === 503 || err.status === 503) && err.message.includes("unconfigured in production");
+      }
+
+      process.env.RAZORPAY_KEY_ID = "rzp_test_forbidden_in_prod";
+      process.env.RAZORPAY_KEY_SECRET = "secret";
+      process.env.ALLOW_TEST_PAYMENTS_IN_PRODUCTION = "true"; // Attempt override
+      let testKeyBlocked = false;
+      try {
+        await gateway.createOrder({ orderId: 99999, amountPaise: 10000 });
+      } catch (err) {
+        testKeyBlocked = (err.statusCode === 503 || err.status === 503) && err.message.includes("Test mode Razorpay credentials detected in production");
+      }
+      delete process.env.ALLOW_TEST_PAYMENTS_IN_PRODUCTION;
+
+      // Test 19.3: Mock gateway mode strictly blocked in production
+      process.env.RAZORPAY_MOCK_GATEWAY = "true";
+      let mockBlockedInProd = false;
+      try {
+        await gateway.createOrder({ orderId: 99999, amountPaise: 10000 });
+      } catch (err) {
+        mockBlockedInProd = (err.statusCode === 500 || err.status === 500) && err.message.includes("Mock payment provider cannot be used in production");
+      }
+      delete process.env.RAZORPAY_MOCK_GATEWAY;
+
+      // Test 19.4: Webhook secret does NOT fall back to key secret in production
+      delete process.env.RAZORPAY_WEBHOOK_SECRET;
+      delete process.env.RAZOR_PAY_WEBHOOK_SECRET;
+      delete process.env.RZP_WEBHOOK_SECRET;
+      process.env.RAZORPAY_KEY_ID = "rzp_live_testmodekeyid";
+      process.env.RAZORPAY_KEY_SECRET = "live_secret_strictly_for_api_not_webhook";
+
+      const prodWebhookSecret = razorpay.getWebhookSecret();
+      const webhookConfiguredInProd = gateway.getStatus().webhookConfigured;
+
+      // An attacker payload signed with the API key secret should fail
+      const testRawPayload = JSON.stringify({ event: "order.paid" });
+      const signedWithKeySecret = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET).update(testRawPayload).digest("hex");
+      const sigAcceptedInProd = gateway.verifyWebhookSignature({ rawBody: testRawPayload, signature: signedWithKeySecret });
+
+      const secretIsolationPassed = prodWebhookSecret === "" && webhookConfiguredInProd === false && sigAcceptedInProd === false;
+
+      report(
+        19,
+        "Production environment strictly rejects missing keys, accidental test credentials, mock gateways, and secret fallback",
+        missingBlocked && testKeyBlocked && mockBlockedInProd && secretIsolationPassed,
+        `Missing keys 503: ${missingBlocked}, Test keys 503: ${testKeyBlocked}, Mock blocked: ${mockBlockedInProd}, Secret isolated: ${secretIsolationPassed}`
+      );
+    } finally {
+      process.env.NODE_ENV = origEnv;
+      if (origKey !== undefined) process.env.RAZORPAY_KEY_ID = origKey;
+      if (origSecret !== undefined) process.env.RAZORPAY_KEY_SECRET = origSecret;
+    }
+
+    // -------------------------------------------------------------------------
+    // 20. Gateway failure idempotency: releases coupon reservation and marks order failed
+    // -------------------------------------------------------------------------
+    const couponCode20 = `FAILCOUP${timestamp}`.slice(0, 15);
+    const [failCouponRes] = await pool.query(
+      "INSERT INTO coupons (code, discount_type, discount_value, min_order_paise, is_active, created_at) VALUES (?, 'flat', 5000, 0, 1, NOW())",
+      [couponCode20]
+    );
+    cleanupCouponIds.push(failCouponRes.insertId);
+
+    const subscriptionController = require("../controllers/subscriptionController");
+    const origCreateOrder = gateway.createOrder;
+    try {
+      // Simulate Razorpay outage / provider network timeout
+      gateway.createOrder = async () => {
+        throw new Error("Razorpay provider service unavailable / connection timeout");
+      };
+
+      let controllerErr = null;
+      const mockReq = {
+        user: userA,
+        body: { plan_code: "monthly", coupon_code: couponCode20 },
+      };
+      const mockRes = {
+        status: () => mockRes,
+        json: () => {},
+      };
+
+      await new Promise((resolve) => {
+        subscriptionController.createOrder(mockReq, mockRes, (err) => {
+          controllerErr = err;
+          resolve();
+        });
+      });
+
+      const controllerThrew = controllerErr && controllerErr.message.includes("Razorpay provider service unavailable");
+
+      const [failedOrders] = await pool.query(
+        "SELECT id, status FROM subscription_orders WHERE user_id = ? AND coupon_code = ? ORDER BY id DESC LIMIT 1",
+        [userA.id, couponCode20]
+      );
+      if (failedOrders.length) cleanupOrderIds.push(failedOrders[0].id);
+
+      const [redemptions] = await pool.query(
+        "SELECT status FROM coupon_redemptions WHERE coupon_id = ? ORDER BY id DESC LIMIT 1",
+        [failCouponRes.insertId]
+      );
+
+      const orderFailedCleanly = failedOrders[0]?.status === "failed";
+      const couponReleased = redemptions[0]?.status === "released";
+
+      report(
+        20,
+        "Failed gateway initialization automatically updates order to 'failed' and releases coupon reservation",
+        controllerThrew && orderFailedCleanly && couponReleased,
+        `Controller error thrown: ${Boolean(controllerThrew)}, Order status: ${failedOrders[0]?.status}, Coupon status: ${redemptions[0]?.status}`
+      );
+    } finally {
+      gateway.createOrder = origCreateOrder;
+    }
+
+    // -------------------------------------------------------------------------
+    // 21. Webhook concurrent deduplication and enum integrity
+    // -------------------------------------------------------------------------
+    const concurrentEventId = `evt_race_${timestamp}`;
+    const concurrentPayload = JSON.stringify({
+      event: "order.paid",
+      id: concurrentEventId,
+      payload: {
+        payment: { entity: { id: `pay_race_${timestamp}`, order_id: "order_nonexistent_mock", amount: 10000, currency: "INR" } },
+      },
+    });
+    const concurrentSig = crypto.createHmac("sha256", testWebhookSecret).update(concurrentPayload).digest("hex");
+
+    // Deliver first request
+    const concRes1 = await fetch(`${BASE_URL}/api/webhooks/payment/razorpay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-razorpay-signature": concurrentSig },
+      body: concurrentPayload,
+    });
+    const concData1 = await concRes1.json();
+
+    // Deliver duplicate second request
+    const concRes2 = await fetch(`${BASE_URL}/api/webhooks/payment/razorpay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-razorpay-signature": concurrentSig },
+      body: concurrentPayload,
+    });
+    const concData2 = await concRes2.json();
+
+    const [eventRow] = await pool.query(
+      "SELECT id, status, error_message FROM payment_webhook_events WHERE event_id = ?",
+      [concurrentEventId]
+    );
+
+    report(
+      21,
+      "Webhook deduplication handles repeated event IDs cleanly and maintains database enum stability",
+      concRes1.status === 200 && concRes2.status === 200 && concData2.duplicate === true && eventRow.length === 1 && ["processed", "ignored", "failed"].includes(eventRow[0]?.status),
+      `Req 1: ${concData1.status}, Req 2: duplicate=${concData2.duplicate}, DB status: ${eventRow[0]?.status}`
+    );
+
+    // -------------------------------------------------------------------------
+    // 22. Webhook payload without event ID or entity IDs is safely ignored without fabricating timestamp keys
+    // -------------------------------------------------------------------------
+    const missingIdPayload = JSON.stringify({
+      event: "payment.captured",
+      payload: {
+        payment: { entity: {} },
+      },
+    });
+    const missingIdSig = crypto.createHmac("sha256", testWebhookSecret).update(missingIdPayload).digest("hex");
+
+    const [eventsBefore] = await pool.query("SELECT COUNT(*) as cnt FROM payment_webhook_events");
+
+    const missingIdRes = await fetch(`${BASE_URL}/api/webhooks/payment/razorpay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-razorpay-signature": missingIdSig },
+      body: missingIdPayload,
+    });
+    const missingIdData = await missingIdRes.json();
+
+    const [eventsAfter] = await pool.query("SELECT COUNT(*) as cnt FROM payment_webhook_events");
+
+    const safelyIgnored =
+      missingIdRes.status === 200 &&
+      missingIdData.ignored === true &&
+      missingIdData.status === "ignored" &&
+      eventsBefore[0]?.cnt === eventsAfter[0]?.cnt;
+
+    report(
+      22,
+      "Webhook lacking event ID and entity IDs is safely ignored without fabricating timestamp keys or inserting events",
+      safelyIgnored,
+      `HTTP: ${missingIdRes.status}, ignored: ${missingIdData.ignored}, events inserted: ${eventsAfter[0]?.cnt - eventsBefore[0]?.cnt}`
+    );
+
   } catch (err) {
     console.error("Test execution encountered an unhandled error:", err);
   } finally {

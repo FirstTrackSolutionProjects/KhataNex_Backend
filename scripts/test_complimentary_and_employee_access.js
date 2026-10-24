@@ -421,6 +421,7 @@ async function run() {
   if (results.some((r) => r.status === "FAIL")) {
     process.exit(1);
   }
+  process.exit(0);
 }
 
 run().catch((err) => {
