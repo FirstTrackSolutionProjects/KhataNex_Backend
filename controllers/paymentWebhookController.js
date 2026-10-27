@@ -127,14 +127,36 @@ const handlePaymentWebhook = asyncHandler(async (req, res) => {
 
     if (providerOrderId) {
       const [orders] = await pool.query(
-        "SELECT id, status FROM subscription_orders WHERE provider_order_id = ?",
+        `SELECT o.id, o.order_number, o.total_paise, o.status, u.email, u.name, u.business_name
+         FROM subscription_orders o
+         JOIN users u ON o.user_id = u.id
+         WHERE o.provider_order_id = ?`,
         [providerOrderId]
       );
       if (orders.length && ["created", "pending"].includes(orders[0].status)) {
-        const orderId = orders[0].id;
+        const order = orders[0];
+        const orderId = order.id;
         await pool.query("UPDATE subscription_orders SET status = 'failed' WHERE id = ?", [orderId]);
         // Safely release coupon reservation
         await pool.query("UPDATE coupon_redemptions SET status = 'released' WHERE order_id = ?", [orderId]);
+
+        // Trigger payment failure notification email
+        if (order.email) {
+          try {
+            const emailService = require("../services/emailService");
+            const failureReason = paymentEntity.error_description || paymentEntity.error_reason || "Transaction was declined by issuing bank or gateway.";
+            await emailService.sendPaymentFailureEmail({
+              to: order.email,
+              userName: order.name || order.business_name,
+              orderNumber: order.order_number,
+              amountPaise: order.total_paise,
+              reason: failureReason,
+              orderId: order.id,
+            });
+          } catch (mailErr) {
+            console.warn(`[PaymentWebhook] Failed to enqueue payment failure email for order ${orderId}:`, mailErr.message);
+          }
+        }
       }
     }
     return finish("processed");

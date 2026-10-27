@@ -73,10 +73,12 @@ async function issueInvoice(orderId) {
   if (order.user_email) {
     try {
       const filePath = invoiceFilePath(pdfFilename);
-      await sendInvoiceEmail(order.user_email, invoiceNumber, order.plan_name, filePath, invoiceId);
+      await sendInvoiceEmail(order.user_email, invoiceNumber, order.plan_name, filePath, invoiceId, order);
     } catch (mailErr) {
       console.warn(`[SubscriptionInvoice] Failed to enqueue invoice email ${invoiceNumber}:`, mailErr.message || mailErr);
     }
+  } else {
+    console.warn(`[SubscriptionInvoice] No recipient email found for order ${order.id} (user ID ${order.user_id}); invoice email skipped.`);
   }
 
   const [created] = await pool.query("SELECT * FROM subscription_invoices WHERE id = ?", [invoiceId]);
@@ -126,27 +128,22 @@ async function renderAndSavePdf(invoiceId, cachedOrder = null) {
 /**
  * Sends invoice email via durable outbox email service
  */
-async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath, invoiceId = null) {
+async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath, invoiceId = null, order = {}) {
   const emailService = require("../services/emailService");
-  return emailService.enqueue({
+  const masked = String(toEmail || "").replace(/(.{2})(.*)(?=@)/, (_, a, b) => a + "*".repeat(b.length));
+  console.log(`[SubscriptionInvoice] Triggering subscription invoice email for #${invoiceNumber} to: ${masked}`);
+
+  return emailService.sendSubscriptionConfirmationEmail({
     to: toEmail,
-    subject: `Your KhataNex Subscription Invoice (${invoiceNumber})`,
-    text: `Hello,\n\nThank you for choosing KhataNex. Your subscription for ${planName} is now active.\nPlease find your tax invoice ${invoiceNumber} attached.\n\nWarm regards,\nTeam KhataNex`,
-    html: `
-      <div style="font-family: Arial, sans-serif; color: #334155; line-height: 1.6;">
-        <h2 style="color: #059669;">KhataNex Subscription Invoice</h2>
-        <p>Hello,</p>
-        <p>Thank you for subscribing to <strong>KhataNex</strong>! Your payment was successful and your subscription plan (<strong>${planName}</strong>) is active.</p>
-        <p>Your official tax invoice <strong>#${invoiceNumber}</strong> is attached to this email.</p>
-        <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
-        <p style="font-size: 12px; color: #64748b;">If you have any questions or require assistance, please reply to this email or contact support.</p>
-      </div>
-    `,
-    attachmentPath,
-    attachmentName: `${invoiceNumber}.pdf`,
-    category: "subscription_invoice",
-    referenceType: "subscription_invoice",
-    referenceId: invoiceId || invoiceNumber,
+    userName: order.user_name || order.business_name || "Valued Customer",
+    planName: planName || order.plan_name || "KhataNex Subscription Plan",
+    invoiceNumber,
+    durationMonths: order.duration_months || 1,
+    startsAt: order.starts_at || null,
+    endsAt: order.ends_at || null,
+    totalPaise: order.total_paise || 0,
+    pdfPath: attachmentPath,
+    invoiceId: invoiceId || invoiceNumber,
   });
 }
 

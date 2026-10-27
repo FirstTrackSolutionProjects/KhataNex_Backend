@@ -618,10 +618,10 @@ const resendInvoice = asyncHandler(async (req, res) => {
   let invoice = invoices[0] || (await issueInvoice(order.id));
 
   const filePath = invoiceFilePath(invoice.pdf_filename);
-  const result = await sendInvoiceEmail(order.user_email, invoice.invoice_number, order.plan_name, filePath);
+  const result = await sendInvoiceEmail(order.user_email, invoice.invoice_number, order.plan_name, filePath, invoice.id, order);
 
-  if (!result.sent) {
-    throw new ApiError(502, `Failed to send email: ${result.error}`);
+  if (result && result.success === false && !result.outboxId) {
+    throw new ApiError(502, `Failed to queue email: ${result.error}`);
   }
 
   await pool.query("UPDATE subscription_invoices SET emailed_at = NOW() WHERE id = ?", [invoice.id]);
@@ -697,6 +697,145 @@ const failOrder = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * GET /api/subscriptions/unsubscribe
+ * One-click email unsubscribe handler for promotional emails
+ */
+const handleUnsubscribeGet = asyncHandler(async (req, res) => {
+  const emailService = require("../services/emailService");
+  const { email, token } = req.query;
+
+  if (!email) {
+    return res.status(400).send("<h3>Invalid request: email is required.</h3>");
+  }
+
+  // Token verification for one-click unsubscribe
+  const isValid = emailService.verifyUnsubscribeToken(email, token);
+  if (!isValid) {
+    return res.status(403).send("<h3>Invalid or expired unsubscribe link.</h3>");
+  }
+
+  await emailService.unsubscribeEmail(email, "one_click_link");
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><meta charset="utf-8"><title>Unsubscribed — KhataNex</title></head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; color: #1e293b; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+      <div style="background: #ffffff; padding: 40px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center; max-width: 480px; border: 1px solid #e2e8f0;">
+        <h2 style="color: #059669; margin: 0 0 12px 0;">Unsubscribed Successfully</h2>
+        <p style="color: #64748b; margin: 0 0 20px 0;">The email address <strong>${email}</strong> has been unsubscribed from KhataNex promotional and marketing emails.</p>
+        <p style="font-size: 13px; color: #94a3b8; margin: 0;">You will still receive essential transactional emails such as subscription invoices and payment receipts.</p>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+/**
+ * POST /api/subscriptions/unsubscribe
+ * Opts out an email address from promotional emails
+ */
+const handleUnsubscribePost = asyncHandler(async (req, res) => {
+  const emailService = require("../services/emailService");
+  const { email, token, reason } = req.body;
+  const targetEmail = email || req.user?.email;
+
+  if (!targetEmail) {
+    throw new ApiError(400, "Email address is required.");
+  }
+
+  if (req.user?.email !== targetEmail) {
+    const isValid = emailService.verifyUnsubscribeToken(targetEmail, token);
+    if (!isValid) {
+      throw new ApiError(403, "Invalid unsubscribe token.");
+    }
+  }
+
+  await emailService.unsubscribeEmail(targetEmail, reason || "user_requested");
+  res.json({ success: true, message: `Successfully unsubscribed ${targetEmail} from promotional emails.` });
+});
+
+/**
+ * POST /api/subscriptions/dev-test-email
+ * Development-only authenticated endpoint to send a test email to a specified address
+ */
+const handleDevTestEmail = asyncHandler(async (req, res) => {
+  if (process.env.NODE_ENV === "production" && req.user?.role !== "superadmin") {
+    throw new ApiError(403, "Dev email test is restricted in production.");
+  }
+
+  const { to, type = "smtp" } = req.body;
+  if (!to || !String(to).includes("@")) {
+    throw new ApiError(400, "Valid recipient 'to' email address is required.");
+  }
+
+  const emailService = require("../services/emailService");
+  const { sendMail, verifyConnection } = require("../utils/mailer");
+
+  let result;
+  if (type === "smtp") {
+    result = await sendMail({
+      to,
+      subject: `KhataNex SMTP Connectivity Test (${Date.now()})`,
+      text: "This is a direct SMTP test verifying delivery from info@khatanex.in.",
+      html: "<p>This is a direct <strong>KhataNex SMTP</strong> test verifying delivery from <code>info@khatanex.in</code>.</p>",
+    });
+  } else if (type === "welcome") {
+    const queueRes = await emailService.sendWelcomeEmail({
+      to,
+      userName: "Diagnostic Tester",
+      userId: 999999,
+    });
+    if (queueRes.outboxId) {
+      result = await emailService.deliverItem(queueRes.outboxId);
+    } else {
+      result = queueRes;
+    }
+  } else if (type === "invoice") {
+    const path = require("path");
+    const testPdfPath = path.join(__dirname, "..", "private", "subscription-invoices", "TEST-SAMPLE-INVOICE.pdf");
+    if (!fs.existsSync(testPdfPath)) {
+      const PDFDocument = require("pdfkit");
+      const doc = new PDFDocument({ size: "A4" });
+      const stream = fs.createWriteStream(testPdfPath);
+      doc.pipe(stream);
+      doc.fillColor("#059669").fontSize(20).text("KhataNex Test Invoice", 50, 50);
+      doc.fontSize(12).text("Diagnostic attachment verification.", 50, 90);
+      doc.end();
+      await new Promise((r) => stream.on("finish", r));
+    }
+
+    const queueRes = await emailService.sendSubscriptionConfirmationEmail({
+      to,
+      userName: "Diagnostic Tester",
+      planName: "KhataNex Annual Pro",
+      invoiceNumber: "SUB-TEST-99999",
+      durationMonths: 12,
+      startsAt: new Date(),
+      endsAt: new Date(Date.now() + 365 * 86400000),
+      totalPaise: 499900,
+      pdfPath: testPdfPath,
+      invoiceId: "test_invoice_99999",
+    });
+
+    if (queueRes.outboxId) {
+      result = await emailService.deliverItem(queueRes.outboxId);
+    } else {
+      result = queueRes;
+    }
+  } else {
+    throw new ApiError(400, "Invalid test type. Use 'smtp', 'welcome', or 'invoice'.");
+  }
+
+  res.json({
+    success: true,
+    recipient: to,
+    type,
+    result,
+  });
+});
+
 module.exports = {
   listPlans,
   previewPrice,
@@ -708,5 +847,8 @@ module.exports = {
   resendInvoice,
   cancelOrder,
   failOrder,
+  handleUnsubscribeGet,
+  handleUnsubscribePost,
+  handleDevTestEmail,
 };
 
