@@ -30,6 +30,7 @@ const MIGRATION_HISTORY = [
   "migration_022_plan_management_employees_help_centre.sql",
   "migration_023_support_ticket_feedback.sql",
   "migration_024_subscription_billing_and_email_outbox.sql",
+  "migration_029_two_factor_authentication.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -265,6 +266,13 @@ const MIGRATION_SCHEMA_CHECKS = {
   "migration_024_subscription_billing_and_email_outbox.sql": async (conn, db) => {
     const [r] = await conn.query(
       "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'email_outbox'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_029_two_factor_authentication.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'user_recovery_codes'",
       [db]
     );
     return r.length > 0;
