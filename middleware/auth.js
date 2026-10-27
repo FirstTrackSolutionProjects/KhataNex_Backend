@@ -19,6 +19,10 @@ const authenticate = async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
+    if (decoded.purpose === "2fa_pending") {
+      throw new ApiError(401, "Two-step verification required. Please complete verification.");
+    }
+
     const [rows] = await pool.query(
       "SELECT id, name, email, role, employee_role_type, permissions, assigned_modules, status, created_by_admin FROM users WHERE id = ?",
       [decoded.id]
