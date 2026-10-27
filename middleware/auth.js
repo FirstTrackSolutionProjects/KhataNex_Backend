@@ -20,7 +20,7 @@ const authenticate = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     const [rows] = await pool.query(
-      "SELECT id, name, email, role, employee_role_type, permissions, assigned_modules, status, created_by_admin FROM users WHERE id = ?",
+      "SELECT id, name, email, role, employee_role_type, permissions, assigned_modules, status, created_by_admin, password_changed_at, token_version FROM users WHERE id = ?",
       [decoded.id]
     );
 
@@ -28,6 +28,18 @@ const authenticate = async (req, res, next) => {
     if (!user) throw new ApiError(401, "User no longer exists.");
     if (user.status !== "active") {
       throw new ApiError(403, "Your account has been deactivated. Contact the super admin.");
+    }
+
+    // Invalidate sessions issued prior to credential/password change
+    if (decoded.token_version !== undefined && user.token_version !== undefined && decoded.token_version !== user.token_version) {
+      throw new ApiError(401, "Session expired due to password change. Please log in again.");
+    }
+    if (user.password_changed_at && decoded.iat) {
+      const pwdChangedMs = new Date(user.password_changed_at).getTime();
+      const tokenIatMs = decoded.iat * 1000;
+      if (tokenIatMs < pwdChangedMs - 2000) {
+        throw new ApiError(401, "Session expired due to password change. Please log in again.");
+      }
     }
 
     if (typeof user.assigned_modules === "string") {
