@@ -15,6 +15,9 @@ const {
   resendInvoice,
   cancelOrder,
   failOrder,
+  handleUnsubscribeGet,
+  handleUnsubscribePost,
+  handleDevTestEmail,
 } = require("../controllers/subscriptionController");
 
 // Rate limiters for financial endpoints
@@ -69,6 +72,13 @@ router.get("/orders/:id", authenticate, getOrder);
 router.get("/me", authenticate, getMySubscription);
 router.get("/orders/:id/invoice", authenticate, downloadInvoice);
 router.post("/orders/:id/invoice/resend", authenticate, invoiceResendLimiter, resendInvoice);
+
+// Unsubscribe endpoints
+router.get("/unsubscribe", handleUnsubscribeGet);
+router.post("/unsubscribe", optionalAuthenticate, handleUnsubscribePost);
+
+// Development / Diagnostic email test endpoint
+router.post("/dev-test-email", optionalAuthenticate, handleDevTestEmail);
 
 module.exports = router;
 
