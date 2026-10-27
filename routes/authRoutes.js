@@ -3,6 +3,9 @@ const router = require("express").Router();
 const {
   register,
   login,
+  forgotPassword,
+  verifyResetToken,
+  resetPassword,
   getMe,
   updateMe,
   uploadProfileLogo,
@@ -14,8 +17,10 @@ const { authenticate } = require("../middleware/auth");
 const { uploadLogo: logoUploader } = require("../utils/upload");
 
 router.post("/register", register);
-
 router.post("/login", login);
+router.post("/forgot-password", forgotPassword);
+router.get("/verify-reset-token", verifyResetToken);
+router.post("/reset-password", resetPassword);
 
 router.post(
   "/me/logo",
