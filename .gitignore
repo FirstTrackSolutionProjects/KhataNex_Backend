@@ -142,3 +142,16 @@ dist
 .svelte-kit
 
 # End of https://www.toptal.com/developers/gitignore/api/node
+# Runtime storage & test invoice artifacts
+private/
+uploads/invoices/*.pdf
+uploads/loading-photos/179*
+uploads/logos/179*
+uploads/logos/Gemini*
+uploads/logos/pngtree*
+uploads/logos/signature*
+uploads/logos/passport*
+uploads/waybills-generated/*.pdf
+uploads/waybills-uploaded/*.pdf
+uploads/logos/*
+!uploads/logos/.gitkeep
