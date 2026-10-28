@@ -27,7 +27,6 @@ const {
   setUserStatus,
   updateUser,
   deleteUser,
-  restoreUser,
   listAuditLogs,
 } = require("../controllers/superAdminController");
 const { authenticate, authorize, authorizePermission, authorizeModule, requirePermission } = require("../middleware/auth");
@@ -65,7 +64,6 @@ router.get("/users/:id/records/:recordId", authorize("superadmin", "employee"), 
 router.patch("/users/:id", authorize("superadmin"), updateUser);
 router.patch("/users/:id/status", authorize("superadmin"), setUserStatus);
 router.delete("/users/:id", authorize("superadmin"), deleteUser);
-router.post("/users/:id/restore", authorize("superadmin"), restoreUser);
 
 // Employees Management — Superadmin only
 router.post("/employees", authorize("superadmin"), uploadEmployeePhoto.single("profile_photo"), createEmployee);

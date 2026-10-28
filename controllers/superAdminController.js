@@ -84,24 +84,6 @@ const listUsers = asyncHandler(async (req, res) => {
     }
   }
 
-  const tab = (req.query.tab || "active").toLowerCase();
-  let tabCondition = "";
-  if (tab === "deleted") {
-    tabCondition = " AND (u.deleted_at IS NOT NULL OR u.status = 'deleted')";
-  } else if (tab === "active") {
-    tabCondition = " AND u.deleted_at IS NULL AND u.status != 'deleted'";
-  }
-
-  const [countRows] = await pool.query(
-    `SELECT
-       COUNT(CASE WHEN u.deleted_at IS NULL AND u.status != 'deleted' THEN 1 END) AS active_count,
-       COUNT(CASE WHEN u.deleted_at IS NOT NULL OR u.status = 'deleted' THEN 1 END) AS deleted_count,
-       COUNT(*) AS total_count
-     FROM users u
-     WHERE u.role = 'user'${tenantFilter}`,
-    queryParams
-  );
-
   const [rows] = await pool.query(
     `SELECT
        u.id,
@@ -129,18 +111,6 @@ const listUsers = asyncHandler(async (req, res) => {
        u.status,
        u.last_login_at,
        u.last_active_at,
-       u.deleted_at,
-       u.deleted_by,
-       deleter.name AS deleted_by_name,
-       u.deletion_reason,
-       u.restored_at,
-       u.restored_by,
-       restorer.name AS restored_by_name,
-       u.restoration_reason,
-       CASE
-         WHEN u.deleted_at IS NOT NULL OR u.status = 'deleted' THEN 1
-         ELSE 0
-       END AS is_deleted,
        CASE
          WHEN u.last_active_at IS NOT NULL
           AND u.last_active_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE)
@@ -426,8 +396,6 @@ const listUsers = asyncHandler(async (req, res) => {
        END AS subscription_display_status
 
      FROM users u
-     LEFT JOIN users deleter ON u.deleted_by = deleter.id
-     LEFT JOIN users restorer ON u.restored_by = restorer.id
      LEFT JOIN (
        SELECT s1.user_id, s1.plan_id, s1.ends_at, s1.is_complimentary, s1.status, p.name AS plan_name, p.code AS plan_code
        FROM subscriptions s1
@@ -438,7 +406,7 @@ const listUsers = asyncHandler(async (req, res) => {
        ) s2 ON s1.user_id = s2.user_id AND s1.ends_at = s2.max_end
        JOIN subscription_plans p ON s1.plan_id = p.id
      ) latest_sub ON latest_sub.user_id = u.id
-     WHERE u.role = 'user'${tenantFilter}${tabCondition}
+     WHERE u.role = 'user'${tenantFilter}
      ORDER BY u.created_at DESC`,
     queryParams
   );
@@ -450,7 +418,6 @@ const listUsers = asyncHandler(async (req, res) => {
 
     return {
       ...user,
-      is_deleted: Boolean(user.is_deleted || user.deleted_at || user.status === "deleted"),
       total_sales: totalSales,
       total_revenue: totalSales,
       expenses: totalExpenses,
@@ -490,16 +457,7 @@ const listUsers = asyncHandler(async (req, res) => {
     };
   });
 
-  res.json({
-    success: true,
-    count: users.length,
-    counts: {
-      active: Number(countRows[0]?.active_count || 0),
-      deleted: Number(countRows[0]?.deleted_count || 0),
-      total: Number(countRows[0]?.total_count || 0),
-    },
-    users,
-  });
+  res.json({ success: true, count: users.length, users });
 });
 
 // GET /api/superadmin/users/:id
@@ -508,25 +466,12 @@ const getUser = asyncHandler(async (req, res) => {
   await checkTenantAccess(req.user, id);
 
   const [rows] = await pool.query(
-    `SELECT
-       u.id, u.name, u.email, u.phone, u.secondary_phone, u.business_name, u.business_type,
-       u.gstin, u.pan, u.website, u.address, u.address_line1, u.address_line2,
-       u.city, u.state, u.pincode, u.country, u.role, u.employee_role_type,
-       u.employee_title, u.permissions, u.profile_photo_path, u.status,
-       u.last_login_at, u.last_active_at, u.created_by_admin, u.created_at, u.updated_at,
-       u.deleted_at, u.deleted_by, deleter.name AS deleted_by_name, u.deletion_reason,
-       u.restored_at, u.restored_by, restorer.name AS restored_by_name, u.restoration_reason,
-       CASE WHEN (u.deleted_at IS NOT NULL OR u.status = 'deleted') THEN 1 ELSE 0 END AS is_deleted
-     FROM users u
-     LEFT JOIN users deleter ON u.deleted_by = deleter.id
-     LEFT JOIN users restorer ON u.restored_by = restorer.id
-     WHERE u.id = ?`,
+    `SELECT id, name, email, phone, secondary_phone, business_name, business_type, gstin, pan, website, address, address_line1, address_line2, city, state, pincode, country, role, employee_role_type, employee_title, permissions, profile_photo_path, status, last_login_at, last_active_at, created_by_admin, created_at, updated_at
+     FROM users WHERE id = ?`,
     [id]
   );
   if (!rows.length) throw new ApiError(404, "User not found.");
-  const user = rows[0];
-  user.is_deleted = Boolean(user.is_deleted || user.deleted_at || user.status === "deleted");
-  res.json({ success: true, user });
+  res.json({ success: true, user: rows[0] });
 });
 
 // GET /api/superadmin/users/:id/overview
@@ -536,19 +481,14 @@ const getUserOverview = asyncHandler(async (req, res) => {
 
   const [userRows] = await pool.query(
     `SELECT
-       u.id, u.name, u.email, u.phone,
-       u.business_name, u.business_type, u.gstin, u.pan, u.website,
-       u.logo_path, u.signature_path,
-       u.address, u.address_line1, u.address_line2, u.city, u.state, u.pincode, u.country,
-       u.currency, u.tax_type, u.tcs_enabled, u.tds_enabled, u.payment_terms,
-       u.role, u.status, u.created_at, u.last_login_at, u.last_active_at,
-       u.deleted_at, u.deleted_by, deleter.name AS deleted_by_name, u.deletion_reason,
-       u.restored_at, u.restored_by, restorer.name AS restored_by_name, u.restoration_reason,
-       CASE WHEN (u.deleted_at IS NOT NULL OR u.status = 'deleted') THEN 1 ELSE 0 END AS is_deleted
-     FROM users u
-     LEFT JOIN users deleter ON u.deleted_by = deleter.id
-     LEFT JOIN users restorer ON u.restored_by = restorer.id
-     WHERE u.id = ? AND u.role = 'user'`,
+       id, name, email, phone,
+       business_name, business_type, gstin, pan, website,
+       logo_path, signature_path,
+       address, address_line1, address_line2, city, state, pincode, country,
+       currency, tax_type, tcs_enabled, tds_enabled, payment_terms,
+       role, status, created_at, last_login_at, last_active_at
+     FROM users
+     WHERE id = ? AND role = 'user'`,
     [id]
   );
 
@@ -557,7 +497,6 @@ const getUserOverview = asyncHandler(async (req, res) => {
   }
 
   const user = userRows[0];
-  user.is_deleted = Boolean(user.is_deleted || user.deleted_at || user.status === "deleted");
 
   const [subRows] = await pool.query(
     `SELECT s.id, s.status, s.plan_id, s.starts_at, s.ends_at, s.is_complimentary,
@@ -741,11 +680,7 @@ const createEmployee = asyncHandler(async (req, res) => {
     throw new ApiError(400, "email and password are required to create an employee login.");
   }
 
-  const normalizedEmail = email.trim().toLowerCase();
-  const [existing] = await pool.query(
-    "SELECT id FROM users WHERE email = ? AND (deleted_at IS NULL AND status != 'deleted')",
-    [normalizedEmail]
-  );
+  const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
   if (existing.length) throw new ApiError(409, "An account with this email already exists.");
 
   const normalizedPermissions = normalizePermissions(permissions);
@@ -765,47 +700,38 @@ const createEmployee = asyncHandler(async (req, res) => {
   }
   const hashed = await bcrypt.hash(password, 10);
 
-  let result;
-  try {
-    const [insertResult] = await pool.query(
-      `INSERT INTO users (
-         name, email, phone, secondary_phone, employee_code, joining_date, emergency_contact, notes,
-         password, role, employee_role_type, employee_title, date_of_birth, employee_age,
-         address, pan, aadhaar_number, passport_number, profile_photo_path,
-         permissions, assigned_modules, created_by_admin
-       )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        name || null,
-        normalizedEmail,
-        phone || null,
-        secondary_phone || null,
-        employee_code && employee_code.trim() ? employee_code.trim() : null,
-        joining_date && String(joining_date).trim() ? String(joining_date).trim().slice(0, 10) : null,
-        emergency_contact && emergency_contact.trim() ? emergency_contact.trim() : null,
-        notes && notes.trim() ? notes.trim() : null,
-        hashed,
-        employee_role_type && employee_role_type.trim() ? employee_role_type.trim() : "staff",
-        employee_title && employee_title.trim() ? employee_title.trim() : null,
-        date_of_birth && String(date_of_birth).trim() ? String(date_of_birth).trim().slice(0, 10) : null,
-        employee_age !== "" && employee_age !== null && !isNaN(Number(employee_age)) ? parseInt(employee_age, 10) : null,
-        address && address.trim() ? address.trim() : null,
-        pan && pan.trim() ? pan.trim() : null,
-        aadhaar_number && aadhaar_number.trim() ? aadhaar_number.trim() : null,
-        passport_number && passport_number.trim() ? passport_number.trim() : null,
-        req.file ? relativeUploadPath(req.file.path) : null,
-        normalizedPermissions ? JSON.stringify(normalizedPermissions) : null,
-        assignedModulesJson,
-        req.user.id,
-      ]
-    );
-    result = insertResult;
-  } catch (err) {
-    if (err.code === "ER_DUP_ENTRY") {
-      throw new ApiError(409, "An account with this email already exists.");
-    }
-    throw err;
-  }
+  const [result] = await pool.query(
+    `INSERT INTO users (
+       name, email, phone, secondary_phone, employee_code, joining_date, emergency_contact, notes,
+       password, role, employee_role_type, employee_title, date_of_birth, employee_age,
+       address, pan, aadhaar_number, passport_number, profile_photo_path,
+       permissions, assigned_modules, created_by_admin
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'employee', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      name || null,
+      email,
+      phone || null,
+      secondary_phone || null,
+      employee_code && employee_code.trim() ? employee_code.trim() : null,
+      joining_date && String(joining_date).trim() ? String(joining_date).trim().slice(0, 10) : null,
+      emergency_contact && emergency_contact.trim() ? emergency_contact.trim() : null,
+      notes && notes.trim() ? notes.trim() : null,
+      hashed,
+      employee_role_type && employee_role_type.trim() ? employee_role_type.trim() : "staff",
+      employee_title && employee_title.trim() ? employee_title.trim() : null,
+      date_of_birth && String(date_of_birth).trim() ? String(date_of_birth).trim().slice(0, 10) : null,
+      employee_age !== "" && employee_age !== null && !isNaN(Number(employee_age)) ? parseInt(employee_age, 10) : null,
+      address && address.trim() ? address.trim() : null,
+      pan && pan.trim() ? pan.trim() : null,
+      aadhaar_number && aadhaar_number.trim() ? aadhaar_number.trim() : null,
+      passport_number && passport_number.trim() ? passport_number.trim() : null,
+      req.file ? relativeUploadPath(req.file.path) : null,
+      normalizedPermissions ? JSON.stringify(normalizedPermissions) : null,
+      assignedModulesJson,
+      req.user.id,
+    ]
+  );
 
   const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [result.insertId]);
 
@@ -1047,10 +973,10 @@ const updateEmployee = asyncHandler(async (req, res) => {
   if (!rows.length) throw new ApiError(404, "Employee not found.");
   const current = rows[0];
 
-  // If email is changing, ensure uniqueness among active accounts
+  // If email is changing, ensure uniqueness
   if (email && email.trim() && email.trim().toLowerCase() !== current.email.toLowerCase()) {
     const [conflict] = await pool.query(
-      "SELECT id FROM users WHERE email = ? AND id != ? AND (deleted_at IS NULL AND status != 'deleted')",
+      "SELECT id FROM users WHERE email = ? AND id != ?",
       [email.trim().toLowerCase(), id]
     );
     if (conflict.length) {
@@ -1261,13 +1187,10 @@ const updateUser = asyncHandler(async (req, res) => {
   for (const field of allowedFields) {
     if (req.body[field] !== undefined) {
       const val = req.body[field] === null ? null : String(req.body[field]).trim();
-      if (field === "email" && val && val.toLowerCase() !== (existingUser.email || "").toLowerCase()) {
-        const [conflict] = await pool.query(
-          "SELECT id FROM users WHERE email = ? AND id != ? AND (deleted_at IS NULL AND status != 'deleted')",
-          [val.toLowerCase(), targetId]
-        );
+      if (field === "email" && val && val !== existingUser.email) {
+        const [conflict] = await pool.query("SELECT id FROM users WHERE email = ? AND id != ?", [val, targetId]);
         if (conflict.length > 0) {
-          throw new ApiError(409, "Email address is already in use by another active account.");
+          throw new ApiError(409, "Email address is already in use by another account.");
         }
       }
       if (field === "status" && val && !["active", "inactive"].includes(val)) {
@@ -1285,14 +1208,7 @@ const updateUser = asyncHandler(async (req, res) => {
     const setValues = Object.values(updates);
     setValues.push(targetId);
 
-    try {
-      await pool.query(`UPDATE users SET ${setClauses}, updated_at = NOW() WHERE id = ?`, setValues);
-    } catch (updateErr) {
-      if (updateErr.code === "ER_DUP_ENTRY") {
-        throw new ApiError(409, "Email address is already in use by another active account.");
-      }
-      throw updateErr;
-    }
+    await pool.query(`UPDATE users SET ${setClauses}, updated_at = NOW() WHERE id = ?`, setValues);
 
     try {
       await pool.query(
@@ -1342,10 +1258,10 @@ const setUserStatus = asyncHandler(async (req, res) => {
 });
 
 // DELETE /api/superadmin/users/:id
-// Superadmin user soft deletion with referential integrity preservation & audit trail
+// Superadmin user deletion/safe deactivation with foreign key check & audit trail
 const deleteUser = asyncHandler(async (req, res) => {
   const targetId = Number(req.params.id);
-  const { reason = "Superadmin initiated account deletion" } = req.body || {};
+  const { reason = "Superadmin initiated account deletion" } = req.body;
 
   if (!targetId || Number.isNaN(targetId)) {
     throw new ApiError(400, "Invalid user ID provided.");
@@ -1374,25 +1290,7 @@ const deleteUser = asyncHandler(async (req, res) => {
       throw new ApiError(403, "System superadmin accounts cannot be deleted.");
     }
 
-    // 3. Idempotent check
-    if (targetUser.deleted_at !== null || targetUser.status === "deleted") {
-      await conn.rollback();
-      return res.json({
-        success: true,
-        type: "already_deleted",
-        message: `User "${targetUser.name || targetUser.email}" is already in the deleted users archive.`,
-        user: {
-          id: targetUser.id,
-          name: targetUser.name,
-          email: targetUser.email,
-          status: "deleted",
-          is_deleted: true,
-          deleted_at: targetUser.deleted_at,
-        },
-      });
-    }
-
-    // 4. Count referential dependencies across financial and business ledger tables
+    // 3. Count referential dependencies across financial and business ledger tables
     const [[{ count: custCount }]] = await conn.query("SELECT COUNT(*) AS count FROM customers WHERE created_by = ?", [targetId]);
     const [[{ count: invCount }]] = await conn.query("SELECT COUNT(*) AS count FROM invoices WHERE created_by = ?", [targetId]);
     const [[{ count: quoCount }]] = await conn.query("SELECT COUNT(*) AS count FROM quotations WHERE created_by = ?", [targetId]);
@@ -1407,32 +1305,14 @@ const deleteUser = asyncHandler(async (req, res) => {
     const totalRecords =
       custCount + invCount + quoCount + payCount + colCount + expCount + stockCount + purCount + subOrderCount + subCount;
 
-    // 5. Soft-delete user: update status to 'deleted', record deleted_at, deleted_by, deletion_reason
-    // DO NOT scramble password so that restoration is clean and preserves the original credentials
-    await conn.query(
-      `UPDATE users
-       SET status = 'deleted',
-           deleted_at = NOW(),
-           deleted_by = ?,
-           deletion_reason = ?,
-           last_active_at = NULL
-       WHERE id = ?`,
-      [req.user.id, reason, targetId]
-    );
-
-    // Also deactivate any employees created by this business owner
-    await conn.query(
-      "UPDATE users SET status = 'inactive', last_active_at = NULL WHERE created_by_admin = ?",
-      [targetId]
-    );
-
-    // 6. Record audit trail in user_audit_logs and admin_audit_logs
+    // 4. Record audit trail in user_audit_logs
     await conn.query(
       `INSERT INTO user_audit_logs (superadmin_id, target_user_id, action, reason, details)
-       VALUES (?, ?, 'soft_delete_user', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?)`,
       [
         req.user.id,
         targetId,
+        totalRecords > 0 ? "deactivate_soft_delete" : "permanent_delete",
         reason,
         JSON.stringify({
           target_email: targetUser.email,
@@ -1455,171 +1335,51 @@ const deleteUser = asyncHandler(async (req, res) => {
       ]
     );
 
-    try {
-      await conn.query(
-        `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
-         VALUES (?, ?, 'SOFT_DELETE_USER', 'user', ?, ?, ?, ?, ?)`,
-        [
-          req.user.id,
-          req.user.role || "superadmin",
-          String(targetId),
-          JSON.stringify({ status: targetUser.status, deleted_at: targetUser.deleted_at }),
-          JSON.stringify({ status: "deleted", deleted_at: new Date() }),
-          JSON.stringify({ reason, name: targetUser.name, email: targetUser.email, total_records_preserved: totalRecords }),
-          req.ip || null,
-        ]
-      );
-    } catch (_) {}
+    let resultType = "deactivated";
+    let message = "";
 
-    await conn.commit();
-
-    res.json({
-      success: true,
-      type: "soft_deleted",
-      message: `User "${targetUser.name || targetUser.email}" has been moved to the deleted users archive. All ${totalRecords} historical business and financial ledger records have been safely preserved.`,
-      user: {
-        id: targetUser.id,
-        name: targetUser.name,
-        email: targetUser.email,
-        status: "deleted",
-        is_deleted: true,
-      },
-    });
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
-  }
-});
-
-// POST /api/superadmin/users/:id/restore
-// Restore a previously soft-deleted user account and reactivate its employees
-const restoreUser = asyncHandler(async (req, res) => {
-  const targetId = Number(req.params.id);
-  const { reason = "Superadmin restored account" } = req.body || {};
-
-  if (!targetId || Number.isNaN(targetId)) {
-    throw new ApiError(400, "Invalid user ID provided.");
-  }
-
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [targets] = await conn.query("SELECT * FROM users WHERE id = ? FOR UPDATE", [targetId]);
-    if (!targets.length) {
-      await conn.rollback();
-      throw new ApiError(404, "User not found.");
-    }
-
-    const targetUser = targets[0];
-
-    // Idempotency check: if user is already active
-    if (targetUser.deleted_at === null && targetUser.status !== "deleted") {
-      await conn.rollback();
-      return res.json({
-        success: true,
-        message: `User "${targetUser.name || targetUser.email}" is already active.`,
-        user: {
-          id: targetUser.id,
-          name: targetUser.name,
-          email: targetUser.email,
-          status: targetUser.status,
-          is_deleted: false,
-        },
-      });
-    }
-
-    // Check if another active account is currently using this email address
-    const [conflictingActive] = await conn.query(
-      "SELECT id, name, email FROM users WHERE email = ? AND (deleted_at IS NULL AND status != 'deleted') AND id != ? LIMIT 1",
-      [targetUser.email.trim().toLowerCase(), targetId]
-    );
-    if (conflictingActive.length > 0) {
-      await conn.rollback();
-      const conflictUser = conflictingActive[0];
-      throw new ApiError(
-        409,
-        `Cannot restore account: an active user (#${conflictUser.id} - "${conflictUser.name || conflictUser.email}") is currently using the email "${targetUser.email}". The active account must be renamed, deactivated, or deleted before this archived account can be restored.`
-      );
-    }
-
-    // Restore user
-    try {
+    if (totalRecords > 0) {
+      // Safe deactivation / soft-delete: preserve referential integrity and audit records
+      const crypto = require("crypto");
+      const scrambledPassword = `DEACTIVATED_${Date.now()}_${crypto.randomBytes(16).toString("hex")}`;
       await conn.query(
         `UPDATE users
-         SET status = 'active',
-             deleted_at = NULL,
-             deleted_by = NULL,
-             deletion_reason = NULL,
-             restored_at = NOW(),
-             restored_by = ?,
-             restoration_reason = ?
+         SET status = 'inactive',
+             password = ?,
+             deleted_at = NOW(),
+             deleted_by = ?,
+             deletion_reason = ?,
+             last_active_at = NULL
          WHERE id = ?`,
-        [req.user.id, reason, targetId]
+        [scrambledPassword, req.user.id, reason, targetId]
       );
-    } catch (restoreErr) {
-      if (restoreErr.code === "ER_DUP_ENTRY") {
-        await conn.rollback();
-        throw new ApiError(
-          409,
-          `Cannot restore account: an active user is currently using the email "${targetUser.email}". The active account must be renamed, deactivated, or deleted before this archived account can be restored.`
-        );
-      }
-      throw restoreErr;
-    }
 
-    // Also reactivate employees belonging to this business owner
-    await conn.query(
-      "UPDATE users SET status = 'active' WHERE created_by_admin = ?",
-      [targetId]
-    );
-
-    // Audit logs
-    await conn.query(
-      `INSERT INTO user_audit_logs (superadmin_id, target_user_id, action, reason, details)
-       VALUES (?, ?, 'restore_user', ?, ?)`,
-      [
-        req.user.id,
-        targetId,
-        reason,
-        JSON.stringify({
-          target_email: targetUser.email,
-          target_name: targetUser.name,
-          previous_status: targetUser.status,
-          previous_deleted_at: targetUser.deleted_at,
-        }),
-      ]
-    );
-
-    try {
+      // Also deactivate any employees created by this business owner
       await conn.query(
-        `INSERT INTO admin_audit_logs (actor_id, actor_role, action, target_type, target_id, before_value, after_value, details, ip_address)
-         VALUES (?, ?, 'RESTORE_USER', 'user', ?, ?, ?, ?, ?)`,
-        [
-          req.user.id,
-          req.user.role || "superadmin",
-          String(targetId),
-          JSON.stringify({ status: targetUser.status, deleted_at: targetUser.deleted_at }),
-          JSON.stringify({ status: "active", restored_at: new Date() }),
-          JSON.stringify({ reason, name: targetUser.name, email: targetUser.email }),
-          req.ip || null,
-        ]
+        "UPDATE users SET status = 'inactive', last_active_at = NULL WHERE created_by_admin = ?",
+        [targetId]
       );
-    } catch (_) {}
+
+      resultType = "deactivated";
+      message = `User "${targetUser.name || targetUser.email}" was deactivated and access revoked. ${totalRecords} historical business and financial ledger record(s) were preserved for legal/accounting compliance.`;
+    } else {
+      // Hard delete: zero linked records
+      await conn.query("DELETE FROM users WHERE id = ?", [targetId]);
+      resultType = "deleted";
+      message = `User "${targetUser.name || targetUser.email}" had no linked business records and was completely removed.`;
+    }
 
     await conn.commit();
 
     res.json({
       success: true,
-      message: `User "${targetUser.name || targetUser.email}" has been successfully restored to active status.`,
+      type: resultType,
+      message,
       user: {
         id: targetUser.id,
         name: targetUser.name,
         email: targetUser.email,
-        status: "active",
-        is_deleted: false,
+        status: "inactive",
       },
     });
   } catch (err) {
@@ -3495,6 +3255,5 @@ module.exports = {
   setUserStatus,
   updateUser,
   deleteUser,
-  restoreUser,
   listAuditLogs,
 };
