@@ -20,27 +20,14 @@ const authenticate = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     const [rows] = await pool.query(
-      "SELECT id, name, email, role, employee_role_type, permissions, assigned_modules, status, created_by_admin, deleted_at FROM users WHERE id = ?",
+      "SELECT id, name, email, role, employee_role_type, permissions, assigned_modules, status, created_by_admin FROM users WHERE id = ?",
       [decoded.id]
     );
 
     const user = rows[0];
     if (!user) throw new ApiError(401, "User no longer exists.");
-    if (user.deleted_at || user.status === "deleted") {
-      throw new ApiError(403, "This account has been deleted. Access revoked.");
-    }
     if (user.status !== "active") {
       throw new ApiError(403, "Your account has been deactivated. Contact the super admin.");
-    }
-
-    if (user.role === "employee" && user.created_by_admin) {
-      const [creatorRows] = await pool.query(
-        "SELECT id, status, deleted_at FROM users WHERE id = ?",
-        [user.created_by_admin]
-      );
-      if (creatorRows.length && (creatorRows[0].deleted_at || creatorRows[0].status === "deleted")) {
-        throw new ApiError(403, "The organization account associated with this employee has been deleted.");
-      }
     }
 
     if (typeof user.assigned_modules === "string") {
