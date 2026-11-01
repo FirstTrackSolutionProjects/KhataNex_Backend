@@ -445,7 +445,11 @@ async function runSalesTestSuite() {
     console.log(`Passed: ${passed}/${total} (${Math.round((passed / total) * 100)}%)\n`);
     results.forEach((r, idx) => console.log(`  ${idx + 1}. [${r.passed ? "PASS" : "FAIL"}] ${r.name}`));
 
-    if (passed !== total) process.exit(1);
+    if (passed !== total) {
+      process.exit(1);
+    } else {
+      process.exit(0);
+    }
   }
 }
 
