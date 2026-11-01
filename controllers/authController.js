@@ -81,14 +81,19 @@ const register = asyncHandler(async (req, res) => {
     throw new ApiError(400, "email and password are required to create a login.");
   }
 
-  const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
+  const cleanEmail = String(email).trim().toLowerCase();
+
+  const [existing] = await pool.query(
+    "SELECT id FROM users WHERE LOWER(TRIM(email)) = ? AND (deleted_at IS NULL AND status != 'deleted')",
+    [cleanEmail]
+  );
   if (existing.length) throw new ApiError(409, "An account with this email already exists.");
 
   const hashed = await bcrypt.hash(password, 10);
   const [result] = await pool.query(
     `INSERT INTO users (name, email, phone, business_name, address, password, role)
      VALUES (?, ?, ?, ?, ?, ?, 'user')`,
-    [name || null, email, phone || null, business_name || null, address || null, hashed]
+    [name || null, cleanEmail, phone || null, business_name || null, address || null, hashed]
   );
 
   const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [result.insertId]);
@@ -105,9 +110,24 @@ const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) throw new ApiError(400, "email and password are required.");
 
-  const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
+  const cleanEmail = String(email).trim().toLowerCase();
+
+  const [rows] = await pool.query(
+    "SELECT * FROM users WHERE LOWER(TRIM(email)) = ? AND (deleted_at IS NULL AND status != 'deleted') ORDER BY id DESC LIMIT 1",
+    [cleanEmail]
+  );
   const user = rows[0];
-  if (!user) throw new ApiError(401, "Invalid email or password.");
+
+  if (!user) {
+    const [deletedRows] = await pool.query(
+      "SELECT * FROM users WHERE LOWER(TRIM(email)) = ? AND (deleted_at IS NOT NULL OR status = 'deleted') ORDER BY id DESC LIMIT 1",
+      [cleanEmail]
+    );
+    if (deletedRows.length) {
+      throw new ApiError(403, "Your account has been deactivated or deleted. Contact the super admin or register a new account.");
+    }
+    throw new ApiError(401, "Invalid email or password.");
+  }
 
   if (user.status !== "active") {
     throw new ApiError(403, "Your account has been deactivated. Contact the super admin.");

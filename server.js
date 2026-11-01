@@ -23,6 +23,7 @@ const vehicleRoutes = require("./routes/vehicleRoutes");
 const settingsRoutes = require("./routes/settingsRoutes");
 const khataRoutes = require("./routes/khataRoutes");
 const bankingRoutes = require("./routes/bankingRoutes");
+const salesRoutes = require("./routes/salesRoutes");
 const fileRoutes = require("./routes/fileRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const paymentWebhookRoutes = require("./routes/paymentWebhookRoutes");
@@ -118,6 +119,7 @@ app.use("/api/documents", requireActiveSubscription, documentRoutes);
 app.use("/api/vehicles", requireActiveSubscription, vehicleRoutes);
 app.use("/api/settings", requireActiveSubscription, settingsRoutes);
 app.use("/api/khata", requireActiveSubscription, khataRoutes);
+app.use("/api/sales", requireActiveSubscription, salesRoutes);
 app.use("/api/banking", requireActiveSubscription, bankingRoutes);
 app.use("/api/files", fileRoutes);
 
