@@ -21,6 +21,20 @@ async function issueInvoice(orderId) {
   );
   if (existing.length > 0) {
     const inv = existing[0];
+    // Ensure subscription_orders table also has the invoice_number persisted
+    if (!inv.invoice_number) {
+      const year = new Date(inv.issued_at || Date.now()).getFullYear();
+      inv.invoice_number = `SUB-${year}-${String(orderId).padStart(5, "0")}`;
+      await pool.query(
+        "UPDATE subscription_invoices SET invoice_number = ? WHERE id = ?",
+        [inv.invoice_number, inv.id]
+      );
+    }
+    await pool.query(
+      "UPDATE subscription_orders SET invoice_number = ? WHERE id = ? AND (invoice_number IS NULL OR invoice_number = '')",
+      [inv.invoice_number, orderId]
+    );
+
     const fullPath = invoiceFilePath(inv.pdf_filename);
     if (!fs.existsSync(fullPath)) {
       // Re-generate PDF if missing from disk
@@ -40,7 +54,11 @@ async function issueInvoice(orderId) {
        u.phone AS user_phone, 
        u.business_name, 
        u.address AS user_address, 
+       u.city AS user_city,
+       u.state AS user_state,
+       u.pincode AS user_pincode,
        u.gstin AS user_gstin,
+       u.pan AS user_pan,
        s.starts_at, 
        s.ends_at
      FROM subscription_orders o
@@ -55,16 +73,58 @@ async function issueInvoice(orderId) {
   if (!order) throw new ApiError(404, "Order not found for invoice issuance.");
 
   const year = new Date().getFullYear();
-  const invoiceNumber = `SUB-${year}-${String(order.id).padStart(5, "0")}`;
+  // Reuse existing invoice_number if order already has one, else generate standard deterministic format
+  const invoiceNumber = order.invoice_number || `SUB-${year}-${String(order.id).padStart(5, "0")}`;
   const pdfFilename = `${invoiceNumber}.pdf`;
 
-  const [res] = await pool.query(
-    `INSERT INTO subscription_invoices (invoice_number, order_id, user_id, pdf_filename, issued_at)
-     VALUES (?, ?, ?, ?, NOW())`,
-    [invoiceNumber, order.id, order.user_id, pdfFilename]
-  );
+  let invoiceId;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
 
-  const invoiceId = res.insertId;
+    // Check again under transaction lock to handle concurrent webhook/download race conditions
+    const [locked] = await conn.query(
+      "SELECT * FROM subscription_invoices WHERE order_id = ? FOR UPDATE",
+      [order.id]
+    );
+
+    if (locked.length > 0) {
+      invoiceId = locked[0].id;
+      await conn.query(
+        "UPDATE subscription_orders SET invoice_number = ? WHERE id = ? AND (invoice_number IS NULL OR invoice_number = '')",
+        [locked[0].invoice_number, order.id]
+      );
+      await conn.commit();
+    } else {
+      const [res] = await conn.query(
+        `INSERT INTO subscription_invoices (invoice_number, order_id, user_id, pdf_filename, issued_at)
+         VALUES (?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE pdf_filename = VALUES(pdf_filename)`,
+        [invoiceNumber, order.id, order.user_id, pdfFilename]
+      );
+      invoiceId = res.insertId || (await conn.query("SELECT id FROM subscription_invoices WHERE order_id = ?", [order.id]))[0][0]?.id;
+
+      await conn.query(
+        "UPDATE subscription_orders SET invoice_number = ? WHERE id = ?",
+        [invoiceNumber, order.id]
+      );
+      await conn.commit();
+    }
+  } catch (err) {
+    await conn.rollback();
+    // Concurrency fallback: fetch existing if already inserted by a parallel request
+    const [fallback] = await pool.query(
+      "SELECT id FROM subscription_invoices WHERE order_id = ?",
+      [order.id]
+    );
+    if (fallback.length > 0) {
+      invoiceId = fallback[0].id;
+    } else {
+      throw err;
+    }
+  } finally {
+    conn.release();
+  }
 
   // Render PDF
   await renderAndSavePdf(invoiceId, order);
@@ -105,7 +165,11 @@ async function renderAndSavePdf(invoiceId, cachedOrder = null) {
          u.phone AS user_phone, 
          u.business_name, 
          u.address AS user_address, 
+         u.city AS user_city,
+         u.state AS user_state,
+         u.pincode AS user_pincode,
          u.gstin AS user_gstin,
+         u.pan AS user_pan,
          s.starts_at, 
          s.ends_at
        FROM subscription_orders o

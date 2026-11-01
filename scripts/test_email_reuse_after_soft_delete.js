@@ -766,6 +766,8 @@ async function runTestSuite() {
 
     if (passedCount !== totalCount) {
       process.exit(1);
+    } else {
+      process.exit(0);
     }
   }
 }

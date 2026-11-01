@@ -1031,7 +1031,7 @@ const createDocument =
           let resolvedProductId = item.product_id || null;
           const reqQty = cleanNumber(item.quantity, 1);
 
-          if (item.item_type !== "service" && resolvedProductId) {
+          if (!body.skip_inventory_decrement && item.item_type !== "service" && resolvedProductId) {
             const [rows] = await conn.query(
               "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
               [resolvedProductId, tenant.businessOwnerId]

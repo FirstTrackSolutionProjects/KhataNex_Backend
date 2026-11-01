@@ -19,6 +19,7 @@ const MODULE_OPERATIONS = {
   reports: ["view", "export"],
   dashboard: ["view", "export"],
   billing: ["view"],
+  sales: ["view", "create", "edit", "delete", "invoice"],
   help_centre: ["view", "reply", "claim", "resolve"],
 };
 
@@ -145,6 +146,7 @@ function hasPermission(user, moduleName, operation = "view") {
   if (!Array.isArray(assigned)) assigned = [];
 
   const isPurchasesCheck = canonicalMod === "purchases";
+  const isSalesCheck = canonicalMod === "sales";
   const hasModule =
     assigned.includes("all") ||
     assigned.includes("manage_all") ||
@@ -152,7 +154,8 @@ function hasPermission(user, moduleName, operation = "view") {
     assigned.includes(moduleName) ||
     (canonicalMod === "reports" && assigned.includes("dashboard")) ||
     (canonicalMod === "dashboard" && assigned.includes("reports")) ||
-    (isPurchasesCheck && (assigned.includes("inventory") || assigned.includes("stock")));
+    (isPurchasesCheck && (assigned.includes("inventory") || assigned.includes("stock"))) ||
+    (isSalesCheck && (assigned.includes("khata") || assigned.includes("invoices")));
 
   if (!hasModule) return false;
 
