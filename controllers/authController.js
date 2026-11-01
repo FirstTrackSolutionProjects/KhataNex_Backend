@@ -1,13 +1,20 @@
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const pool = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const { relativeUploadPath } = require("../utils/upload");
 const ApiError = require("../utils/ApiError");
+const emailService = require("../services/emailService");
 
 const signToken = (user) =>
   jwt.sign(
-    { id: user.id, role: user.role, employee_role_type: user.employee_role_type },
+    {
+      id: user.id,
+      role: user.role,
+      employee_role_type: user.employee_role_type,
+      token_version: user.token_version !== undefined ? user.token_version : 1,
+    },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
   );
@@ -287,9 +294,265 @@ const deleteProfileSignature = asyncHandler(async (req, res) => {
   });
 });
 
+// Rate limiter for forgot password requests per IP
+const forgotPasswordIpAttempts = new Map();
+const isForgotPasswordRateLimited = (ip, max = 5, windowMs = 15 * 60 * 1000) => {
+  if (!ip) return false;
+  // Loopback exemption in dev/test to allow local test suites to run
+  if (process.env.NODE_ENV !== "production" && (ip === "127.0.0.1" || ip === "::1" || ip === "localhost")) {
+    return false;
+  }
+  const now = Date.now();
+  const timestamps = (forgotPasswordIpAttempts.get(ip) || []).filter((t) => now - t < windowMs);
+  if (timestamps.length >= max) return true;
+  timestamps.push(now);
+  forgotPasswordIpAttempts.set(ip, timestamps);
+  return false;
+};
+
+// Rate limiter for reset attempts per IP
+const resetPasswordIpAttempts = new Map();
+const isResetPasswordRateLimited = (ip, max = 10, windowMs = 15 * 60 * 1000) => {
+  if (!ip) return false;
+  if (process.env.NODE_ENV !== "production" && (ip === "127.0.0.1" || ip === "::1" || ip === "localhost")) {
+    return false;
+  }
+  const now = Date.now();
+  const timestamps = (resetPasswordIpAttempts.get(ip) || []).filter((t) => now - t < windowMs);
+  if (timestamps.length >= max) return true;
+  timestamps.push(now);
+  resetPasswordIpAttempts.set(ip, timestamps);
+  return false;
+};
+
+// POST /api/auth/forgot-password
+// Generates cryptographically secure single-use token and sends email instructions
+const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  const clientIp = (req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
+
+  if (isForgotPasswordRateLimited(clientIp)) {
+    throw new ApiError(429, "Too many password reset requests from this IP address. Please try again after 15 minutes.");
+  }
+
+  // Always return identical generic confirmation response
+  const genericResponse = {
+    success: true,
+    message: "If an eligible account exists for this email, you will receive password reset instructions shortly.",
+  };
+
+  if (!email || !String(email).trim() || !String(email).includes("@")) {
+    return res.json(genericResponse);
+  }
+
+  const normalizedEmail = String(email).trim().toLowerCase();
+
+  const [users] = await pool.query(
+    `SELECT id, name, email, status, deleted_at
+     FROM users
+     WHERE email = ? AND (deleted_at IS NULL AND status != 'deleted')
+     ORDER BY id DESC
+     LIMIT 1`,
+    [normalizedEmail]
+  );
+
+  const user = users[0];
+
+  // If no active user exists, or user is not active, return the exact same generic response
+  if (!user || user.status !== "active") {
+    return res.json(genericResponse);
+  }
+
+  // User-level rate limiting: Check recent reset requests for this user in last 15 minutes
+  const [recentResets] = await pool.query(
+    "SELECT COUNT(*) AS cnt FROM password_resets WHERE user_id = ? AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)",
+    [user.id]
+  );
+  if (recentResets[0]?.cnt >= 3) {
+    return res.json(genericResponse);
+  }
+
+  // Invalidate any existing unconsumed reset tokens for this user
+  await pool.query(
+    "UPDATE password_resets SET consumed_at = NOW() WHERE user_id = ? AND consumed_at IS NULL",
+    [user.id]
+  );
+
+  // Generate cryptographic single-use token (32 bytes hex = 64 characters)
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+  const expiryMinutes = 20;
+  const userAgent = (req.headers["user-agent"] || "").slice(0, 255);
+
+  const [insertRes] = await pool.query(
+    `INSERT INTO password_resets (user_id, token_hash, expires_at, ip_address, user_agent)
+     VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), ?, ?)`,
+    [user.id, tokenHash, expiryMinutes, clientIp || null, userAgent || null]
+  );
+
+  // Build reset link with frontend URL
+  const frontendUrl = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
+  const resetUrl = `${frontendUrl}/reset-password?token=${rawToken}`;
+
+  // Enqueue reset email
+  try {
+    emailService.sendPasswordResetEmail({
+      to: user.email,
+      userName: user.name || "Valued User",
+      resetUrl,
+      expiresInMinutes: expiryMinutes,
+      resetId: insertRes.insertId,
+    }).catch((mailErr) => {
+      console.warn(`[Auth] Non-fatal password reset email queue error for user ${user.id}:`, mailErr.message);
+    });
+  } catch (err) {
+    console.warn(`[Auth] Password reset email trigger error:`, err.message);
+  }
+
+  return res.json(genericResponse);
+});
+
+// GET /api/auth/verify-reset-token
+// Validates whether a reset token is current, unconsumed and unexpired without consuming it.
+const verifyResetToken = asyncHandler(async (req, res) => {
+  const { token } = req.query || {};
+  if (!token || !String(token).trim()) {
+    return res.status(400).json({ valid: false, message: "Reset token is required." });
+  }
+
+  const tokenHash = crypto.createHash("sha256").update(String(token).trim()).digest("hex");
+  const [rows] = await pool.query(
+    `SELECT pr.id, pr.expires_at, pr.consumed_at, u.status, u.deleted_at
+     FROM password_resets pr
+     JOIN users u ON u.id = pr.user_id
+     WHERE pr.token_hash = ?`,
+    [tokenHash]
+  );
+
+  if (!rows.length) {
+    return res.status(400).json({ valid: false, message: "Invalid or expired password reset link." });
+  }
+
+  const row = rows[0];
+  if (row.consumed_at) {
+    return res.status(400).json({ valid: false, message: "This password reset link has already been used. Please request a new one." });
+  }
+  if (new Date(row.expires_at) < new Date()) {
+    return res.status(400).json({ valid: false, message: "This password reset link has expired. Please request a new one." });
+  }
+  if (row.deleted_at || row.status !== "active") {
+    return res.status(403).json({ valid: false, message: "This account is not eligible for password reset." });
+  }
+
+  return res.json({ valid: true });
+});
+
+// POST /api/auth/reset-password
+// Atomically verifies token, marks it consumed, hashes the new password,
+// increments token_version to invalidate prior JWT sessions, and records password_changed_at.
+const resetPassword = asyncHandler(async (req, res) => {
+  const { token, password, confirmPassword } = req.body || {};
+  const clientIp = (req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
+
+  if (isResetPasswordRateLimited(clientIp)) {
+    throw new ApiError(429, "Too many password reset attempts. Please try again later.");
+  }
+
+  if (!token || !String(token).trim()) {
+    throw new ApiError(400, "Reset token is required.");
+  }
+  if (!password || String(password).length < 6) {
+    throw new ApiError(400, "Password must be at least 6 characters long.");
+  }
+  if (confirmPassword !== undefined && password !== confirmPassword) {
+    throw new ApiError(400, "Passwords do not match. Please verify your password.");
+  }
+
+  const tokenHash = crypto.createHash("sha256").update(String(token).trim()).digest("hex");
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      `SELECT pr.id, pr.user_id, pr.expires_at, pr.consumed_at, u.status, u.deleted_at, u.token_version
+       FROM password_resets pr
+       JOIN users u ON u.id = pr.user_id
+       WHERE pr.token_hash = ?
+       FOR UPDATE`,
+      [tokenHash]
+    );
+
+    if (!rows.length) {
+      await conn.rollback();
+      throw new ApiError(400, "Invalid or expired password reset link.");
+    }
+
+    const resetRecord = rows[0];
+
+    if (resetRecord.consumed_at) {
+      await conn.rollback();
+      throw new ApiError(400, "This password reset link has already been used. Please request a new one.");
+    }
+
+    if (new Date(resetRecord.expires_at) < new Date()) {
+      await conn.rollback();
+      throw new ApiError(400, "This password reset link has expired. Please request a new one.");
+    }
+
+    if (resetRecord.deleted_at || resetRecord.status === "deleted") {
+      await conn.rollback();
+      throw new ApiError(403, "This account has been deleted. Password reset cannot be completed.");
+    }
+
+    if (resetRecord.status !== "active") {
+      await conn.rollback();
+      throw new ApiError(403, "Your account has been deactivated. Contact the super admin.");
+    }
+
+    // Atomically mark token as consumed
+    await conn.query("UPDATE password_resets SET consumed_at = NOW() WHERE id = ?", [resetRecord.id]);
+
+    // Invalidate any other outstanding reset tokens for this user
+    await conn.query(
+      "UPDATE password_resets SET consumed_at = NOW() WHERE user_id = ? AND consumed_at IS NULL",
+      [resetRecord.user_id]
+    );
+
+    // Hash new password using bcrypt
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Update password, increment token_version, record password_changed_at
+    await conn.query(
+      `UPDATE users
+       SET password = ?,
+           password_changed_at = NOW(),
+           token_version = token_version + 1,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [hashedPassword, resetRecord.user_id]
+    );
+
+    await conn.commit();
+
+    return res.json({
+      success: true,
+      message: "Your password has been successfully reset. You can now log in with your new password.",
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
 module.exports = {
   register,
   login,
+  forgotPassword,
+  verifyResetToken,
+  resetPassword,
   getMe,
   updateMe,
   uploadProfileLogo,
