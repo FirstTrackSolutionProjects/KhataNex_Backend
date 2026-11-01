@@ -325,7 +325,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
 
   const genericResponse = {
     success: true,
-    message: "If an eligible account exists for this email, you will receive password reset instructions shortly.",
+    message: "If an eligible account exists for this email, you will receive password reset instructions.",
   };
 
   if (!email || !String(email).trim() || !String(email).includes("@")) {
