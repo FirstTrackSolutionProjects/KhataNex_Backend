@@ -31,6 +31,8 @@ const MIGRATION_HISTORY = [
   "migration_023_support_ticket_feedback.sql",
   "migration_024_subscription_billing_and_email_outbox.sql",
   "migration_025_email_unsubscribes.sql",
+  "migration_026_soft_delete_and_restore.sql",
+  "migration_027_allow_email_reuse_after_soft_delete.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -273,6 +275,20 @@ const MIGRATION_SCHEMA_CHECKS = {
   "migration_025_email_unsubscribes.sql": async (conn, db) => {
     const [r] = await conn.query(
       "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'email_unsubscribes'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_026_soft_delete_and_restore.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'users' AND COLUMN_NAME = 'restored_at'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_027_allow_email_reuse_after_soft_delete.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'users' AND COLUMN_NAME = 'active_email'",
       [db]
     );
     return r.length > 0;
