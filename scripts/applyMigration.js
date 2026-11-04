@@ -28,12 +28,14 @@ const MIGRATION_HISTORY = [
   "migration_020_subscription_pricing_and_settings.sql",
   "migration_021_promotions_and_coupon_enhancements.sql",
   "migration_022_plan_management_employees_help_centre.sql",
-  "migration_023_support_ticket_feedback.sql",
   "migration_024_subscription_billing_and_email_outbox.sql",
   "migration_025_email_unsubscribes.sql",
   "migration_026_soft_delete_and_restore.sql",
   "migration_027_allow_email_reuse_after_soft_delete.sql",
+  "migration_028_password_resets.sql",
+  "migration_029_two_factor_authentication.sql",
   "migration_030_subscription_invoice_persistence.sql",
+  "migration_031_create_sales_table.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -290,6 +292,20 @@ const MIGRATION_SCHEMA_CHECKS = {
   "migration_027_allow_email_reuse_after_soft_delete.sql": async (conn, db) => {
     const [r] = await conn.query(
       "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'users' AND COLUMN_NAME = 'active_email'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_028_password_resets.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'password_resets'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_029_two_factor_authentication.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'user_recovery_codes'",
       [db]
     );
     return r.length > 0;
