@@ -2,6 +2,7 @@ const router = require("express").Router();
 const {
   addStock,
   listStock,
+  getStockById,
   updateStock,
   deleteStock,
   lookupStockOrPurchase,
@@ -17,6 +18,7 @@ router.get("/purchase-bills/items", searchPurchaseItems);
 
 router.post("/", addStock);
 router.get("/", listStock);
+router.get("/:id", getStockById);
 router.patch("/:id", updateStock);
 router.delete("/:id", deleteStock);
 

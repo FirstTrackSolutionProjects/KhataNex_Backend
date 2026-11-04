@@ -70,6 +70,10 @@ const normalizeItem = (item) => {
 
     quantity: qty,
     price: price,
+    selling_price:
+      item.selling_price !== undefined && item.selling_price !== null && item.selling_price !== ""
+        ? Number(item.selling_price)
+        : null,
     discount: discount,
     unit: itemType === "goods" ? item.unit || null : null,
     item_type: itemType,
@@ -211,19 +215,89 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
     const purchaseBillId = billResult.insertId;
 
     let billTotal = 0;
-    const stockUpdates = new Map(); // productId -> aggregated quantity to increment
+    const shouldUpdateInventory =
+      req.body.update_inventory === true ||
+      req.body.update_inventory === "true" ||
+      req.body.add_to_inventory === true ||
+      req.body.add_to_inventory === "true";
 
     for (const item of validItems) {
       billTotal += Number(item.total_amount || 0);
       let productId = item.product_id ? Number(item.product_id) : null;
-      if (!productId && item.item_name) {
-        const [matching] = await connection.query(
-          "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
-          [item.item_name, item.item_name, businessOwnerId]
-        );
-        if (matching.length) {
-          productId = matching[0].id;
+
+      if (shouldUpdateInventory && item.item_type !== "service" && Number(item.quantity || 0) > 0) {
+        // Find existing matching inventory item in stock table
+        let matchedStock = null;
+        if (productId) {
+          const [rows] = await connection.query(
+            "SELECT * FROM stock WHERE id = ? AND created_by = ? LIMIT 1",
+            [productId, businessOwnerId]
+          );
+          if (rows.length) matchedStock = rows[0];
         }
+        if (!matchedStock && item.item_name) {
+          const [rows] = await connection.query(
+            "SELECT * FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY id DESC LIMIT 1",
+            [item.item_name, item.item_name, businessOwnerId]
+          );
+          if (rows.length) matchedStock = rows[0];
+        }
+
+        const purchaseCost = Number(item.price || 0);
+        const userSellingPrice =
+          item.selling_price !== undefined && item.selling_price !== null && item.selling_price !== ""
+            ? Number(item.selling_price)
+            : null;
+
+        if (matchedStock) {
+          productId = matchedStock.id;
+          const newSellingPrice =
+            userSellingPrice !== null && userSellingPrice > 0 ? userSellingPrice : matchedStock.price;
+          await connection.query(
+            `UPDATE stock
+             SET quantity = quantity + ?,
+                 purchase_price = ?,
+                 price = ?,
+                 unit = COALESCE(NULLIF(?, ''), unit),
+                 hsn_code = COALESCE(NULLIF(?, ''), hsn_code),
+                 gst_rate = COALESCE(?, gst_rate)
+             WHERE id = ? AND created_by = ?`,
+            [
+              Number(item.quantity),
+              purchaseCost,
+              newSellingPrice,
+              item.unit || null,
+              item.hsn_code || null,
+              item.gst_rate !== undefined ? item.gst_rate : null,
+              matchedStock.id,
+              businessOwnerId,
+            ]
+          );
+        } else {
+          const finalSellingPrice =
+            userSellingPrice !== null && userSellingPrice > 0 ? userSellingPrice : purchaseCost;
+          const [newStockResult] = await connection.query(
+            `INSERT INTO stock (
+               product_name, category, type, item_type, unit, hsn_code, gst_rate,
+               quantity, price, purchase_price, purchase_bill_id, created_by
+             ) VALUES (?, 'Inventory', 'goods', 'goods', ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              item.item_name,
+              item.unit || "pcs",
+              item.hsn_code || null,
+              Number(item.gst_rate || 0),
+              Number(item.quantity),
+              finalSellingPrice,
+              purchaseCost,
+              purchaseBillId,
+              businessOwnerId,
+            ]
+          );
+          productId = newStockResult.insertId;
+        }
+      } else if (!shouldUpdateInventory && item.product_id) {
+        // Checkbox unchecked: preserve existing product link if provided, but do not alter stock quantities
+        productId = Number(item.product_id);
       }
 
       await connection.query(
@@ -254,23 +328,6 @@ const addPurchaseBill = asyncHandler(async (req, res) => {
           item.hsn_code,
         ]
       );
-
-      // Existing linked product in stock: aggregate quantity so stock is updated exactly once
-      if (item.item_type === "goods" && productId && Number(item.quantity || 0) > 0) {
-        stockUpdates.set(productId, (stockUpdates.get(productId) || 0) + Number(item.quantity));
-      }
-    }
-
-    // Apply stock updates: exactly ONE update per linked product
-    for (const [prodId, totalQty] of stockUpdates.entries()) {
-      if (prodId && totalQty > 0) {
-        await connection.query(
-          `UPDATE stock
-           SET quantity = quantity + ?
-           WHERE id = ? AND created_by = ?`,
-          [totalQty, prodId, businessOwnerId]
-        );
-      }
     }
 
     // Fall back to supplied body amount if no item lines were entered
@@ -569,20 +626,88 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
     );
 
     let updatedBillTotal = 0;
-    const newStockUpdates = new Map();
+    const shouldUpdateInventoryOnUpdate =
+      req.body.update_inventory === true ||
+      req.body.update_inventory === "true" ||
+      req.body.add_to_inventory === true ||
+      req.body.add_to_inventory === "true";
 
     // Insert new valid items and apply new stock quantities (goods only)
     for (const item of validItems) {
       updatedBillTotal += Number(item.total_amount || 0);
       let productId = item.product_id ? Number(item.product_id) : null;
-      if (!productId && item.item_name) {
-        const [matching] = await connection.query(
-          "SELECT id FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY (category = 'Purchases') ASC, id DESC LIMIT 1",
-          [item.item_name, item.item_name, businessOwnerId]
-        );
-        if (matching.length) {
-          productId = matching[0].id;
+
+      if (shouldUpdateInventoryOnUpdate && item.item_type !== "service" && Number(item.quantity || 0) > 0) {
+        let matchedStock = null;
+        if (productId) {
+          const [rows] = await connection.query(
+            "SELECT * FROM stock WHERE id = ? AND created_by = ? LIMIT 1",
+            [productId, businessOwnerId]
+          );
+          if (rows.length) matchedStock = rows[0];
         }
+        if (!matchedStock && item.item_name) {
+          const [rows] = await connection.query(
+            "SELECT * FROM stock WHERE (product_name = ? OR LOWER(product_name) = LOWER(?)) AND created_by = ? ORDER BY id DESC LIMIT 1",
+            [item.item_name, item.item_name, businessOwnerId]
+          );
+          if (rows.length) matchedStock = rows[0];
+        }
+
+        const purchaseCost = Number(item.price || 0);
+        const userSellingPrice =
+          item.selling_price !== undefined && item.selling_price !== null && item.selling_price !== ""
+            ? Number(item.selling_price)
+            : null;
+
+        if (matchedStock) {
+          productId = matchedStock.id;
+          const newSellingPrice =
+            userSellingPrice !== null && userSellingPrice > 0 ? userSellingPrice : matchedStock.price;
+          await connection.query(
+            `UPDATE stock
+             SET quantity = quantity + ?,
+                 purchase_price = ?,
+                 price = ?,
+                 unit = COALESCE(NULLIF(?, ''), unit),
+                 hsn_code = COALESCE(NULLIF(?, ''), hsn_code),
+                 gst_rate = COALESCE(?, gst_rate)
+             WHERE id = ? AND created_by = ?`,
+            [
+              Number(item.quantity),
+              purchaseCost,
+              newSellingPrice,
+              item.unit || null,
+              item.hsn_code || null,
+              item.gst_rate !== undefined ? item.gst_rate : null,
+              matchedStock.id,
+              businessOwnerId,
+            ]
+          );
+        } else {
+          const finalSellingPrice =
+            userSellingPrice !== null && userSellingPrice > 0 ? userSellingPrice : purchaseCost;
+          const [newStockResult] = await connection.query(
+            `INSERT INTO stock (
+               product_name, category, type, item_type, unit, hsn_code, gst_rate,
+               quantity, price, purchase_price, purchase_bill_id, created_by
+             ) VALUES (?, 'Inventory', 'goods', 'goods', ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              item.item_name,
+              item.unit || "pcs",
+              item.hsn_code || null,
+              Number(item.gst_rate || 0),
+              Number(item.quantity),
+              finalSellingPrice,
+              purchaseCost,
+              id,
+              businessOwnerId,
+            ]
+          );
+          productId = newStockResult.insertId;
+        }
+      } else if (!shouldUpdateInventoryOnUpdate && item.product_id) {
+        productId = Number(item.product_id);
       }
 
       await connection.query(
@@ -613,22 +738,6 @@ const updatePurchaseBill = asyncHandler(async (req, res) => {
           item.hsn_code,
         ]
       );
-
-      if (item.item_type === "goods" && productId && Number(item.quantity || 0) > 0) {
-        newStockUpdates.set(productId, (newStockUpdates.get(productId) || 0) + Number(item.quantity));
-      }
-    }
-
-    // Existing linked product updates stock exactly once
-    for (const [prodId, totalQty] of newStockUpdates.entries()) {
-      if (prodId && totalQty > 0) {
-        await connection.query(
-          `UPDATE stock
-           SET quantity = quantity + ?
-           WHERE id = ? AND created_by = ?`,
-          [totalQty, prodId, businessOwnerId]
-        );
-      }
     }
 
     if (validItems.length === 0) {

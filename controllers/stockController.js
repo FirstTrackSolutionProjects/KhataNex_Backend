@@ -82,6 +82,8 @@ const enrichStockItem = (item) => {
 
   return {
     ...item,
+    selling_price: item.price !== null && item.price !== undefined ? Number(item.price) : 0,
+    purchase_price: item.purchase_price !== null && item.purchase_price !== undefined ? Number(item.purchase_price) : 0,
     item_type: resolvedItemType,
     type: item.type || resolvedItemType,
     price_inclusive_gst: isInclusive ? 1 : 0,
@@ -901,9 +903,31 @@ const searchPurchaseItems = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * GET /api/stock/:id
+ * Retrieve a single stock item by ID
+ */
+const getStockById = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const stockId = Number(req.params.id);
+
+  const [rows] = await pool.query(
+    "SELECT * FROM stock WHERE id = ? AND created_by = ? LIMIT 1",
+    [stockId, tenant.businessOwnerId]
+  );
+
+  if (!rows.length) {
+    throw new ApiError(404, "Stock item not found.");
+  }
+
+  const enriched = enrichStockItem(rows[0]);
+  res.json({ success: true, stock: enriched, data: enriched });
+});
+
 module.exports = {
   addStock,
   listStock,
+  getStockById,
   updateStock,
   deleteStock,
   lookupStockOrPurchase,
