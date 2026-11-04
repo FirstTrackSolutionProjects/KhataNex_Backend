@@ -380,7 +380,17 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
     if (!order) throw new ApiError(404, "Order not found.");
 
     if (order.status === "paid") {
-      await conn.rollback();
+      // Ensure outbox event exists for already-paid order to prevent permanently skipped invoice dispatch
+      try {
+        const year = new Date(order.paid_at || Date.now()).getFullYear();
+        const invoiceNumber = order.invoice_number || `SUB-${year}-${String(order.id).padStart(5, "0")}`;
+        const { enqueueInvoiceEvent, publishInvoiceEventForOrder } = require("../services/subscriptionInvoiceQueueService");
+        await enqueueInvoiceEvent(conn, { orderId: order.id, userId: order.user_id, invoiceNumber });
+        await conn.commit();
+        publishInvoiceEventForOrder(order.id).catch(console.error);
+      } catch (_) {
+        await conn.rollback();
+      }
       return { alreadyPaid: true, order };
     }
 
@@ -420,13 +430,21 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
       [order.user_id, order.plan_id, order.id, durationMonths, order.provider === "manual" ? 1 : 0, order.user_id]
     );
 
-    // Update order status
+    const year = new Date().getFullYear();
+    const invoiceNumber = order.invoice_number || `SUB-${year}-${String(order.id).padStart(5, "0")}`;
+
+    // Update order status and persist the deterministic invoice_number
     await conn.query(
       `UPDATE subscription_orders
-       SET status = 'paid', provider_payment_id = ?, provider_signature = ?, paid_at = NOW()
+       SET status = 'paid', provider_payment_id = ?, provider_signature = ?, paid_at = NOW(),
+           invoice_number = COALESCE(invoice_number, ?)
        WHERE id = ?`,
-      [providerPaymentId || null, providerSignature || null, order.id]
+      [providerPaymentId || null, providerSignature || null, invoiceNumber, order.id]
     );
+
+    // Save pending invoice generation event in the durable transactional outbox
+    const { enqueueInvoiceEvent, publishInvoiceEventForOrder } = require("../services/subscriptionInvoiceQueueService");
+    await enqueueInvoiceEvent(conn, { orderId: order.id, userId: order.user_id, invoiceNumber });
 
     // If introductory offer used, mark user as having consumed the offer
     if (order.is_introductory) {
@@ -463,13 +481,19 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
     conn.release();
   }
 
-  // Issue invoice asynchronously if required (including 100% discounted zero-cost orders)
+  // Post-commit: Dispatch invoice event to AWS SQS FIFO queue via outbox service
   if (invoice) {
     try {
-      const { issueInvoice } = require("./subscriptionInvoice");
-      await issueInvoice(order.id);
+      const { publishInvoiceEventForOrder } = require("../services/subscriptionInvoiceQueueService");
+      publishInvoiceEventForOrder(order.id).catch(console.error);
+
+      // If SQS automation is explicitly disabled, fall back to synchronous local invoice generation
+      if (process.env.DISABLE_AUTOMATION_SQS === "true") {
+        const { issueInvoice } = require("./subscriptionInvoice");
+        await issueInvoice(order.id);
+      }
     } catch (err) {
-      console.error(`[SubscriptionLogic] Invoice generation failed for order ${order.id}:`, err.message || err);
+      console.error(`[SubscriptionLogic] Outbox SQS dispatch failed for order ${order.id}:`, err.message || err);
     }
   }
 
