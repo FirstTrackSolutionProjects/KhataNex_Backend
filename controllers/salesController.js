@@ -54,6 +54,31 @@ async function generateInvoiceNumber(conn, invoiceDate = new Date()) {
 }
 
 /**
+ * Helper to build sale numbering in format SALE-YYYY-XXXXX
+ */
+async function generateSaleNumber(conn, saleDate = new Date()) {
+  const dateObj = new Date(saleDate);
+  const year = Number.isNaN(dateObj.getFullYear()) ? new Date().getFullYear() : dateObj.getFullYear();
+  const prefix = `SALE-${year}-`;
+
+  const [rows] = await conn.query(
+    "SELECT sale_number FROM sales WHERE sale_number LIKE ? ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    [`${prefix}%`]
+  );
+
+  let nextSeq = 1;
+  if (rows.length > 0 && rows[0].sale_number) {
+    const parts = rows[0].sale_number.split("-");
+    const lastNum = parseInt(parts[parts.length - 1], 10);
+    if (!Number.isNaN(lastNum)) {
+      nextSeq = lastNum + 1;
+    }
+  }
+
+  return `${prefix}${String(nextSeq).padStart(5, "0")}`;
+}
+
+/**
  * GET /api/sales
  * GET /api/sales/dashboard
  * Retrieves sales list with top-level metrics, search, and date filters
@@ -75,6 +100,7 @@ const getSales = asyncHandler(async (req, res) => {
     end_date,
     period,
     payment_mode,
+    payment_status,
     invoice_status,
     customer_id,
     search,
@@ -94,7 +120,6 @@ const getSales = asyncHandler(async (req, res) => {
     conditions.push("s.sale_date BETWEEN ? AND ?");
     params.push(start_date, end_date);
   } else if (period) {
-    const today = new Date();
     if (period === "today") {
       const todayStr = formatCurrentDate();
       conditions.push("s.sale_date = ?");
@@ -114,6 +139,12 @@ const getSales = asyncHandler(async (req, res) => {
     params.push(payment_mode);
   }
 
+  // Payment status filter
+  if (payment_status && payment_status !== "all") {
+    conditions.push("s.payment_status = ?");
+    params.push(payment_status);
+  }
+
   // Invoice status filter
   if (invoice_status === "invoiced") {
     conditions.push("s.invoice_id IS NOT NULL");
@@ -127,11 +158,11 @@ const getSales = asyncHandler(async (req, res) => {
     params.push(Number(customer_id));
   }
 
-  // Search filter (customer name, customer phone, product name)
+  // Search filter (customer name, customer phone, product name, sale number)
   if (search && search.trim()) {
     const term = `%${search.trim()}%`;
-    conditions.push("(s.customer_name LIKE ? OR s.customer_phone LIKE ? OR s.product_name LIKE ?)");
-    params.push(term, term, term);
+    conditions.push("(s.customer_name LIKE ? OR s.customer_phone LIKE ? OR s.product_name LIKE ? OR s.sale_number LIKE ?)");
+    params.push(term, term, term, term);
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -144,7 +175,9 @@ const getSales = asyncHandler(async (req, res) => {
        COUNT(CASE WHEN s.invoice_id IS NOT NULL THEN 1 END) AS invoiced_sales_count,
        COUNT(CASE WHEN s.invoice_id IS NULL THEN 1 END) AS uninvoiced_sales_count,
        COALESCE(SUM(CASE WHEN s.invoice_id IS NULL THEN s.amount ELSE 0 END), 0) AS uninvoiced_sales_amount,
-       COALESCE(SUM(CASE WHEN s.invoice_id IS NOT NULL THEN s.amount ELSE 0 END), 0) AS invoiced_sales_amount
+       COALESCE(SUM(CASE WHEN s.invoice_id IS NOT NULL THEN s.amount ELSE 0 END), 0) AS invoiced_sales_amount,
+       COALESCE(SUM(s.paid_amount), 0) AS total_paid_amount,
+       COALESCE(SUM(s.due_amount), 0) AS total_due_amount
      FROM sales s
      ${whereClause}`,
     params
@@ -157,6 +190,8 @@ const getSales = asyncHandler(async (req, res) => {
     uninvoiced_sales_count: 0,
     uninvoiced_sales_amount: 0,
     invoiced_sales_amount: 0,
+    total_paid_amount: 0,
+    total_due_amount: 0,
   };
 
   // 2. Fetch Sales Records with Joined Invoice Details
@@ -177,6 +212,35 @@ const getSales = asyncHandler(async (req, res) => {
     params
   );
 
+  // 3. Attach sale_items to each sale
+  if (sales.length > 0) {
+    const saleIds = sales.map((s) => s.id);
+    const [allItems] = await pool.query(
+      `SELECT * FROM sale_items WHERE sale_id IN (${saleIds.map(() => "?").join(",")}) ORDER BY id ASC`,
+      saleIds
+    );
+
+    const itemsBySaleId = new Map();
+    for (const it of allItems) {
+      if (!itemsBySaleId.has(it.sale_id)) {
+        itemsBySaleId.set(it.sale_id, []);
+      }
+      itemsBySaleId.get(it.sale_id).push(it);
+    }
+
+    for (const s of sales) {
+      const items = itemsBySaleId.get(s.id) || [];
+      s.items = items;
+      if (items.length === 1) {
+        s.items_summary = items[0].product_name;
+      } else if (items.length > 1) {
+        s.items_summary = `${items[0].product_name} (+${items.length - 1} more)`;
+      } else {
+        s.items_summary = s.product_name;
+      }
+    }
+  }
+
   res.json({
     success: true,
     metrics: {
@@ -186,6 +250,8 @@ const getSales = asyncHandler(async (req, res) => {
       uninvoiced_sales_count: Number(metrics.uninvoiced_sales_count || 0),
       uninvoiced_sales_amount: roundMoney(metrics.uninvoiced_sales_amount),
       invoiced_sales_amount: roundMoney(metrics.invoiced_sales_amount),
+      total_paid_amount: roundMoney(metrics.total_paid_amount),
+      total_due_amount: roundMoney(metrics.total_due_amount),
     },
     sales,
   });
@@ -193,7 +259,7 @@ const getSales = asyncHandler(async (req, res) => {
 
 /**
  * GET /api/sales/:id
- * Retrieve a single sale by ID
+ * Retrieve a single sale by ID with its line items
  */
 const getSaleById = asyncHandler(async (req, res) => {
   const tenant = getTenantContext(req);
@@ -230,6 +296,19 @@ const getSaleById = asyncHandler(async (req, res) => {
     throw new ApiError(403, "Access denied: you do not have permission to view this sale.");
   }
 
+  const [items] = await pool.query(
+    "SELECT * FROM sale_items WHERE sale_id = ? ORDER BY id ASC",
+    [saleId]
+  );
+  sale.items = items;
+  if (items.length === 1) {
+    sale.items_summary = items[0].product_name;
+  } else if (items.length > 1) {
+    sale.items_summary = `${items[0].product_name} (+${items.length - 1} more)`;
+  } else {
+    sale.items_summary = sale.product_name;
+  }
+
   res.json({ success: true, sale });
 });
 
@@ -239,6 +318,7 @@ const getSaleById = asyncHandler(async (req, res) => {
 async function createSalesTaxInvoice({
   conn,
   tenant,
+  saleId = null,
   customerData,
   items,
   invoiceDate,
@@ -252,16 +332,19 @@ async function createSalesTaxInvoice({
   const docNumber = await generateInvoiceNumber(conn, invoiceDate);
 
   let subtotal = 0;
+  let totalCalculatedTax = 0;
+
   const calculatedItems = items.map((it) => {
     const qty = cleanNumber(it.quantity, 1);
     const rate = cleanNumber(it.unit_price || it.price, 0);
     const disc = cleanNumber(it.discount, 0);
     const taxable = roundMoney(qty * rate - disc);
-    const taxRate = cleanNumber(it.tax_rate ?? gstRate, 0);
+    const taxRate = cleanNumber(it.tax_rate !== undefined ? it.tax_rate : gstRate, 0);
     const taxAmount = roundMoney((taxable * taxRate) / 100);
     const lineTotal = roundMoney(taxable + taxAmount);
 
     subtotal += taxable;
+    totalCalculatedTax += taxAmount;
 
     return {
       product_id: it.product_id || null,
@@ -278,6 +361,7 @@ async function createSalesTaxInvoice({
   });
 
   subtotal = roundMoney(subtotal);
+  totalCalculatedTax = roundMoney(totalCalculatedTax);
 
   // Determine State / Place of Supply for GST (Intra vs Inter state)
   const sellerState = String(user.state || "").trim().toLowerCase();
@@ -290,17 +374,19 @@ async function createSalesTaxInvoice({
   let sgstAmount = 0;
   let igstRate = 0;
   let igstAmount = 0;
+  const effectiveGstRate =
+    cleanNumber(gstRate, 0) ||
+    (subtotal > 0 && totalCalculatedTax > 0 ? roundMoney((totalCalculatedTax / subtotal) * 100) : 0);
 
-  const effectiveGstRate = cleanNumber(gstRate, 0);
-  if (effectiveGstRate > 0) {
+  if (totalCalculatedTax > 0 || effectiveGstRate > 0) {
     if (isInterState) {
       igstRate = effectiveGstRate;
-      igstAmount = roundMoney((subtotal * igstRate) / 100);
+      igstAmount = totalCalculatedTax;
     } else {
       cgstRate = effectiveGstRate / 2;
-      cgstAmount = roundMoney((subtotal * cgstRate) / 100);
+      cgstAmount = roundMoney(totalCalculatedTax / 2);
       sgstRate = effectiveGstRate / 2;
-      sgstAmount = roundMoney((subtotal * sgstRate) / 100);
+      sgstAmount = roundMoney(totalCalculatedTax - cgstAmount);
     }
   }
 
@@ -317,7 +403,7 @@ async function createSalesTaxInvoice({
        from_logo_path, from_signature_path,
        to_name, to_business_name, to_email, to_phone, to_gstin,
        to_billing_state, to_billing_city, to_billing_pincode,
-       created_by
+       sale_id, created_by
      ) VALUES (
        'invoice', ?, ?, ?, ?, ?,
        'issued', ?, ?, ?, ?, ?, ?,
@@ -327,7 +413,7 @@ async function createSalesTaxInvoice({
        ?, ?,
        ?, ?, ?, ?, ?,
        ?, ?, ?,
-       ?
+       ?, ?
      )`,
     [
       docNumber,
@@ -362,6 +448,7 @@ async function createSalesTaxInvoice({
       customerData.billing_state || customerData.state || null,
       customerData.billing_city || customerData.city || null,
       customerData.billing_pincode || customerData.pincode || null,
+      saleId || null,
       tenant.businessOwnerId,
     ]
   );
@@ -444,7 +531,8 @@ async function createSalesTaxInvoice({
 
 /**
  * POST /api/sales
- * Create a new sale with optional inventory decrement & tax invoice generation
+ * Create a new sale with support for multiple line items, inventory decrement,
+ * payment recording (cash/bank), and optional invoice generation.
  */
 const createSale = asyncHandler(async (req, res) => {
   const tenant = getTenantContext(req);
@@ -460,6 +548,10 @@ const createSale = asyncHandler(async (req, res) => {
     customer_email,
     customer_address,
     customer_gstin,
+    billing_state,
+    state,
+    items,
+    // Legacy single item fields
     product_id,
     product_name,
     category,
@@ -467,7 +559,13 @@ const createSale = asyncHandler(async (req, res) => {
     unit = "pcs",
     unit_price = 0,
     discount = 0,
+    tax_rate = 0,
+    item_type = "goods",
+    hsn_code,
+    // Payment details
     payment_mode = "cash",
+    paid_amount,
+    bank_id,
     sale_date,
     sale_time,
     notes,
@@ -475,68 +573,43 @@ const createSale = asyncHandler(async (req, res) => {
     gst_rate = 0,
   } = req.body;
 
-  // Validation
-  const finalCustomerName = String(customer_name || "").trim();
-  const finalProductName = String(product_name || "").trim();
-  const numQuantity = cleanNumber(quantity, 1);
-  const numUnitPrice = cleanNumber(unit_price, 0);
-  const numDiscount = cleanNumber(discount, 0);
+  // 1. Prepare and normalize item list (supporting multi-item or single item fallback)
+  let rawItems = [];
+  if (Array.isArray(items) && items.length > 0) {
+    rawItems = items;
+  } else if (product_name || product_id) {
+    rawItems = [
+      {
+        product_id,
+        product_name,
+        category,
+        quantity,
+        unit,
+        unit_price,
+        discount,
+        tax_rate: tax_rate || gst_rate,
+        item_type: item_type || "goods",
+        hsn_code,
+      },
+    ];
+  }
 
-  if (!finalCustomerName) {
-    throw new ApiError(400, "Customer name is required.");
-  }
-  if (!finalProductName) {
-    throw new ApiError(400, "Product name is required.");
-  }
-  if (numQuantity <= 0) {
-    throw new ApiError(400, "Quantity must be greater than zero.");
-  }
-  if (numUnitPrice < 0) {
-    throw new ApiError(400, "Unit price cannot be negative.");
+  if (rawItems.length === 0) {
+    throw new ApiError(400, "Please provide at least one product or service item for the sale.");
   }
 
-  const calculatedAmount = roundMoney(numQuantity * numUnitPrice - numDiscount);
-  const finalSaleDate = sale_date || formatCurrentDate();
-  const finalSaleTime = sale_time || formatCurrentTime();
+  // 2. Customer details handling (Existing vs Walk-in)
+  let resolvedCustomerId = customer_id ? Number(customer_id) : null;
+  let finalCustomerName = String(customer_name || "").trim();
+  let custPhone = customer_phone ? String(customer_phone).trim() : null;
+  let custEmail = customer_email ? String(customer_email).trim() : null;
+  let custAddress = customer_address ? String(customer_address).trim() : null;
+  let custGstin = customer_gstin ? String(customer_gstin).trim() : null;
+  let custState = billing_state || state ? String(billing_state || state).trim() : null;
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-
-    let resolvedProductId = product_id ? Number(product_id) : null;
-    let resolvedCustomerId = customer_id ? Number(customer_id) : null;
-
-    // 1. If product is from Inventory, validate stock and decrement
-    if (resolvedProductId) {
-      const [stockRows] = await conn.query(
-        "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
-        [resolvedProductId, tenant.businessOwnerId]
-      );
-      if (stockRows.length > 0) {
-        const stockItem = stockRows[0];
-        const availableStock = Number(stockItem.quantity || 0);
-        if (availableStock < numQuantity) {
-          throw new ApiError(
-            400,
-            `Insufficient stock for "${stockItem.product_name}". Requested: ${numQuantity}, Available: ${availableStock}`
-          );
-        }
-
-        // Decrement stock
-        await conn.query(
-          "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
-          [numQuantity, resolvedProductId, tenant.businessOwnerId]
-        );
-      } else {
-        resolvedProductId = null;
-      }
-    }
-
-    // 2. If customer_id provided, fetch customer details for completeness
-    let custEmail = customer_email || null;
-    let custPhone = customer_phone || null;
-    let custAddress = customer_address || null;
-    let custGstin = customer_gstin || null;
 
     if (resolvedCustomerId) {
       const [custRows] = await conn.query(
@@ -545,38 +618,168 @@ const createSale = asyncHandler(async (req, res) => {
       );
       if (custRows.length > 0) {
         const c = custRows[0];
-        custEmail = custEmail || c.email;
+        finalCustomerName = finalCustomerName || c.name || c.business_name || "Customer";
         custPhone = custPhone || c.phone;
+        custEmail = custEmail || c.email;
         custAddress = custAddress || c.address_line1 || c.billing_city || c.address;
         custGstin = custGstin || c.gstin;
+        custState = custState || c.billing_state || c.state;
+      } else {
+        throw new ApiError(404, "Selected customer not found.");
+      }
+    } else {
+      if (!finalCustomerName) {
+        finalCustomerName = "Walk-in Customer";
       }
     }
 
-    // 3. Insert into sales table
+    const finalSaleDate = sale_date || formatCurrentDate();
+    const finalSaleTime = sale_time || formatCurrentTime();
+    const saleNumber = await generateSaleNumber(conn, finalSaleDate);
+
+    // 3. Process each line item, validate stock, and calculate amounts
+    let calculatedSubtotal = 0;
+    let calculatedTotalTax = 0;
+    let totalQuantity = 0;
+    let totalDiscount = 0;
+
+    const validatedItems = [];
+
+    for (const raw of rawItems) {
+      const itName = String(raw.product_name || raw.name || "").trim();
+      if (!itName) {
+        throw new ApiError(400, "Every item must have a valid name.");
+      }
+
+      const itQty = cleanNumber(raw.quantity, 1);
+      if (itQty <= 0) {
+        throw new ApiError(400, `Quantity for "${itName}" must be greater than zero.`);
+      }
+
+      const itPrice = cleanNumber(raw.unit_price !== undefined ? raw.unit_price : raw.price, 0);
+      if (itPrice < 0) {
+        throw new ApiError(400, `Unit price for "${itName}" cannot be negative.`);
+      }
+
+      const itDisc = cleanNumber(raw.discount, 0);
+      const itTaxRate = cleanNumber(raw.tax_rate !== undefined ? raw.tax_rate : gst_rate, 0);
+      const itType = raw.item_type === "service" || raw.type === "service" ? "service" : "goods";
+      const itUnit = raw.unit || "pcs";
+      const itHsn = raw.hsn_code || raw.hsn || null;
+      const itCat = raw.category || null;
+      let itProdId = raw.product_id ? Number(raw.product_id) : null;
+
+      // Inventory check & decrement (Goods only, Services do not reduce inventory)
+      if (itType === "goods" && itProdId) {
+        const [stockRows] = await conn.query(
+          "SELECT id, product_name, quantity FROM stock WHERE id = ? AND created_by = ? FOR UPDATE",
+          [itProdId, tenant.businessOwnerId]
+        );
+        if (stockRows.length > 0) {
+          const stockItem = stockRows[0];
+          const availableStock = Number(stockItem.quantity || 0);
+          if (availableStock < itQty) {
+            throw new ApiError(
+              400,
+              `Insufficient stock for "${stockItem.product_name}". Requested: ${itQty}, Available: ${availableStock}`
+            );
+          }
+
+          // Decrement stock
+          await conn.query(
+            "UPDATE stock SET quantity = quantity - ? WHERE id = ? AND created_by = ?",
+            [itQty, itProdId, tenant.businessOwnerId]
+          );
+        } else {
+          itProdId = null;
+        }
+      }
+
+      const taxableAmount = roundMoney(itQty * itPrice - itDisc);
+      const taxAmount = roundMoney((taxableAmount * itTaxRate) / 100);
+      const lineTotal = roundMoney(taxableAmount + taxAmount);
+
+      calculatedSubtotal += taxableAmount;
+      calculatedTotalTax += taxAmount;
+      totalQuantity += itQty;
+      totalDiscount += itDisc;
+
+      validatedItems.push({
+        product_id: itProdId,
+        product_name: itName,
+        category: itCat,
+        quantity: itQty,
+        unit: itUnit,
+        unit_price: itPrice,
+        discount: itDisc,
+        tax_rate: itTaxRate,
+        tax_amount: taxAmount,
+        total_amount: lineTotal,
+        item_type: itType,
+        hsn_code: itHsn,
+      });
+    }
+
+    calculatedSubtotal = roundMoney(calculatedSubtotal);
+    calculatedTotalTax = roundMoney(calculatedTotalTax);
+    const calculatedTotalAmount = roundMoney(calculatedSubtotal + calculatedTotalTax);
+
+    // 4. Payment calculations
+    const cleanPaidAmount = paid_amount !== undefined && paid_amount !== null && paid_amount !== ""
+      ? cleanNumber(paid_amount, calculatedTotalAmount)
+      : calculatedTotalAmount;
+
+    const numPaid = Math.max(0, roundMoney(cleanPaidAmount));
+    const dueAmount = Math.max(0, roundMoney(calculatedTotalAmount - numPaid));
+
+    let paymentStatus = "paid";
+    if (numPaid >= calculatedTotalAmount) {
+      paymentStatus = "paid";
+    } else if (numPaid > 0 && numPaid < calculatedTotalAmount) {
+      paymentStatus = "partial";
+    } else {
+      paymentStatus = "unpaid";
+    }
+
+    const primaryItem = validatedItems[0];
+    const itemsSummary =
+      validatedItems.length === 1
+        ? primaryItem.product_name
+        : `${primaryItem.product_name} (+${validatedItems.length - 1} more)`;
+
+    // 5. Insert into sales table
     const [saleResult] = await conn.query(
       `INSERT INTO sales (
-         user_id, customer_id, customer_name, customer_phone, customer_email,
+         user_id, sale_number, customer_id, customer_name, customer_phone, customer_email,
          customer_address, customer_gstin, product_id, product_name, category,
-         quantity, unit, unit_price, discount, payment_mode, amount,
+         quantity, unit, unit_price, discount, subtotal, tax_amount, payment_mode, bank_id,
+         amount, paid_amount, due_amount, payment_status,
          sale_date, sale_time, notes, created_by
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         tenant.businessOwnerId,
+        saleNumber,
         resolvedCustomerId,
         finalCustomerName,
         custPhone,
         custEmail,
         custAddress,
         custGstin,
-        resolvedProductId,
-        finalProductName,
-        category || null,
-        numQuantity,
-        unit || "pcs",
-        numUnitPrice,
-        numDiscount,
+        primaryItem.product_id,
+        itemsSummary,
+        primaryItem.category,
+        totalQuantity,
+        primaryItem.unit,
+        primaryItem.unit_price,
+        totalDiscount,
+        calculatedSubtotal,
+        calculatedTotalTax,
         payment_mode || "cash",
-        calculatedAmount,
+        bank_id ? Number(bank_id) : null,
+        calculatedTotalAmount,
+        numPaid,
+        dueAmount,
+        paymentStatus,
         finalSaleDate,
         finalSaleTime,
         notes || null,
@@ -585,13 +788,75 @@ const createSale = asyncHandler(async (req, res) => {
     );
 
     const saleId = saleResult.insertId;
-    let generatedInvoice = null;
 
-    // 4. If requested, generate official production invoice
+    // 6. Insert line items into sale_items
+    for (const it of validatedItems) {
+      await conn.query(
+        `INSERT INTO sale_items (
+           sale_id, product_id, product_name, category, quantity, unit,
+           unit_price, discount, tax_rate, tax_amount, total_amount,
+           item_type, hsn_code
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          saleId,
+          it.product_id,
+          it.product_name,
+          it.category,
+          it.quantity,
+          it.unit,
+          it.unit_price,
+          it.discount,
+          it.tax_rate,
+          it.tax_amount,
+          it.total_amount,
+          it.item_type,
+          it.hsn_code,
+        ]
+      );
+    }
+
+    // 7. Payment Ledger Integration: Record payment if paid_amount > 0
+    let paymentId = null;
+    if (numPaid > 0) {
+      const paymentDate = finalSaleDate;
+      const normalizedPaymentMode = (payment_mode && String(payment_mode).trim().toLowerCase() === "cash") ? "cash" : "online";
+
+      const [payResult] = await conn.query(
+        `INSERT INTO payments (
+           payment_category, party_name, customer_id, purpose, amount,
+           payment_mode, payment_date, product_id, product_name, quantity,
+           unit_price, sale_id, created_by
+         ) VALUES (
+           'product_sale', ?, ?, ?, ?,
+           ?, ?, ?, ?, ?,
+           ?, ?, ?
+         )`,
+        [
+          finalCustomerName,
+          resolvedCustomerId,
+          `Product Sale - ${saleNumber}`,
+          numPaid,
+          normalizedPaymentMode,
+          paymentDate,
+          primaryItem.product_id,
+          itemsSummary,
+          totalQuantity,
+          primaryItem.unit_price,
+          saleId,
+          tenant.businessOwnerId,
+        ]
+      );
+      paymentId = payResult.insertId;
+      await conn.query("UPDATE sales SET payment_id = ? WHERE id = ?", [paymentId, saleId]);
+    }
+
+    // 8. If requested, generate official production invoice
+    let generatedInvoice = null;
     if (create_invoice) {
       generatedInvoice = await createSalesTaxInvoice({
         conn,
         tenant,
+        saleId,
         customerData: {
           customer_id: resolvedCustomerId,
           customer_name: finalCustomerName,
@@ -599,22 +864,13 @@ const createSale = asyncHandler(async (req, res) => {
           customer_email: custEmail,
           customer_address: custAddress,
           customer_gstin: custGstin,
-          state: req.body.state || req.body.billing_state,
-          billing_state: req.body.state || req.body.billing_state,
+          state: custState,
+          billing_state: custState,
         },
-        items: [
-          {
-            product_id: resolvedProductId,
-            product_name: finalProductName,
-            quantity: numQuantity,
-            unit: unit || "pcs",
-            unit_price: numUnitPrice,
-            discount: numDiscount,
-          },
-        ],
+        items: validatedItems,
         invoiceDate: finalSaleDate,
-        notes: notes || `Generated from Sale #${saleId}`,
-        gstRate: cleanNumber(gst_rate, 0),
+        notes: notes || `Generated from Sale ${saleNumber}`,
+        gstRate: cleanNumber(gst_rate, validatedItems[0]?.tax_rate || 0),
       });
 
       // Link invoice_id to sale
@@ -623,7 +879,7 @@ const createSale = asyncHandler(async (req, res) => {
 
     await conn.commit();
 
-    // Fetch created sale record
+    // Fetch created sale record with joined details
     const [fetchedRows] = await pool.query(
       `SELECT
          s.*,
@@ -638,17 +894,140 @@ const createSale = asyncHandler(async (req, res) => {
       [saleId]
     );
 
+    const createdSale = fetchedRows[0];
+    createdSale.items = validatedItems;
+    createdSale.items_summary = itemsSummary;
+
     logAuditEvent(req, {
       action: "create_sale",
       target_type: "sale",
       target_id: saleId,
-      metadata: { amount: calculatedAmount, invoice_id: generatedInvoice?.invoiceId },
+      metadata: {
+        amount: calculatedTotalAmount,
+        paid_amount: numPaid,
+        sale_number: saleNumber,
+        invoice_id: generatedInvoice?.invoiceId,
+        payment_id: paymentId,
+      },
     });
 
     res.status(201).json({
       success: true,
-      message: "Sale recorded successfully.",
-      sale: fetchedRows[0],
+      message: `Sale ${saleNumber} recorded successfully.`,
+      sale: createdSale,
+      invoice: generatedInvoice,
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
+/**
+ * POST /api/sales/:id/create-invoice
+ * One-click action to create an official tax invoice from an existing un-invoiced sale
+ */
+const createInvoiceForSale = asyncHandler(async (req, res) => {
+  const tenant = getTenantContext(req);
+  const saleId = Number(req.params.id);
+
+  if (tenant.isEmployee && !hasPermission(req.user, "sales", "create")) {
+    throw new ApiError(403, "Access denied: you do not have permission to generate invoices from sales.");
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [sales] = await conn.query("SELECT * FROM sales WHERE id = ? FOR UPDATE", [saleId]);
+    if (!sales.length) {
+      throw new ApiError(404, "Sale not found.");
+    }
+
+    const sale = sales[0];
+    if (!tenant.isSuperadmin && sale.user_id !== tenant.businessOwnerId) {
+      throw new ApiError(403, "Access denied for this sale.");
+    }
+
+    // Idempotent: If invoice is already linked, return existing invoice without duplicating!
+    if (sale.invoice_id) {
+      const [invRows] = await conn.query("SELECT * FROM invoices WHERE id = ?", [sale.invoice_id]);
+      if (invRows.length > 0) {
+        await conn.commit();
+        return res.json({
+          success: true,
+          message: `Invoice ${invRows[0].invoice_number} is already generated for this sale.`,
+          is_existing: true,
+          invoice: {
+            invoiceId: invRows[0].id,
+            invoiceNumber: invRows[0].invoice_number,
+            pdfPath: invRows[0].pdf_path,
+            invoice: invRows[0],
+          },
+        });
+      }
+    }
+
+    // Fetch line items for this sale
+    const [items] = await conn.query("SELECT * FROM sale_items WHERE sale_id = ? ORDER BY id ASC", [saleId]);
+    const invoiceItems = items.length > 0
+      ? items.map((it) => ({
+          product_id: it.product_id,
+          product_name: it.product_name,
+          quantity: it.quantity,
+          unit: it.unit || "pcs",
+          unit_price: it.unit_price,
+          discount: it.discount || 0,
+          tax_rate: it.tax_rate || 0,
+        }))
+      : [
+          {
+            product_id: sale.product_id,
+            product_name: sale.product_name,
+            quantity: sale.quantity,
+            unit: sale.unit || "pcs",
+            unit_price: sale.unit_price,
+            discount: sale.discount || 0,
+            tax_rate: 0,
+          },
+        ];
+
+    const generatedInvoice = await createSalesTaxInvoice({
+      conn,
+      tenant,
+      saleId,
+      customerData: {
+        customer_id: sale.customer_id,
+        customer_name: sale.customer_name,
+        customer_phone: sale.customer_phone,
+        customer_email: sale.customer_email,
+        customer_address: sale.customer_address,
+        customer_gstin: sale.customer_gstin,
+        billing_state: req.body.billing_state || req.body.state,
+      },
+      items: invoiceItems,
+      invoiceDate: req.body.invoice_date || sale.sale_date,
+      notes: req.body.notes || `Generated from Sale #${sale.sale_number || sale.id}`,
+      gstRate: cleanNumber(req.body.gst_rate, 0),
+    });
+
+    // Link invoice_id to sale
+    await conn.query("UPDATE sales SET invoice_id = ? WHERE id = ?", [generatedInvoice.invoiceId, saleId]);
+
+    await conn.commit();
+
+    logAuditEvent(req, {
+      action: "create_invoice_for_sale",
+      target_type: "invoice",
+      target_id: generatedInvoice.invoiceId,
+      metadata: { sale_id: saleId, invoice_number: generatedInvoice.invoiceNumber },
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `Invoice ${generatedInvoice.invoiceNumber} generated successfully.`,
       invoice: generatedInvoice,
     });
   } catch (err) {
@@ -693,10 +1072,40 @@ const updateSale = asyncHandler(async (req, res) => {
       customer_gstin,
       category,
       payment_mode,
+      paid_amount,
       sale_date,
       sale_time,
       notes,
     } = req.body;
+
+    let updatedPaidAmount = sale.paid_amount;
+    let updatedDueAmount = sale.due_amount;
+    let updatedPaymentStatus = sale.payment_status;
+
+    if (paid_amount !== undefined && paid_amount !== null) {
+      updatedPaidAmount = Math.max(0, cleanNumber(paid_amount, sale.amount));
+      updatedDueAmount = Math.max(0, roundMoney(sale.amount - updatedPaidAmount));
+      if (updatedPaidAmount >= sale.amount) {
+        updatedPaymentStatus = "paid";
+      } else if (updatedPaidAmount > 0) {
+        updatedPaymentStatus = "partial";
+      } else {
+        updatedPaymentStatus = "unpaid";
+      }
+
+      // Update linked payment record if exists
+      if (sale.payment_id) {
+        await conn.query(
+          "UPDATE payments SET amount = ?, payment_mode = ? WHERE id = ? AND created_by = ?",
+          [
+            updatedPaidAmount,
+            (payment_mode || sale.payment_mode) === "cash" ? "cash" : "online",
+            sale.payment_id,
+            tenant.businessOwnerId,
+          ]
+        );
+      }
+    }
 
     await conn.query(
       `UPDATE sales SET
@@ -707,6 +1116,9 @@ const updateSale = asyncHandler(async (req, res) => {
          customer_gstin = COALESCE(?, customer_gstin),
          category = COALESCE(?, category),
          payment_mode = COALESCE(?, payment_mode),
+         paid_amount = ?,
+         due_amount = ?,
+         payment_status = ?,
          sale_date = COALESCE(?, sale_date),
          sale_time = COALESCE(?, sale_time),
          notes = COALESCE(?, notes)
@@ -719,6 +1131,9 @@ const updateSale = asyncHandler(async (req, res) => {
         customer_gstin || null,
         category || null,
         payment_mode || null,
+        updatedPaidAmount,
+        updatedDueAmount,
+        updatedPaymentStatus,
         sale_date || null,
         sale_time || null,
         notes || null,
@@ -751,7 +1166,7 @@ const updateSale = asyncHandler(async (req, res) => {
 
 /**
  * DELETE /api/sales/:id
- * Delete a sale, restoring stock and checking invoice constraints
+ * Delete a sale, restoring stock for physical goods and removing linked payments
  */
 const deleteSale = asyncHandler(async (req, res) => {
   const tenant = getTenantContext(req);
@@ -775,7 +1190,7 @@ const deleteSale = asyncHandler(async (req, res) => {
       throw new ApiError(403, "Access denied: you do not have permission to delete this sale.");
     }
 
-    // 1. If sale has an invoice that is issued, warn or prevent accidental ledger corruption
+    // 1. If sale has an invoice that is issued, warn or prevent accidental deletion
     if (sale.invoice_id) {
       const [invRows] = await conn.query("SELECT id, invoice_number, document_status FROM invoices WHERE id = ?", [sale.invoice_id]);
       if (invRows.length > 0 && invRows[0].document_status === "issued") {
@@ -786,15 +1201,32 @@ const deleteSale = asyncHandler(async (req, res) => {
       }
     }
 
-    // 2. Restore inventory if product was linked
-    if (sale.product_id && Number(sale.quantity) > 0) {
+    // 2. Restore inventory for all goods items in sale_items (services do not restore inventory)
+    const [saleItems] = await conn.query("SELECT * FROM sale_items WHERE sale_id = ?", [saleId]);
+    if (saleItems.length > 0) {
+      for (const it of saleItems) {
+        if (it.item_type !== "service" && it.product_id && Number(it.quantity) > 0) {
+          await conn.query(
+            "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
+            [it.quantity, it.product_id, sale.user_id]
+          );
+        }
+      }
+    } else if (sale.product_id && Number(sale.quantity) > 0) {
+      // Fallback for legacy single item sale
       await conn.query(
         "UPDATE stock SET quantity = quantity + ? WHERE id = ? AND created_by = ?",
         [sale.quantity, sale.product_id, sale.user_id]
       );
     }
 
-    // 3. Delete sale
+    // 3. Delete linked payment from payments table
+    if (sale.payment_id) {
+      await conn.query("DELETE FROM payments WHERE id = ? AND created_by = ?", [sale.payment_id, sale.user_id]);
+    }
+    await conn.query("DELETE FROM payments WHERE sale_id = ? AND created_by = ?", [saleId, sale.user_id]);
+
+    // 4. Delete sale (sale_items are CASCADE deleted via FK fk_sale_items_sale)
     await conn.query("DELETE FROM sales WHERE id = ?", [saleId]);
 
     await conn.commit();
@@ -819,7 +1251,7 @@ const deleteSale = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/sales/generate-invoice
- * Phase 4: Batch generate an official tax invoice from one or more un-invoiced sales!
+ * Batch generate an official tax invoice from one or more un-invoiced sales
  */
 const generateInvoiceFromSales = asyncHandler(async (req, res) => {
   const tenant = getTenantContext(req);
@@ -885,21 +1317,40 @@ const generateInvoiceFromSales = asyncHandler(async (req, res) => {
       }
     }
 
-    // 4. Map each sale to an invoice line item
-    const invoiceItems = sales.map((s) => ({
-      product_id: s.product_id,
-      product_name: s.product_name,
-      quantity: s.quantity,
-      unit: s.unit || "pcs",
-      unit_price: s.unit_price,
-      discount: s.discount || 0,
-      tax_rate: cleanNumber(gst_rate, 0),
-    }));
+    // 4. Fetch line items for all sales
+    const [allItems] = await conn.query(
+      `SELECT * FROM sale_items WHERE sale_id IN (${sanitizedIds.map(() => "?").join(",")})`,
+      sanitizedIds
+    );
+
+    let invoiceItems = [];
+    if (allItems.length > 0) {
+      invoiceItems = allItems.map((it) => ({
+        product_id: it.product_id,
+        product_name: it.product_name,
+        quantity: it.quantity,
+        unit: it.unit || "pcs",
+        unit_price: it.unit_price,
+        discount: it.discount || 0,
+        tax_rate: it.tax_rate !== undefined ? it.tax_rate : cleanNumber(gst_rate, 0),
+      }));
+    } else {
+      invoiceItems = sales.map((s) => ({
+        product_id: s.product_id,
+        product_name: s.product_name,
+        quantity: s.quantity,
+        unit: s.unit || "pcs",
+        unit_price: s.unit_price,
+        discount: s.discount || 0,
+        tax_rate: cleanNumber(gst_rate, 0),
+      }));
+    }
 
     // 5. Generate production invoice (with skip_inventory_decrement since stock was already decremented on sale creation)
     const generatedInvoice = await createSalesTaxInvoice({
       conn,
       tenant,
+      saleId: sanitizedIds[0],
       customerData: {
         customer_id: firstSale.customer_id,
         customer_name: firstSale.customer_name,
@@ -951,5 +1402,6 @@ module.exports = {
   createSale,
   updateSale,
   deleteSale,
+  createInvoiceForSale,
   generateInvoiceFromSales,
 };

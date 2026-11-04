@@ -36,6 +36,7 @@ const MIGRATION_HISTORY = [
   "migration_029_two_factor_authentication.sql",
   "migration_030_subscription_invoice_persistence.sql",
   "migration_031_create_sales_table.sql",
+  "migration_032_sales_enhancements_and_items.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -320,6 +321,13 @@ const MIGRATION_SCHEMA_CHECKS = {
   "migration_031_create_sales_table.sql": async (conn, db) => {
     const [r] = await conn.query(
       "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'sales'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_032_sales_enhancements_and_items.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'sale_items'",
       [db]
     );
     return r.length > 0;

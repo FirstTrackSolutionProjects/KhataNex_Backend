@@ -147,6 +147,18 @@ const calculateReportMetrics = async (userId, rangeFrom, rangeTo) => {
     salesFilter.params
   );
 
+  const modernSalesFilter = buildDateFilter(userId, "sale_date", rangeFrom, rangeTo);
+  const [[modernSalesSummary]] = await pool.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN payment_mode = 'cash' THEN paid_amount ELSE 0 END), 0) AS cash,
+       COALESCE(SUM(CASE WHEN payment_mode IN ('online', 'upi', 'bank', 'bank_transfer', 'cheque') THEN paid_amount ELSE 0 END), 0) AS online,
+       COALESCE(SUM(due_amount), 0) AS due,
+       COALESCE(SUM(amount), 0) AS total,
+       COUNT(*) AS count
+     FROM sales ${modernSalesFilter.clause}`,
+    modernSalesFilter.params
+  );
+
   const khataCreditFilter = buildDateFilter(userId, "entry_date", rangeFrom, rangeTo);
   const [[khataCreditSummary]] = await pool.query(
     `SELECT
@@ -164,12 +176,16 @@ const calculateReportMetrics = async (userId, rangeFrom, rangeTo) => {
        (SELECT COUNT(*) FROM collections ${salesFilter.clause})
        +
        (SELECT COUNT(*) FROM khata_entries ${khataCreditFilter.clause ? khataCreditFilter.clause + " AND " : "WHERE "} type = 'credit')
+       +
+       (SELECT COUNT(*) FROM sales ${modernSalesFilter.clause})
      ) AS count`,
-    [...salesFilter.params, ...khataCreditFilter.params]
+    [...salesFilter.params, ...khataCreditFilter.params, ...modernSalesFilter.params]
   );
   const creditEntriesCount = Number(creditCountSummary?.count || 0);
 
-  const totalSales = Math.round((Number(salesSummary.total || 0) + Number(khataCreditSummary.total || 0)) * 100) / 100;
+  const totalSales = Math.round(
+    (Number(salesSummary.total || 0) + Number(khataCreditSummary.total || 0) + Number(modernSalesSummary.total || 0)) * 100
+  ) / 100;
 
   // 2. PURCHASES: Purchase Bills (separate from Expenses)
   const pbFilter = buildDateFilter(userId, "DATE(pb.bill_date)", rangeFrom, rangeTo);
@@ -324,6 +340,7 @@ const calculateReportMetrics = async (userId, rangeFrom, rangeTo) => {
   // Inflows:
   const totalCashInflow =
     Number(salesSummary.cash || 0) +
+    Number(modernSalesSummary.cash || 0) +
     Number(khataCreditSummary.cash || 0) +
     Number(normalRecPaymentsSummary.cash || 0) +
     Number(unlinkedNormalMrSummary.cash || 0) +
@@ -332,6 +349,7 @@ const calculateReportMetrics = async (userId, rangeFrom, rangeTo) => {
 
   const totalBankInflow =
     Number(salesSummary.online || 0) +
+    Number(modernSalesSummary.online || 0) +
     Number(khataCreditSummary.online || 0) +
     Number(normalRecPaymentsSummary.online || 0) +
     Number(unlinkedNormalMrSummary.online || 0) +
@@ -739,7 +757,20 @@ const executeReportDrilldown = async (userId, metricParam, period, from, to, cat
         khataCreditFilter.params
       );
 
-      transactions = sortTransactionsChronologicalDesc([...colRows, ...keRows]);
+      const modernSalesDrillFilter = buildDateFilter(userId, "s.sale_date", rangeFrom, rangeTo);
+      const [salesRows] = await pool.query(
+        `SELECT s.id, s.amount, s.sale_date AS date, s.sale_time AS time, s.created_at,
+                s.payment_mode, s.payment_mode AS mode,
+                s.product_name AS description, s.product_name AS purpose,
+                s.customer_name AS party, s.customer_name AS customer, s.customer_name AS customer_name,
+                'Sales' AS category,
+                'sale' AS source
+         FROM sales s
+         ${modernSalesDrillFilter.clause}`,
+        modernSalesDrillFilter.params
+      );
+
+      transactions = sortTransactionsChronologicalDesc([...colRows, ...keRows, ...salesRows]);
       break;
     }
 
