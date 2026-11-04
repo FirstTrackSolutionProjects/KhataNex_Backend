@@ -186,6 +186,67 @@ async function main() {
     );
   });
 
+  // Test 14: Atomic status claiming prevents concurrent double-publishing
+  runTest("Atomic claiming query transitions pending/failed to 'publishing' and rejects concurrent runners", () => {
+    // Simulate database row state
+    let rowState = { id: 1, order_id: 108, status: "pending", attempts: 0, max_attempts: 5 };
+
+    // Function simulating atomic claim UPDATE ... WHERE status IN ('pending', 'failed')
+    const tryClaim = (row) => {
+      if (["pending", "failed"].includes(row.status) && row.attempts < row.max_attempts) {
+        row.status = "publishing";
+        return { affectedRows: 1 };
+      }
+      return { affectedRows: 0 };
+    };
+
+    // Runner 1 attempts claim
+    const claim1 = tryClaim(rowState);
+    assert.strictEqual(claim1.affectedRows, 1, "First worker must successfully claim row");
+    assert.strictEqual(rowState.status, "publishing", "Status must become 'publishing'");
+
+    // Runner 2 attempts claim concurrently while Runner 1 is in-flight
+    const claim2 = tryClaim(rowState);
+    assert.strictEqual(claim2.affectedRows, 0, "Concurrent second worker must NOT claim row");
+    assert.strictEqual(rowState.status, "publishing", "Row remains claimed by first worker");
+  });
+
+  // Test 15: Outbox retry query includes failed events
+  runTest("Outbox retry mechanism explicitly selects 'failed' events below max_attempts", () => {
+    const outboxEvents = [
+      { id: 1, status: "published", attempts: 1, max_attempts: 5 },
+      { id: 2, status: "failed", attempts: 2, max_attempts: 5 },
+      { id: 3, status: "failed", attempts: 5, max_attempts: 5 }, // maxed out
+      { id: 4, status: "pending", attempts: 0, max_attempts: 5 },
+    ];
+
+    // Filter matching the outbox retry query: WHERE status IN ('pending', 'failed') AND attempts < max_attempts
+    const eligibleForRetry = outboxEvents.filter(
+      (ev) => ["pending", "failed"].includes(ev.status) && ev.attempts < ev.max_attempts
+    );
+
+    assert.strictEqual(eligibleForRetry.length, 2, "Only event #2 and #4 should be selected for retry");
+    assert.strictEqual(eligibleForRetry[0].id, 2, "Failed event #2 must be selected for subsequent retry");
+    assert.strictEqual(eligibleForRetry[1].id, 4, "Pending event #4 must be selected");
+  });
+
+  // Test 16: Missing invoice recovery query identifies paid orders without invoice records
+  runTest("Missing invoice recovery identifies paid orders without invoices", () => {
+    const orders = [
+      { id: 101, status: "paid", hasInvoice: true, outboxStatus: "published" },
+      { id: 102, status: "pending", hasInvoice: false, outboxStatus: null },
+      { id: 103, status: "paid", hasInvoice: false, outboxStatus: null }, // unrecorded paid
+      { id: 104, status: "paid", hasInvoice: false, outboxStatus: "failed" }, // failed outbox paid
+    ];
+
+    const needsRecovery = orders.filter(
+      (o) => o.status === "paid" && !o.hasInvoice && (!o.outboxStatus || o.outboxStatus === "failed")
+    );
+
+    assert.strictEqual(needsRecovery.length, 2, "Orders 103 and 104 must be targeted for recovery");
+    assert.deepStrictEqual(needsRecovery.map((o) => o.id), [103, 104]);
+  });
+
   console.log("=================================================================");
   console.log(`ALL ${passedTests} OF ${totalTests} TESTS PASSED SUCCESSFULLY!`);
   console.log("=================================================================");

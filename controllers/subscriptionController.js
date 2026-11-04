@@ -577,7 +577,16 @@ const downloadInvoice = asyncHandler(async (req, res) => {
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
       res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-      return fs.createReadStream(filePath).pipe(res);
+      const localStream = fs.createReadStream(filePath);
+      localStream.on("error", (streamErr) => {
+        console.error("[DownloadInvoice] Local file stream error:", streamErr.message || streamErr);
+        if (!res.headersSent) {
+          res.status(500).json({ success: false, message: "Error streaming invoice file." });
+        } else {
+          res.end();
+        }
+      });
+      return localStream.pipe(res);
     }
   }
 
@@ -602,6 +611,18 @@ const downloadInvoice = asyncHandler(async (req, res) => {
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `inline; filename="${invoiceNumber}.pdf"`);
       res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+      if (s3Response.Body && typeof s3Response.Body.on === "function") {
+        s3Response.Body.on("error", (streamErr) => {
+          console.error(`[DownloadInvoice] S3 stream error for ${s3Key}:`, streamErr.message || streamErr);
+          if (!res.headersSent) {
+            res.status(500).json({ success: false, message: "Error streaming invoice from storage." });
+          } else {
+            res.end();
+          }
+        });
+      }
+
       return s3Response.Body.pipe(res);
     } catch (s3Err) {
       if (s3Err.name !== "NoSuchKey" && s3Err.$metadata?.httpStatusCode !== 404) {
