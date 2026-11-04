@@ -545,12 +545,14 @@ const getMySubscription = asyncHandler(async (req, res) => {
 
 /**
  * GET /api/subscriptions/orders/:id/invoice
- * Streams the private invoice PDF securely to the authorized owner or superadmin
+ * Streams the invoice PDF securely to the authorized owner or superadmin.
+ * Automatically resolves between private AWS S3 storage and historical local-disk storage.
  */
 const downloadInvoice = asyncHandler(async (req, res) => {
   const orderId = Number(req.params.id);
   const isSuperadmin = req.user.role === "superadmin";
 
+  // Strict ownership check: ensure the authenticated user owns this order
   const [orders] = await pool.query(
     `SELECT * FROM subscription_orders WHERE id = ? ${isSuperadmin ? "" : "AND user_id = ?"}`,
     isSuperadmin ? [orderId] : [orderId, req.user.id]
@@ -562,30 +564,73 @@ const downloadInvoice = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Invoice is only available for paid orders.");
   }
 
-  let [invoices] = await pool.query(
+  const [invoices] = await pool.query(
     "SELECT * FROM subscription_invoices WHERE order_id = ?",
     [order.id]
   );
-
   let invoice = invoices[0];
-  if (!invoice) {
+
+  // 1. Check historical local-disk storage first
+  if (invoice) {
+    const filePath = invoiceFilePath(invoice.pdf_filename);
+    if (fs.existsSync(filePath)) {
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      return fs.createReadStream(filePath).pipe(res);
+    }
+  }
+
+  // 2. Check private AWS S3 storage
+  const { isS3Configured, getS3Client } = require("../config/aws");
+  if (isS3Configured()) {
+    const invoiceNumber = invoice?.invoice_number || order.invoice_number || `SUB-${new Date(order.paid_at || Date.now()).getFullYear()}-${String(order.id).padStart(5, "0")}`;
+    const s3Key = invoice?.pdf_filename && invoice.pdf_filename.startsWith("invoices/")
+      ? invoice.pdf_filename
+      : `invoices/${invoiceNumber}.pdf`;
+
+    try {
+      const { GetObjectCommand } = require("@aws-sdk/client-s3");
+      const s3Client = getS3Client();
+      const s3Response = await s3Client.send(
+        new GetObjectCommand({
+          Bucket: process.env.S3_BUCKET_NAME,
+          Key: s3Key,
+        })
+      );
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${invoiceNumber}.pdf"`);
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      return s3Response.Body.pipe(res);
+    } catch (s3Err) {
+      if (s3Err.name !== "NoSuchKey" && s3Err.$metadata?.httpStatusCode !== 404) {
+        console.error(`[DownloadInvoice] S3 retrieval error for ${s3Key}:`, s3Err.message || s3Err);
+      }
+    }
+  }
+
+  // 3. Fallback for offline development or missing automation invocation
+  if (!invoice && process.env.DISABLE_AUTOMATION_SQS === "true") {
     invoice = await issueInvoice(order.id);
+    const filePath = invoiceFilePath(invoice.pdf_filename);
+    if (fs.existsSync(filePath)) {
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
+      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      return fs.createReadStream(filePath).pipe(res);
+    }
   }
 
-  const filePath = invoiceFilePath(invoice.pdf_filename);
-  if (!fs.existsSync(filePath)) {
-    await issueInvoice(order.id);
-  }
+  // 4. If invoice is still processing in automation microservice, inform client safely
+  const { publishInvoiceEventForOrder } = require("../services/subscriptionInvoiceQueueService");
+  publishInvoiceEventForOrder(order.id).catch(console.error);
 
-  if (!fs.existsSync(filePath)) {
-    throw new ApiError(500, "Invoice file could not be generated.");
-  }
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
-  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-
-  fs.createReadStream(filePath).pipe(res);
+  return res.status(202).json({
+    success: false,
+    status: "processing",
+    message: "Invoice is currently being processed by the automation microservice. Please retry in a few moments.",
+  });
 });
 
 /**
