@@ -1,5 +1,6 @@
 const fs = require("fs");
 const pool = require("../config/db");
+const getS3Object = require("../services/aws/s3/getObject");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const gateway = require("../utils/paymentGateway");
@@ -573,6 +574,20 @@ const downloadInvoice = asyncHandler(async (req, res) => {
   }
 
   const filePath = invoiceFilePath(invoice.pdf_filename);
+  if (invoice.s3_key) {
+    const s3Object = await getS3Object(invoice.s3_key);
+    if (!s3Object.Body) {
+      throw new ApiError(500, "Invoice file could not be retrieved from S3.");
+    }
+
+    const pdfBuffer = Buffer.from(await s3Object.Body.transformToByteArray());
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.send(pdfBuffer);
+    return;
+  }
+
   if (!fs.existsSync(filePath)) {
     await issueInvoice(order.id);
   }
@@ -617,8 +632,18 @@ const resendInvoice = asyncHandler(async (req, res) => {
   );
   let invoice = invoices[0] || (await issueInvoice(order.id));
 
-  const filePath = invoiceFilePath(invoice.pdf_filename);
-  const result = await sendInvoiceEmail(order.user_email, invoice.invoice_number, order.plan_name, filePath, invoice.id, order);
+  const attachmentPath = invoice.s3_key
+    ? `s3://${invoice.s3_key}`
+    : invoiceFilePath(invoice.pdf_filename);
+  const result = await sendInvoiceEmail(
+    order.user_email,
+    invoice.invoice_number,
+    order.plan_name,
+    attachmentPath,
+    invoice.id,
+    order,
+    { allowResend: true }
+  );
 
   if (result && result.success === false && !result.outboxId) {
     throw new ApiError(502, `Failed to queue email: ${result.error}`);
@@ -851,4 +876,3 @@ module.exports = {
   handleUnsubscribePost,
   handleDevTestEmail,
 };
-

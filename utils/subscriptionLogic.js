@@ -465,11 +465,21 @@ async function fulfillOrder(orderId, providerPaymentId, providerSignature = null
 
   // Issue invoice asynchronously if required (including 100% discounted zero-cost orders)
   if (invoice) {
-    try {
-      const { issueInvoice } = require("./subscriptionInvoice");
-      await issueInvoice(order.id);
-    } catch (err) {
-      console.error(`[SubscriptionLogic] Invoice generation failed for order ${order.id}:`, err.message || err);
+    if (process.env.INVOICE_AUTOMATION_ENABLED === "true") {
+      try {
+        const sendInvoiceGenerationMessage = require("../services/aws/sqs/sendInvoiceGenerationMessage");
+        await sendInvoiceGenerationMessage(order.id);
+      } catch (err) {
+        console.error(`[SubscriptionLogic] Failed to enqueue invoice generation for order ${order.id}:`, err.message || err);
+        // TODO: Persist failed invoice-generation sends to a retryable outbox.
+      }
+    } else {
+      try {
+        const { issueInvoice } = require("./subscriptionInvoice");
+        await issueInvoice(order.id);
+      } catch (err) {
+        console.error(`[SubscriptionLogic] Invoice generation failed for order ${order.id}:`, err.message || err);
+      }
     }
   }
 

@@ -192,7 +192,7 @@ async function renderAndSavePdf(invoiceId, cachedOrder = null) {
 /**
  * Sends invoice email via durable outbox email service
  */
-async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath, invoiceId = null, order = {}) {
+async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath, invoiceId = null, order = {}, options = {}) {
   const emailService = require("../services/emailService");
   const masked = String(toEmail || "").replace(/(.{2})(.*)(?=@)/, (_, a, b) => a + "*".repeat(b.length));
   console.log(`[SubscriptionInvoice] Triggering subscription invoice email for #${invoiceNumber} to: ${masked}`);
@@ -208,6 +208,7 @@ async function sendInvoiceEmail(toEmail, invoiceNumber, planName, attachmentPath
     totalPaise: order.total_paise || 0,
     pdfPath: attachmentPath,
     invoiceId: invoiceId || invoiceNumber,
+    allowResend: options.allowResend || false,
   });
 }
 
@@ -217,4 +218,3 @@ module.exports = {
   renderAndSavePdf,
   sendInvoiceEmail,
 };
-

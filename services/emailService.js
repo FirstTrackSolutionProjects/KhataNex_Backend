@@ -3,6 +3,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const pool = require("../config/db");
 const { sendMail } = require("../utils/mailer");
+const getS3Object = require("./aws/s3/getObject");
 
 /**
  * KhataNex Durable Email Service
@@ -49,6 +50,7 @@ class EmailService {
     category = "other",
     referenceType = null,
     referenceId = null,
+    allowResend = false,
     maxAttempts = 5,
   }) {
     if (!to || !String(to).trim()) {
@@ -59,10 +61,13 @@ class EmailService {
 
     // Check for exact pending duplicate in outbox to enforce idempotency
     if (referenceType && referenceId) {
+      const duplicateStatuses = allowResend
+        ? "status IN ('pending', 'sending')"
+        : "status IN ('pending', 'sending', 'sent')";
       const [existing] = await pool.query(
         `SELECT id, status FROM email_outbox 
          WHERE reference_type = ? AND reference_id = ? AND recipient_email = ? 
-           AND status IN ('pending', 'sending', 'sent')
+           AND ${duplicateStatuses}
          ORDER BY id DESC LIMIT 1`,
         [referenceType, String(referenceId), cleanTo]
       );
@@ -127,8 +132,24 @@ class EmailService {
 
     // Prepare attachments
     const attachments = [];
+    let attachmentError = null;
     if (item.attachment_path) {
-      if (fs.existsSync(item.attachment_path)) {
+      if (item.attachment_path.startsWith("s3://")) {
+        const s3Key = item.attachment_path.slice("s3://".length);
+        try {
+          const s3Object = await getS3Object(s3Key);
+          if (!s3Object.Body) {
+            throw new Error(`S3 object body is empty for key ${s3Key}`);
+          }
+          attachments.push({
+            filename: item.attachment_name || path.basename(s3Key),
+            content: Buffer.from(await s3Object.Body.transformToByteArray()),
+            contentType: "application/pdf",
+          });
+        } catch (err) {
+          attachmentError = `Failed to fetch S3 email attachment ${s3Key}: ${err.message}`;
+        }
+      } else if (fs.existsSync(item.attachment_path)) {
         attachments.push({
           filename: item.attachment_name || path.basename(item.attachment_path),
           path: item.attachment_path,
@@ -139,13 +160,15 @@ class EmailService {
     }
 
     const maskedEmail = item.recipient_email ? item.recipient_email.replace(/(.{2})(.*)(?=@)/, (_, a, b) => a + "*".repeat(b.length)) : "unknown";
-    const result = await sendMail({
-      to: item.recipient_email,
-      subject: item.subject,
-      text: item.body_text,
-      html: item.body_html,
-      attachments,
-    });
+    const result = attachmentError
+      ? { sent: false, error: attachmentError }
+      : await sendMail({
+          to: item.recipient_email,
+          subject: item.subject,
+          text: item.body_text,
+          html: item.body_html,
+          attachments,
+        });
 
     if (result.sent) {
       await pool.query(
@@ -403,6 +426,7 @@ class EmailService {
     totalPaise = 0,
     pdfPath = null,
     invoiceId = null,
+    allowResend = false,
   }) {
     const frontendUrl = process.env.FRONTEND_URL || "https://khatanex.in";
     const name = userName || "Valued Customer";
@@ -476,6 +500,7 @@ class EmailService {
       category: "subscription_invoice",
       referenceType: "subscription_invoice",
       referenceId: invoiceId || invoiceNumber,
+      allowResend,
     });
   }
 
@@ -961,4 +986,3 @@ function wrapBrandTemplate({ title, badge, contentHtml, unsubscribeUrl = null })
 }
 
 module.exports = new EmailService();
-
