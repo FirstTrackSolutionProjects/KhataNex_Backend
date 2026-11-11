@@ -37,6 +37,8 @@ const MIGRATION_HISTORY = [
   "migration_030_subscription_invoice_persistence.sql",
   "migration_031_create_sales_table.sql",
   "migration_032_sales_enhancements_and_items.sql",
+  "migration_033_subscription_invoice_s3_key.sql",
+  "migration_034_subscription_invoice_series.sql",
 ];
 
 // Schema verification predicates for existing environments

@@ -4,6 +4,7 @@ const pool = require("../config/db");
 const ApiError = require("./ApiError");
 const { sendMail } = require("./mailer");
 const { PRIVATE_INVOICE_DIR, generateSubscriptionInvoicePdf } = require("./generateSubscriptionInvoicePdf");
+const getNextSubscriptionInvoiceNumber = require("./getNextSubscriptionInvoiceNumber");
 
 /**
  * Resolves full path to an invoice PDF inside the private invoices directory.
@@ -23,11 +24,11 @@ async function issueInvoice(orderId) {
     const inv = existing[0];
     // Ensure subscription_orders table also has the invoice_number persisted
     if (!inv.invoice_number) {
-      const year = new Date(inv.issued_at || Date.now()).getFullYear();
-      inv.invoice_number = `SUB-${year}-${String(orderId).padStart(5, "0")}`;
+      inv.invoice_number = await getNextSubscriptionInvoiceNumber(pool);
+      inv.pdf_filename = `${inv.invoice_number.replace(/[\\/]/g, "-")}.pdf`;
       await pool.query(
-        "UPDATE subscription_invoices SET invoice_number = ? WHERE id = ?",
-        [inv.invoice_number, inv.id]
+        "UPDATE subscription_invoices SET invoice_number = ?, pdf_filename = ? WHERE id = ?",
+        [inv.invoice_number, inv.pdf_filename, inv.id]
       );
     }
     await pool.query(
@@ -72,10 +73,9 @@ async function issueInvoice(orderId) {
   const order = orders[0];
   if (!order) throw new ApiError(404, "Order not found for invoice issuance.");
 
-  const year = new Date().getFullYear();
-  // Reuse existing invoice_number if order already has one, else generate standard deterministic format
-  const invoiceNumber = order.invoice_number || `SUB-${year}-${String(order.id).padStart(5, "0")}`;
-  const pdfFilename = `${invoiceNumber}.pdf`;
+  // Reuse an existing number when present; otherwise allocate from the fiscal-year series.
+  const invoiceNumber = order.invoice_number || await getNextSubscriptionInvoiceNumber(pool);
+  const pdfFilename = `${invoiceNumber.replace(/[\\/]/g, "-")}.pdf`;
 
   let invoiceId;
   const conn = await pool.getConnection();
