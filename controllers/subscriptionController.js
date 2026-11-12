@@ -553,7 +553,10 @@ const downloadInvoice = asyncHandler(async (req, res) => {
   const isSuperadmin = req.user.role === "superadmin";
 
   const [orders] = await pool.query(
-    `SELECT * FROM subscription_orders WHERE id = ? ${isSuperadmin ? "" : "AND user_id = ?"}`,
+    `SELECT o.*, u.name AS invoice_owner_name
+     FROM subscription_orders o
+     LEFT JOIN users u ON u.id = o.user_id
+     WHERE o.id = ? ${isSuperadmin ? "" : "AND o.user_id = ?"}`,
     isSuperadmin ? [orderId] : [orderId, req.user.id]
   );
   if (!orders.length) throw new ApiError(404, "Order not found.");
@@ -573,6 +576,25 @@ const downloadInvoice = asyncHandler(async (req, res) => {
     invoice = await issueInvoice(order.id);
   }
 
+  const ownerName = String(order.invoice_owner_name || "Customer").trim() || "Customer";
+  const invoiceNumber = String(invoice.invoice_number || invoice.pdf_filename || "Invoice");
+  const displayFilename = `${ownerName}_${invoiceNumber.replace(/\.pdf$/i, "")}.pdf`;
+  const asciiFilename = displayFilename
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\x20-\x7E]/g, "_")
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/[\r\n]/g, "_");
+  const encodedFilename = encodeURIComponent(displayFilename).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`
+  );
+  res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+
   const filePath = invoiceFilePath(invoice.pdf_filename);
   if (invoice.s3_key) {
     const s3Object = await getS3Object(invoice.s3_key);
@@ -581,8 +603,6 @@ const downloadInvoice = asyncHandler(async (req, res) => {
     }
 
     const pdfBuffer = Buffer.from(await s3Object.Body.transformToByteArray());
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     res.send(pdfBuffer);
     return;
@@ -596,8 +616,6 @@ const downloadInvoice = asyncHandler(async (req, res) => {
     throw new ApiError(500, "Invoice file could not be generated.");
   }
 
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `inline; filename="${invoice.pdf_filename}"`);
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 
   fs.createReadStream(filePath).pipe(res);
