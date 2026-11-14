@@ -37,6 +37,7 @@ const MIGRATION_HISTORY = [
   "migration_030_subscription_invoice_persistence.sql",
   "migration_031_create_sales_table.sql",
   "migration_032_sales_enhancements_and_items.sql",
+  "migration_033_subscription_invoice_events_outbox.sql",
 ];
 
 // Schema verification predicates for existing environments
@@ -328,6 +329,13 @@ const MIGRATION_SCHEMA_CHECKS = {
   "migration_032_sales_enhancements_and_items.sql": async (conn, db) => {
     const [r] = await conn.query(
       "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'sale_items'",
+      [db]
+    );
+    return r.length > 0;
+  },
+  "migration_033_subscription_invoice_events_outbox.sql": async (conn, db) => {
+    const [r] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE (TABLE_SCHEMA = ? OR TABLE_SCHEMA = DATABASE()) AND TABLE_NAME = 'subscription_invoice_events_outbox'",
       [db]
     );
     return r.length > 0;

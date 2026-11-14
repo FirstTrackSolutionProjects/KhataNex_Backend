@@ -15,10 +15,10 @@ const DEFAULT_SUBSCRIPTION_SAC_DESC = "Licensing services for the right to use c
 const SELLER_DETAILS = {
   companyName: "First Track Solution Technologies Pvt. Ltd.",
   address: "Saheed Nagar, Bhubaneswar, Odisha, India-751007",
-  contactNo: "+91 8240742313",
+  contactNo: "+91 9040170727",
   email: "contact@firsttrackkhatanex.in",
-  gstin: "21AAECF0000A1Z5",
-  pan: "AAECF0000A",
+  gstin: "21AAFCF2404H1ZA",
+  pan: "AAFCF2404H",
   stateCode: "21", // Odisha State Code
   state: "Odisha",
 };

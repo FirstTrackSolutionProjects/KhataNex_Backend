@@ -324,6 +324,7 @@ async function createSalesTaxInvoice({
   invoiceDate,
   notes,
   gstRate = 0,
+  gstMode = null,
 }) {
   const [userRows] = await conn.query("SELECT * FROM users WHERE id = ?", [tenant.businessOwnerId]);
   const user = userRows[0];
@@ -366,7 +367,9 @@ async function createSalesTaxInvoice({
   // Determine State / Place of Supply for GST (Intra vs Inter state)
   const sellerState = String(user.state || "").trim().toLowerCase();
   const buyerState = String(customerData.billing_state || customerData.state || "").trim().toLowerCase();
-  const isInterState = sellerState && buyerState && sellerState !== buyerState;
+  const isInterState = gstMode
+    ? String(gstMode).trim().toLowerCase() === "igst"
+    : Boolean(sellerState && buyerState && sellerState !== buyerState);
 
   let cgstRate = 0;
   let cgstAmount = 0;
@@ -571,6 +574,7 @@ const createSale = asyncHandler(async (req, res) => {
     notes,
     create_invoice = false,
     gst_rate = 0,
+    gst_mode,
   } = req.body;
 
   // 1. Prepare and normalize item list (supporting multi-item or single item fallback)
@@ -871,6 +875,7 @@ const createSale = asyncHandler(async (req, res) => {
         invoiceDate: finalSaleDate,
         notes: notes || `Generated from Sale ${saleNumber}`,
         gstRate: cleanNumber(gst_rate, validatedItems[0]?.tax_rate || 0),
+        gstMode: gst_mode,
       });
 
       // Link invoice_id to sale
@@ -1011,6 +1016,7 @@ const createInvoiceForSale = asyncHandler(async (req, res) => {
       invoiceDate: req.body.invoice_date || sale.sale_date,
       notes: req.body.notes || `Generated from Sale #${sale.sale_number || sale.id}`,
       gstRate: cleanNumber(req.body.gst_rate, 0),
+      gstMode: req.body.gst_mode || req.body.gstMode,
     });
 
     // Link invoice_id to sale
@@ -1365,6 +1371,7 @@ const generateInvoiceFromSales = asyncHandler(async (req, res) => {
       invoiceDate: invoice_date || formatCurrentDate(),
       notes: notes || `Generated for Sales: ${sanitizedIds.map((id) => `#${id}`).join(", ")}`,
       gstRate: cleanNumber(gst_rate, 0),
+      gstMode: req.body.gst_mode || req.body.gstMode,
     });
 
     // 6. Link invoice_id to all selected sales

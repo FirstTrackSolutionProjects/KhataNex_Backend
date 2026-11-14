@@ -56,10 +56,10 @@ async function runTests() {
   console.log("\n--- 2. Testing Seller Details & SAC Code ---");
   assert(SELLER_DETAILS.companyName === "First Track Solution Technologies Pvt. Ltd.", "Seller name exact match");
   assert(SELLER_DETAILS.address === "Saheed Nagar, Bhubaneswar, Odisha, India-751007", "Seller address exact match");
-  assert(SELLER_DETAILS.contactNo === "+91 8240742313", "Seller contact exact match");
+  assert(SELLER_DETAILS.contactNo === "+91 9040170727", "Seller contact exact match");
   assert(SELLER_DETAILS.email === "contact@firsttrackkhatanex.in", "Seller email exact match");
-  assert(SELLER_DETAILS.gstin === "21AAECF0000A1Z5", "Seller GSTIN exact match");
-  assert(SELLER_DETAILS.pan === "AAECF0000A", "Seller PAN exact match");
+  assert(SELLER_DETAILS.gstin === "21AAFCF2404H1ZA", "Seller GSTIN exact match");
+  assert(SELLER_DETAILS.pan === "AAFCF2404H", "Seller PAN exact match");
   assert(DEFAULT_SUBSCRIPTION_SAC === "997331", "SAC code is 997331");
 
   // -----------------------------------------------------------
